@@ -329,7 +329,7 @@ static int provision_bundle(euicc *eu, const char *dir, const char *path, const 
 		goto out;
 	}
 	if (eu->kind == EUICC_EMU && !(k = crypto_key_parse(b.device_key.d, b.device_key.len))) {
-		snprintf(err, errlen, "bundle %s: device_key is not a P-256 private key", b.issuance_id);
+		snprintf(err, errlen, "bundle %s: device_key is not a consistent P-256 private key", b.issuance_id);
 		goto out;
 	}
 

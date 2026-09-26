@@ -111,6 +111,47 @@ int main(void)
 		crypto_key_free(back);
 	}
 
+	/* a device key is P-256 and its public point is its own: a brainpool
+	 * key, or a SEC1 key carrying another key's point, is refused */
+	{
+		crypto_key *a = crypto_key_generate(), *b = crypto_key_generate(), *x;
+		char pa[] = "/tmp/ipad-test-ka-XXXXXX", pb[] = "/tmp/ipad-test-kb-XXXXXX";
+		uint8_t da[256], db[256], pem[1024];
+		size_t la = 0, lb = 0, lp;
+		FILE *f;
+
+		close(mkstemp(pa));
+		close(mkstemp(pb));
+		if (crypto_key_save(a, pa) == 0 && (f = fopen(pa, "rb"))) {
+			la = fread(da, 1, sizeof(da), f);
+			fclose(f);
+		}
+		if (crypto_key_save(b, pb) == 0 && (f = fopen(pb, "rb"))) {
+			lb = fread(db, 1, sizeof(db), f);
+			fclose(f);
+		}
+		unlink(pa);
+		unlink(pb);
+		OK(la == 121 && lb == 121, "SEC1 P-256 keys with their public point");
+		x = crypto_key_parse(da, la);
+		OK(x != NULL, "parse: a P-256 key with its own point");
+		crypto_key_free(x);
+		/* the uncompressed point is the last 65 octets */
+		memcpy(da + la - 65, db + lb - 65, 65);
+		OK(crypto_key_parse(da, la) == NULL, "parse: another key's public point is refused");
+
+		lp = slurp("brainpoolP256r1.key.pem", pem, sizeof(pem) - 1);
+		pem[lp] = 0;
+		OK(lp > 0 && crypto_key_parse(pem, lp + 1) == NULL, "parse: a brainpoolP256r1 private key is refused");
+		lp = slurp("prime256v1.key.pem", pem, sizeof(pem) - 1);
+		pem[lp] = 0;
+		x = crypto_key_parse(pem, lp + 1);
+		OK(lp > 0 && x != NULL, "parse: a prime256v1 private key (PEM) is taken");
+		crypto_key_free(x);
+		crypto_key_free(a);
+		crypto_key_free(b);
+	}
+
 	/* a curve RSP does not use is refused, not trusted */
 	{
 		uint8_t rsa_spki[] = { 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 };

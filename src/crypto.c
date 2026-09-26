@@ -150,20 +150,24 @@ crypto_key *crypto_key_load(const char *path)
 	n = fread(buf, 1, sizeof(buf), f);
 	fclose(f);
 
-	k = key_new();
-	if (!k || mbedtls_pk_parse_key(&k->pk, buf, n, NULL, 0, rng, NULL) != 0 || !curve_ok(&k->pk)) {
-		crypto_key_free(k);
-		k = NULL;
-	}
+	k = crypto_key_parse(buf, n);
 	mbedtls_platform_zeroize(buf, sizeof(buf));
 	return k;
 }
 
+/* A device key is P-256: the eIM verifies EPR/EPE signatures on P-256 only
+ * (D-62), so a brainpool key would sign results nobody accepts. mbedTLS
+ * takes the public point a SEC1/PKCS#8 key carries as it is, unchecked; a
+ * point that is not d·G would be exported (the import file) while d signs,
+ * and every result would fail at the eIM. Both are refused here. */
 crypto_key *crypto_key_parse(const uint8_t *der, size_t len)
 {
 	crypto_key *k = key_new();
 
-	if (!k || mbedtls_pk_parse_key(&k->pk, der, len, NULL, 0, rng, NULL) != 0 || !curve_ok(&k->pk)) {
+	if (!k || mbedtls_pk_parse_key(&k->pk, der, len, NULL, 0, rng, NULL) != 0 ||
+	    !mbedtls_pk_can_do(&k->pk, MBEDTLS_PK_ECKEY) ||
+	    mbedtls_pk_ec(k->pk)->MBEDTLS_PRIVATE(grp).id != MBEDTLS_ECP_DP_SECP256R1 ||
+	    mbedtls_pk_check_pair(&k->pk, &k->pk, rng, NULL) != 0) {
 		crypto_key_free(k);
 		return NULL;
 	}
