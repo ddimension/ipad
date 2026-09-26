@@ -14,14 +14,17 @@
 #include <sys/stat.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #include <mbedtls/base64.h>
 
+#include "bundle.h"
 #include "crypto.h"
 #include "emu.h"
 #include "euicc.h"
 #include "hex.h"
 #include "host.h"
+#include "http.h"
 #include "ipa.h"
 
 #define IMPORT_FORMAT "eim-euicc-import/1"
@@ -29,6 +32,12 @@
 /* exit codes: 0 done, 1 failed, 2 usage, 3 no eIM configured on the card
  * (provision first) — the one failure the host acts on by itself */
 #define EXIT_NO_EIM 3
+
+/* the binding a bundle leaves to the next poll (D-69) */
+#define BIND_PENDING "bind.pending"
+#define BIND_REFUSED_FILE "bind.refused"
+#define BIND_DONE_FILE "bind.done"
+#define EXIT_BIND_REFUSED 4
 
 static void usage(FILE *f)
 {
@@ -173,8 +182,11 @@ static void fingerprint(const crypto_key *k, char out[65])
 	}
 }
 
-static int cmd_export(euicc *eu, crypto_key *key, const char *eim_id, const char *imei, bool direct,
-                      const uint8_t eid[16], const char *path)
+/* The eim-euicc-import/1 file into a memory stream: what `export` writes to
+ * a file and what the self-binding posts (D-69 takes the import file as it
+ * is). One builder, so both sign the very same text. */
+static int build_import(euicc *eu, crypto_key *key, const char *eim_id, const char *imei, bool direct,
+                        const uint8_t eid[16], char **body, size_t *blen)
 {
 	char eidhex[33], ctr[24];
 	uint8_t spki[256], sig[CRYPTO_SIG_LEN];
@@ -185,10 +197,9 @@ static int cmd_export(euicc *eu, crypto_key *key, const char *eim_id, const char
 	der_tlv t;
 	FILE *f;
 	size_t olen = 0;
-	char tmp[520];
 
 	if (eu->kind != EUICC_EMU) {
-		fprintf(stderr, "ipad: export is for emulated cards; an IoT eUICC signs with its own certificate\n");
+		fprintf(stderr, "ipad: the import file is for emulated cards; an IoT eUICC signs with its own certificate\n");
 		return 1;
 	}
 	hex_encode(eid, 16, eidhex);
@@ -227,11 +238,8 @@ static int cmd_export(euicc *eu, crypto_key *key, const char *eim_id, const char
 	}
 	ipa_put_capabilities(&caps, 0x30, direct);
 
-	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-	if (!(f = fopen(tmp, "w"))) {
-		fprintf(stderr, "ipad: %s: %s\n", tmp, strerror(errno));
+	if (!(f = open_memstream(body, blen)))
 		return 1;
-	}
 	fprintf(f, "{\"format\":\"" IMPORT_FORMAT "\",\"eid\":\"%s\",\"emulated\":true,\"ipa_public_key\":\"", eidhex);
 	fwrite(pk64.d, 1, pk64.len, f);
 	fprintf(f, "\",\"counter\":%lld", (long long)counter);
@@ -253,23 +261,222 @@ static int cmd_export(euicc *eu, crypto_key *key, const char *eim_id, const char
 	fprintf(f, ",\"proof\":\"");
 	b64(f, sig, sizeof(sig));
 	fprintf(f, "\"}\n");
-	if (fclose(f) != 0 || rename(tmp, path) != 0) {
-		fprintf(stderr, "ipad: %s: %s\n", path, strerror(errno));
-		unlink(tmp);
-		return 1;
-	}
-	syslog(LOG_NOTICE, "import file for EID %s written to %s", eidhex, path);
+	n = fclose(f);
 	db_free(&pk64);
 	db_free(&proof);
 	db_free(&info1);
 	db_free(&caps);
+	return n == 0 ? 0 : 1;
+}
+
+/* A bundle (D-69): the eIM configuration through AddInitialEim as usual; the
+ * device key replaces the one ipad would generate, because the eIM issued it
+ * and holds its public half; a marker leaves the binding to the next poll,
+ * which reads the card's EID for it. The file is deleted once all of it is
+ * stored: it holds the private key. */
+static int provision_bundle(euicc *eu, const char *dir, const char *path, const dbuf *file,
+                            char *err, size_t errlen)
+{
+	bundle b;
+	crypto_key *k = NULL;
+	time_t exp;
+	char kpath[512], mpath[512], mtmp[520];
+	FILE *f;
+	int rc = 1;
+
+	if (bundle_parse(file->d, file->len, &b, err, errlen) < 0)
+		return 1;
+
+	/* the eIM refuses an expired bundle at binding anyway; saying so here
+	 * spares a configuration that can never bind. A clock that has not been
+	 * set (before 2024) proves nothing either way. */
+	if (rfc3339_time(b.expires_at, &exp) < 0) {
+		snprintf(err, errlen, "bundle: expires_at is not RFC 3339");
+		goto out;
+	}
+	if (time(NULL) > 1704067200 && time(NULL) >= exp) {
+		snprintf(err, errlen, "bundle %s expired at %s", b.issuance_id, b.expires_at);
+		goto out;
+	}
+	if (eu->kind == EUICC_EMU && !(k = crypto_key_parse(b.device_key.d, b.device_key.len))) {
+		snprintf(err, errlen, "bundle %s: device_key is not a P-256 private key", b.issuance_id);
+		goto out;
+	}
+
+	/* configuration first: it is the step the card can refuse (one initial
+	 * eIM, SGP.32 3.5.2) — a refused one must not leave a new key behind */
+	if (ipa_add_initial_eim(eu, b.eim_config.d, b.eim_config.len, err, errlen) < 0)
+		goto out;
+
+	if (eu->kind == EUICC_EMU) {
+		snprintf(kpath, sizeof(kpath), "%s/device.key", dir);
+		snprintf(mpath, sizeof(mpath), "%s/" BIND_PENDING, dir);
+		snprintf(mtmp, sizeof(mtmp), "%s.tmp", mpath);
+		if (crypto_key_save(k, kpath) < 0) {
+			snprintf(err, errlen, "cannot store the device key in %s", kpath);
+			goto out;
+		}
+		if (!(f = fopen(mtmp, "w"))) {
+			snprintf(err, errlen, "cannot write %s", mtmp);
+			goto out;
+		}
+		fprintf(f, "%s\n%lld\n", b.issuance_id, b.counter);
+		if (fclose(f) != 0 || rename(mtmp, mpath) != 0) {
+			unlink(mtmp);
+			snprintf(err, errlen, "cannot write %s", mpath);
+			goto out;
+		}
+	} else {
+		/* an IoT eUICC signs with its own certificate: the bundle's key has
+		 * nothing to sign, and the card is registered by its EUM data */
+		syslog(LOG_NOTICE, "bundle %s: IoT eUICC — its device key is not used, no self-binding", b.issuance_id);
+	}
+
+	if (unlink(path) != 0)
+		syslog(LOG_WARNING, "bundle %s stored, but the file %s could not be deleted: delete it by hand", b.issuance_id, path);
+	syslog(LOG_NOTICE, "bundle %s provisioned (counter %lld, valid until %s)%s", b.issuance_id, b.counter,
+	       b.expires_at, eu->kind == EUICC_EMU ? "; the card binds itself on the next poll" : "");
+	rc = 0;
+out:
+	crypto_key_free(k);
+	bundle_free(&b);
+	return rc;
+}
+
+/* The self-binding (D-69), before the first GetEimPackage: the import file of
+ * the card now in hand, signed with the bundle key, POSTed to the eIM that
+ * ESipa talks to, over the same TLS. 0 bound (or nothing to bind), 1 retry
+ * later, EXIT_BIND_REFUSED when the eIM said no. */
+static int bind_card(ipa *a, euicc *eu, crypto_key *key, const char *dir, const char *eim_id,
+                     const char *imei, bool direct, const uint8_t eid[16],
+                     void (*logf)(void *, int, const char *), void *lud)
+{
+	char mpath[512], rpath[512], url[512], msg[300];
+	static const char *const hdrs[] = { "Content-Type: application/json", NULL };
+	char *body = NULL;
+	size_t blen = 0;
+	http_resp r;
+	int rc = 1;
+
+	snprintf(mpath, sizeof(mpath), "%s/" BIND_PENDING, dir);
+	snprintf(rpath, sizeof(rpath), "%s/" BIND_REFUSED_FILE, dir);
+	if (access(rpath, F_OK) == 0) {
+		logf(lud, LOG_ERR, "the eIM refused to bind this card: not polling until an operator acts (a new bundle, or ipad reset)");
+		return EXIT_BIND_REFUSED;
+	}
+	if (eu->kind != EUICC_EMU || access(mpath, F_OK) != 0)
+		return 0;
+	if (bind_url(ipa_url(a), url, sizeof(url)) < 0) {
+		logf(lud, LOG_ERR, "no eIM URL to bind at");
+		return 1;
+	}
+	if (build_import(eu, key, eim_id, imei, direct, eid, &body, &blen) != 0) {
+		free(body);
+		return 1;
+	}
+
+	memset(&r, 0, sizeof(r));
+	db_init(&r.body);
+	if (http_post(url, hdrs, (const uint8_t *)body, blen, ipa_tls(a), &r) < 0)
+		r.status = 0;
+
+	switch (bind_outcome_of(r.status)) {
+	case BIND_DONE: {
+		char dpath[512];
+
+		/* kept, with the issuance id: `info` tells a bound card from one
+		 * that never had a bundle */
+		snprintf(dpath, sizeof(dpath), "%s/" BIND_DONE_FILE, dir);
+		rename(mpath, dpath);
+		snprintf(msg, sizeof(msg), "card bound at the eIM (%s)", r.status == 409 ? "409: already registered" : "204");
+		logf(lud, LOG_NOTICE, msg);
+		rc = 0;
+		break;
+	}
+	case BIND_REFUSED:
+		rename(mpath, rpath);
+		logf(lud, LOG_ERR, "the eIM refused the binding (403): not polling until an operator acts");
+		rc = EXIT_BIND_REFUSED;
+		break;
+	case BIND_RETRY:
+		snprintf(msg, sizeof(msg), "binding not done (%s): again on the next poll",
+		         r.status ? (r.status == 429 ? "429 rate limited" : "server error") : (r.error[0] ? r.error : "no answer"));
+		logf(lud, LOG_WARNING, msg);
+		break;
+	case BIND_BAD:
+		snprintf(msg, sizeof(msg), "the eIM rejected the binding request (HTTP %d)", r.status);
+		logf(lud, LOG_ERR, msg);
+		break;
+	}
+	db_free(&r.body);
+	free(body);
+	return rc;
+}
+
+/* `reset`: the emulation forgets its eIM configuration and state (one .state
+ * file per EID), the device key and the binding, so a fresh bundle starts
+ * from nothing. Needs no card. An IoT eUICC keeps its configuration on the
+ * card itself; removing that is an eIM's eCO (deleteEim), not ours. */
+static int cmd_reset(const char *dir)
+{
+	static const char *const fixed[] = { "device.key", BIND_PENDING, BIND_REFUSED_FILE, BIND_DONE_FILE };
+	char p[768];
+	DIR *d;
+	struct dirent *e;
+	size_t i, l;
+	int n = 0;
+
+	for (i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+		snprintf(p, sizeof(p), "%s/%s", dir, fixed[i]);
+		if (unlink(p) == 0)
+			n++;
+	}
+	if ((d = opendir(dir))) {
+		while ((e = readdir(d))) {
+			l = strlen(e->d_name);
+			if (l > 6 && !strcmp(e->d_name + l - 6, ".state")) {
+				snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+				if (unlink(p) == 0)
+					n++;
+			}
+		}
+		closedir(d);
+	}
+	syslog(LOG_NOTICE, "reset: %d file(s) removed from %s", n, dir);
 	return 0;
+}
+
+static int cmd_export(euicc *eu, crypto_key *key, const char *eim_id, const char *imei, bool direct,
+                      const uint8_t eid[16], const char *path)
+{
+	char *body = NULL, tmp[520], eidhex[33];
+	size_t blen = 0;
+	FILE *f;
+	int rc = 1;
+
+	if (build_import(eu, key, eim_id, imei, direct, eid, &body, &blen) != 0) {
+		free(body);
+		return 1;
+	}
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	if (!(f = fopen(tmp, "w"))) {
+		fprintf(stderr, "ipad: %s: %s\n", tmp, strerror(errno));
+	} else if (fwrite(body, 1, blen, f) != blen || fclose(f) != 0 || rename(tmp, path) != 0) {
+		fprintf(stderr, "ipad: %s: %s\n", path, strerror(errno));
+		unlink(tmp);
+	} else {
+		hex_encode(eid, 16, eidhex);
+		syslog(LOG_NOTICE, "import file for EID %s written to %s", eidhex, path);
+		rc = 0;
+	}
+	free(body);
+	return rc;
 }
 
 /* Everything the card says is collected first: stdout is also the APDU
  * channel, and a line printed in pieces around card calls would come out
  * interleaved with them. */
-static void cmd_info(euicc *eu, const crypto_key *key, const uint8_t eid[16], FILE *out)
+static void cmd_info(euicc *eu, const crypto_key *key, const uint8_t eid[16], const char *dir, FILE *out)
 {
 	static const uint8_t q[] = { 0xBF, 0x55, 0x00 };
 	char eidhex[33], iccid[21], fp[65];
@@ -297,6 +504,19 @@ static void cmd_info(euicc *eu, const crypto_key *key, const uint8_t eid[16], FI
 	}
 	if (have_iccid)
 		fprintf(m, ",\"iccid\":\"%s\"", iccid);
+	if (eu->kind == EUICC_EMU) {
+		char bp[512], rp[512], dp[512];
+		int64_t ctr = 0, tok = 0;
+		bool ht = false;
+
+		snprintf(bp, sizeof(bp), "%s/" BIND_PENDING, dir);
+		snprintf(rp, sizeof(rp), "%s/" BIND_REFUSED_FILE, dir);
+		snprintf(dp, sizeof(dp), "%s/" BIND_DONE_FILE, dir);
+		fprintf(m, ",\"bind\":\"%s\"", access(rp, F_OK) == 0 ? "refused" : access(bp, F_OK) == 0 ? "pending"
+		        : access(dp, F_OK) == 0 ? "done" : "none");
+		if (emu_eim_state(eu->emu, NULL, &ctr, &ht, &tok) == 0)
+			fprintf(m, ",\"counter\":%lld", (long long)ctr);
+	}
 	fprintf(m, ",\"eims\":[");
 	if (r.len && der_parse(r.d, r.len, &t) == 0 && der_find(t.val, t.len, 0xA0, &list) == 0)
 		for (p = list.val, end = list.val + list.len; p < end && der_next(&p, end, &c) == 0; ) {
@@ -422,6 +642,13 @@ int main(int argc, char **argv)
 	}
 
 	openlog("ipad", LOG_PID, LOG_DAEMON);
+
+	if (!strcmp(cmd, "reset")) {
+		rc = cmd_reset(dir);
+		result_line(stdout, rc, "reset", NULL);
+		closelog();
+		return rc;
+	}
 	host_init(&hl, stdin, stdout);
 	card_init(&c, &HOST_CARD_OPS, &hl);
 	memset(&eu, 0, sizeof(eu));
@@ -464,15 +691,22 @@ int main(int argc, char **argv)
 	}
 
 	if (!strcmp(cmd, "info")) {
-		cmd_info(&eu, key, eid, stdout);
+		cmd_info(&eu, key, eid, dir, stdout);
 		rc = 0;
 	} else if (!strcmp(cmd, "provision")) {
 		dbuf f;
 		char err[200];
 
 		db_init(&f);
-		if (optind + 1 >= argc || read_file(argv[optind + 1], &f) < 0 || der_or_hex(&f) < 0) {
-			fprintf(stderr, "ipad: provision needs a readable EimConfigurationData file\n");
+		if (optind + 1 < argc && read_file(argv[optind + 1], &f) == 0 && bundle_is(f.d, f.len)) {
+			if ((rc = provision_bundle(&eu, dir, argv[optind + 1], &f, err, sizeof(err))) != 0)
+				cfg.host.log(&hl, LOG_ERR, err);
+			else
+				cfg.host.log(&hl, LOG_NOTICE, "eIM configuration and device key stored from the bundle");
+			/* the file held the private key: nothing of it stays in memory */
+			memset(f.d, 0, f.len);
+		} else if (optind + 1 >= argc || f.err || der_or_hex(&f) < 0) {
+			fprintf(stderr, "ipad: provision needs a readable EimConfigurationData file or bundle\n");
 			rc = 2;
 		} else if (ipa_add_initial_eim(&eu, f.d, f.len, err, sizeof(err)) < 0) {
 			cfg.host.log(&hl, LOG_ERR, err);
@@ -506,6 +740,13 @@ int main(int argc, char **argv)
 			goto out;
 		}
 		if (!strcmp(cmd, "poll")) {
+			/* bound first: the eIM knows nothing of the card before */
+			rc = bind_card(a, &eu, key, dir, cfg.eim_id, imei, direct, eid, cfg.host.log, &hl);
+			if (rc != 0) {
+				result_line(stdout, rc, rc == EXIT_BIND_REFUSED ? "bind refused" : "bind", NULL);
+				ipa_close(a);
+				goto out;
+			}
 			rc = ipa_poll(a, &s) < 0;
 			/* the enabled profile's parameters after every poll, not only
 			 * after a change: the host's copy may be gone (a config reset),

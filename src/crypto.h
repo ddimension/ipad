@@ -33,6 +33,8 @@ int crypto_cert_spki(const uint8_t *der, size_t len, uint8_t *out, size_t cap, i
 
 crypto_key *crypto_key_generate(void);
 crypto_key *crypto_key_load(const char *path);
+/* a private key from DER in memory: SEC1 or PKCS#8 (the eIM's bundle, D-69) */
+crypto_key *crypto_key_parse(const uint8_t *der, size_t len);
 int crypto_key_save(const crypto_key *k, const char *path);
 
 void crypto_key_free(crypto_key *k);

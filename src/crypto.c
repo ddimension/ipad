@@ -157,6 +157,17 @@ crypto_key *crypto_key_load(const char *path)
 	return k;
 }
 
+crypto_key *crypto_key_parse(const uint8_t *der, size_t len)
+{
+	crypto_key *k = key_new();
+
+	if (!k || mbedtls_pk_parse_key(&k->pk, der, len, NULL, 0, rng, NULL) != 0 || !curve_ok(&k->pk)) {
+		crypto_key_free(k);
+		return NULL;
+	}
+	return k;
+}
+
 /* written to a temporary file created 0600 and renamed over the target, so a
  * crash leaves either the old key or the new one, never half of one, and the
  * key is never readable by others for a moment */

@@ -42,11 +42,19 @@ APDUs in lpac's stdio protocol, plus three events that only the host can
 handle (`profile_changed`, `download`, `connectivity`).
 
 ```
-ipad [options] poll | provision <file> | export <file> | connectivity | notify | info
+ipad [options] poll | provision <file> | export <file> | connectivity | notify | info | reset
 ```
 
 - `provision` stores the eIM configuration. It takes the file `eimctl
-  eim-config` writes.
+  eim-config` writes, or an `eim-ipad-provision/1` bundle (`eimctl ipad
+  bundle`, eIM decision D-69): configuration and device key in one file. The
+  key replaces the generated one (0600), the file is deleted once stored, and
+  the next `poll` binds the card first (`POST /ipad/v1/bind`, same host and
+  TLS as ESipa): 204/409 bound, 403 refused — `poll` then exits 4 until an
+  operator acts —, 429/5xx/no answer tried again on the next poll. `info`
+  reports `bind` (none, pending, done, refused) and the eIM `counter`.
+- `reset` forgets the emulation's eIM configuration, state, device key and
+  binding (no card needed); a new bundle starts from nothing.
 - `export` writes the `eim-euicc-import/1` file for the eIM
   (`eimctl euicc import`).
 - `poll` runs everything the eIM has queued.
