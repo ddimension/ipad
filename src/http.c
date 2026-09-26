@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <arpa/inet.h>
 
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/ssl.h>
@@ -477,6 +478,29 @@ static int pinned_ok(const mbedtls_ssl_context *ssl, const http_tls *t)
 	       !memcmp(buf + sizeof(buf) - n, t->pin_spki, (size_t)n);
 }
 
+/* an iPAddress subjectAltName (RFC 5280 4.2.1.6: 4 or 16 octets) equal to
+ * the address; nothing else in the certificate names an address */
+static bool ip_san_ok(const mbedtls_x509_crt *crt, const char *host)
+{
+	uint8_t want[16];
+	size_t wlen;
+	const mbedtls_x509_sequence *n;
+
+	if (!crt)
+		return false;
+	if (inet_pton(AF_INET6, host, want) == 1)
+		wlen = 16;
+	else if (inet_pton(AF_INET, host, want) == 1)
+		wlen = 4;
+	else
+		return false;
+	for (n = &crt->subject_alt_names; n && n->buf.p; n = n->next)
+		if (n->buf.tag == (MBEDTLS_ASN1_CONTEXT_SPECIFIC | MBEDTLS_X509_SAN_IP_ADDRESS) &&
+		    n->buf.len == wlen && !memcmp(n->buf.p, want, wlen))
+			return true;
+	return false;
+}
+
 /* appends to the request head; -1 once it would not fit, so the offset can
  * never pass the buffer and turn the remaining size negative */
 static int hdr_add(char *buf, size_t cap, size_t *off, const char *fmt, ...)
@@ -599,18 +623,16 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 			err(r, "server key does not match the pinned eIM TLS key", 0);
 			goto out;
 		}
-		/* the chain was verified in the handshake; for an IP literal the
-		 * name was not: once more with the address, which mbedTLS matches
-		 * against the iPAddress entries of the subjectAltName */
-		if (u.ip && !(t && (t->insecure || t->pin_spki))) {
-			uint32_t flags = 0;
-			const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&ssl);
-
-			if (!peer || mbedtls_x509_crt_verify((mbedtls_x509_crt *)peer, &ca, NULL, u.host, &flags,
-			                                     NULL, NULL) != 0) {
-				err(r, "certificate not issued for this address", (int)flags);
-				goto out;
-			}
+		/* the chain was verified in the handshake (authmode required); for
+		 * an IP literal the name was not, and it is not left to
+		 * mbedtls_x509_crt_verify_name either: that also takes a dNSName
+		 * spelling the address, a wildcard and a CN without SAN, where an
+		 * IP reference identity matches iPAddress entries only (RFC 9525
+		 * 6.3, 6.4.4) */
+		if (u.ip && !(t && (t->insecure || t->pin_spki)) &&
+		    (mbedtls_ssl_get_verify_result(&ssl) != 0 || !ip_san_ok(mbedtls_ssl_get_peer_cert(&ssl), u.host))) {
+			err(r, "certificate not issued for this address", 0);
+			goto out;
 		}
 	}
 

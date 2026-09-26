@@ -23,3 +23,16 @@ openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 	-addext "subjectAltName=DNS:localhost" 2>/dev/null
 openssl x509 -in server.cert.pem -outform DER -out server.cert.der
 openssl x509 -in server.cert.pem -pubkey -noout | openssl pkey -pubin -outform DER -out server.spki.der
+
+# identities for an IP-literal URL, same key as the server: only an iPAddress
+# SAN names an address (RFC 9525 6.3); a dNSName spelling it, a wildcard and
+# a CN without SAN must not
+ipcert() {   # ipcert <name> <subject> [<SAN>]
+	openssl req -new -x509 -key server.key.pem -out "ip-$1.cert.pem" -subj "$2" -days 3650 \
+		${3:+-addext "subjectAltName=$3"} 2>/dev/null
+}
+ipcert v4 /CN=ipad-test-ip IP:127.0.0.1
+ipcert v6 /CN=ipad-test-ip IP:::1
+ipcert dns /CN=ipad-test-ip DNS:127.0.0.1
+ipcert wild /CN=ipad-test-ip 'DNS:*.0.0.1'
+ipcert cn /CN=127.0.0.1

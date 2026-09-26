@@ -26,7 +26,7 @@ static size_t slurp(const char *name, uint8_t *buf, size_t cap)
 	return n;
 }
 
-static pid_t server(int port)
+static pid_t server_ex(int port, const char *certname, const char *host)
 {
 	int fd[2];
 	pid_t pid;
@@ -40,9 +40,9 @@ static pid_t server(int port)
 
 		dup2(fd[1], 1);
 		snprintf(p, sizeof(p), "%d", port);
-		snprintf(cert, sizeof(cert), "%s/server.cert.pem", FIXTURES);
+		snprintf(cert, sizeof(cert), "%s/%s", FIXTURES, certname);
 		snprintf(key, sizeof(key), "%s/server.key.pem", FIXTURES);
-		execlp("python3", "python3", TESTS "/tls_echo.py", p, cert, key, (char *)NULL);
+		execlp("python3", "python3", TESTS "/tls_echo.py", p, cert, key, host, (char *)NULL);
 		_exit(127);
 	}
 	close(fd[1]);
@@ -50,6 +50,56 @@ static pid_t server(int port)
 		return -1;
 	close(fd[0]);
 	return pid;
+}
+
+static pid_t server(int port)
+{
+	return server_ex(port, "server.cert.pem", "127.0.0.1");
+}
+
+/* An IP-literal URL against a certificate trusted as its own anchor, so
+ * only the name decides: iPAddress SANs pass; a dNSName spelling the
+ * address, a wildcard and a CN without SAN do not (RFC 9525 6.3). */
+static void ip_names(int port)
+{
+	static const struct {
+		const char *cert, *host, *url_host, *msg;
+		bool ok;
+	} C[] = {
+		{ "ip-v4.cert.pem", "127.0.0.1", "127.0.0.1", "ip: iPAddress SAN 127.0.0.1 matches", true },
+		{ "ip-v6.cert.pem", "::1", "[::1]", "ip: iPAddress SAN ::1 matches [::1]", true },
+		{ "ip-v4.cert.pem", "::1", "[::1]", "ip: an iPAddress SAN of another address does not", false },
+		{ "ip-dns.cert.pem", "127.0.0.1", "127.0.0.1", "ip: a dNSName spelling the address does not match", false },
+		{ "ip-wild.cert.pem", "127.0.0.1", "127.0.0.1", "ip: a wildcard dNSName does not match", false },
+		{ "ip-cn.cert.pem", "127.0.0.1", "127.0.0.1", "ip: a CN without SAN does not match", false },
+	};
+	const char *hdrs[] = { NULL };
+	size_t i;
+
+	for (i = 0; i < sizeof(C) / sizeof(C[0]); i++) {
+		char url[128], ca[512];
+		pid_t pid = server_ex(port + 1 + (int)i, C[i].cert, C[i].host);
+		http_tls t;
+		http_resp r;
+		int rc;
+
+		memset(&t, 0, sizeof(t));
+		snprintf(ca, sizeof(ca), "%s/%s", FIXTURES, C[i].cert);
+		t.ca_file = ca;
+		snprintf(url, sizeof(url), "https://%s:%d/x", C[i].url_host, port + 1 + (int)i);
+		rc = http_post(url, hdrs, (const uint8_t *)"x", 1, &t, &r);
+		if (C[i].ok)
+			OK(pid > 0 && rc == 0 && r.status == 200, C[i].msg);
+		else
+			OK(pid > 0 && rc < 0 && strstr(r.error, "this address"), C[i].msg);
+		if (rc != 0 && C[i].ok)
+			fprintf(stderr, "  error: %s\n", r.error);
+		db_free(&r.body);
+		if (pid > 0) {
+			kill(pid, SIGTERM);
+			waitpid(pid, NULL, 0);
+		}
+	}
 }
 
 /* one response through the parser; the body is compared when want is set */
@@ -390,5 +440,6 @@ int main(void)
 		kill(pid, SIGTERM);
 		waitpid(pid, NULL, 0);
 	}
+	ip_names(port);
 	DONE("test_http");
 }

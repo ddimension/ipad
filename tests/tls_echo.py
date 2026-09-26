@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""A stand-in eIM endpoint for test_http: HTTPS on 127.0.0.1:<port>, answers a
+"""A stand-in eIM endpoint for test_http: HTTPS on 127.0.0.1:<port> (or the
+address given after the key), answers a
 POST with its own body behind a marker, and reports the two ESipa headers it
 saw. Chunked when the path asks for it; /host answers with the Host field."""
-import http.server, ssl, sys
+import http.server, socket, ssl, sys
 
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -27,8 +28,12 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+class H6(http.server.HTTPServer):
+    address_family = socket.AF_INET6
+
 port, cert, key = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-srv = http.server.HTTPServer(('127.0.0.1', port), H)
+host = sys.argv[4] if len(sys.argv) > 4 else '127.0.0.1'
+srv = (H6 if ':' in host else http.server.HTTPServer)((host, port), H)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(cert, key)
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
