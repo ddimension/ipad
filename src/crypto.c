@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 André Valentin <avalentin@marcant.net>
  */
+#define _GNU_SOURCE   /* mkostemp (glibc and musl) */
 #include <errno.h>
+#include <dirent.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -195,12 +198,45 @@ static int sync_dir(const char *path)
 	return rc;
 }
 
+/* Temporaries a crashed save left next to the key: <key>.tmp (the name
+ * before unique names) and <key>.tmp.XXXXXX. Only regular files of ours
+ * older than a minute go: a younger one may be another saver's in flight,
+ * and a link is left alone (unlinking it would be harmless, but it is not
+ * ours to tidy). */
+static void clean_stale(const char *path)
+{
+	char dir[4096], p[4096];
+	const char *slash = strrchr(path, '/'), *base = slash ? slash + 1 : path;
+	size_t bl = strlen(base);
+	struct dirent *e;
+	struct stat st;
+	time_t now = time(NULL);
+	DIR *d;
+
+	if (!slash)
+		snprintf(dir, sizeof(dir), ".");
+	else if (snprintf(dir, sizeof(dir), "%.*s", (int)(slash == path ? 1 : slash - path), path) >= (int)sizeof(dir))
+		return;
+	if (!(d = opendir(dir)))
+		return;
+	while ((e = readdir(d))) {
+		if (strncmp(e->d_name, base, bl) || strncmp(e->d_name + bl, ".tmp", 4) ||
+		    (e->d_name[bl + 4] && e->d_name[bl + 4] != '.'))
+			continue;
+		if (snprintf(p, sizeof(p), "%s/%s", dir, e->d_name) >= (int)sizeof(p))
+			continue;
+		if (lstat(p, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() && now - st.st_mtime > 60)
+			unlink(p);
+	}
+	closedir(d);
+}
+
 /* Written to a temporary file and renamed over the target, so a crash
  * leaves either the old key or the new one, never half of one. The
- * temporary is created afresh (O_EXCL) and not through a link (O_NOFOLLOW):
- * a stale one is removed first, and anything put there in between makes
- * the save fail instead of writing the key where a link points. 0600 is set
- * on the descriptor as well, whatever the umask. */
+ * temporary has a name of its own (mkstemp: O_CREAT|O_EXCL, which also
+ * refuses to follow a link someone put there), so two savers never rename
+ * each other's half-written file; 0600 is set on the descriptor as well,
+ * whatever the umask. */
 int crypto_key_save(const crypto_key *k, const char *path)
 {
 	uint8_t buf[512];
@@ -209,12 +245,11 @@ int crypto_key_save(const crypto_key *k, const char *path)
 	size_t off = 0;
 
 	n = mbedtls_pk_write_key_der((mbedtls_pk_context *)&k->pk, buf, sizeof(buf));
-	if (n <= 0 || snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+	if (n <= 0 || snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int)sizeof(tmp))
 		goto out;
 
-	if (unlink(tmp) != 0 && errno != ENOENT)
-		goto out;
-	fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+	clean_stale(path);
+	fd = mkostemp(tmp, O_CLOEXEC);
 	if (fd < 0)
 		goto out;
 	if (fchmod(fd, 0600) == 0) {
@@ -237,7 +272,11 @@ int crypto_key_save(const crypto_key *k, const char *path)
 	if (rc != 0)
 		unlink(tmp);
 	else if (sync_dir(path) != 0)
-		rc = -1;   /* renamed, but not known to be on disk */
+		/* The new key is in place and is what the next load reads, but
+		 * the rename may not survive a power cut. Reported as a failure:
+		 * the caller then does not hand the new public key to an eIM,
+		 * which would otherwise hold a key the device may lose. */
+		rc = -1;
 out:
 	mbedtls_platform_zeroize(buf, sizeof(buf));
 	return rc;

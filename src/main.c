@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -163,24 +165,54 @@ static void mkdir_p(const char *dir)
 	mkdir(p, 0700);   /* the last one holds the key */
 }
 
+/* The state directory's lock, for as long as a key is looked for and
+ * created: two first runs at once (the host's poll and an `export`) would
+ * otherwise each generate a key, one would win the rename, and the other
+ * could already have exported its public key. -1 when it cannot be taken;
+ * the caller goes on unlocked (a read-only directory has nothing to race
+ * over). */
+static int lock_dir(const char *dir)
+{
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+	if (fd >= 0 && flock(fd, LOCK_EX) != 0) {
+		close(fd);
+		fd = -1;
+	}
+	return fd;
+}
+
+static void unlock_dir(int fd)
+{
+	if (fd >= 0)
+		close(fd);   /* releases the flock */
+}
+
 static crypto_key *device_key(const char *dir)
 {
 	char path[512];
 	crypto_key *k;
+	int lk;
 
 	snprintf(path, sizeof(path), "%s/device.key", dir);
+	lk = lock_dir(dir);
+	/* looked for under the lock: a run that waited finds the key the
+	 * other one created */
 	if (access(path, F_OK) == 0) {
 		if (!(k = crypto_key_load(path)))
 			/* never replaced: a new key would orphan every eIM that
 			 * imported the old one */
 			syslog(LOG_ERR, "device key %s unreadable; not replacing it", path);
+		unlock_dir(lk);
 		return k;
 	}
 	if (!(k = crypto_key_generate()) || crypto_key_save(k, path) < 0) {
 		syslog(LOG_ERR, "cannot create the device key %s", path);
 		crypto_key_free(k);
+		unlock_dir(lk);
 		return NULL;
 	}
+	unlock_dir(lk);
 	syslog(LOG_NOTICE, "created device key %s", path);
 	return k;
 }
@@ -340,10 +372,15 @@ static int provision_bundle(euicc *eu, const char *dir, const char *path, const 
 		goto out;
 
 	if (eu->kind == EUICC_EMU) {
+		int lk, saved;
+
 		snprintf(kpath, sizeof(kpath), "%s/device.key", dir);
 		snprintf(mpath, sizeof(mpath), "%s/" BIND_PENDING, dir);
 		snprintf(mtmp, sizeof(mtmp), "%s.tmp", mpath);
-		if (crypto_key_save(k, kpath) < 0) {
+		lk = lock_dir(dir);
+		saved = crypto_key_save(k, kpath);
+		unlock_dir(lk);
+		if (saved < 0) {
 			snprintf(err, errlen, "cannot store the device key in %.150s", kpath);
 			goto out;
 		}

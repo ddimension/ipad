@@ -25,6 +25,19 @@ ok 'ls "$w/s"/*.state >/dev/null 2>&1' 'the emulation state was written'
 ok 'grep -q "\"format\":\"eim-euicc-import/1\"" "$w/dev.json"' 'export: the import file'
 ok 'grep -q "\"device\":{\"imei\":\"353290611234567\"}" "$w/dev.json"' 'export: with the IMEI'
 
+# two first runs at once create one device key between them (the state
+# directory's lock), five times over
+same=0
+for i in 1 2 3 4 5; do
+	"$b/hostsim" -- "$b/ipad" -s "$w/k$i" info >"$w/k$i.a" 2>&1 &
+	"$b/hostsim" -- "$b/ipad" -s "$w/k$i" info >"$w/k$i.b" 2>&1
+	wait
+	fa=$(grep -o '"key_fingerprint":"[0-9A-F]*"' "$w/k$i.a" | head -1)
+	fb=$(grep -o '"key_fingerprint":"[0-9A-F]*"' "$w/k$i.b" | head -1)
+	[ -n "$fa" ] && [ "$fa" = "$fb" ] && same=$((same + 1))
+done
+ok '[ $same = 5 ]' 'two first runs at once: one device key'
+
 # a second provisioning is refused: one initial eIM (SGP.32 3.5.2)
 out=$("$b/hostsim" -- "$b/ipad" -s "$w/s" provision "$w/cfg.der" 2>&1)
 ok 'echo "$out" | grep -q "\"code\":1"' 'provision again: refused'

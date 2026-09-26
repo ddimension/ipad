@@ -2,9 +2,13 @@
  * crypto.c against OpenSSL-made fixtures (tests/gen_fixtures.sh): signatures
  * verify for P-256 and brainpoolP256r1, from SPKI and from a certificate; its
  * own signatures verify; anything altered does not. */
+#define _DEFAULT_SOURCE   /* mkdtemp, utimes */
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <dirent.h>
 #include "check.h"
 #include "crypto.h"
 
@@ -65,7 +69,7 @@ int main(void)
 
 	/* a generated key: sign, export SPKI, verify through the export, save/load */
 	{
-		crypto_key *k = crypto_key_generate(), *pub, *back;
+		crypto_key *k = crypto_key_generate(), *pub, *back, *back2;
 		int n;
 		char path[] = "/tmp/ipad-test-key-XXXXXX";
 		int fd = mkstemp(path);
@@ -84,26 +88,87 @@ int main(void)
 		   crypto_verify(pub, msg, mlen, mine, sizeof(mine)) == 0, "load: the same key signs");
 		unlink(path);
 
-		/* a stale temporary that is a link is removed, not written
-		 * through: the key lands in the target, the link's file is
-		 * untouched; the key file is 0600 whatever the umask */
+		/* the temporary: never written through a link, stale ones of
+		 * ours tidied, a young one (another saver's) left, a link left;
+		 * the key file is 0600 whatever the umask */
 		{
-			char tmp[64], bait[] = "/tmp/ipad-test-bait-XXXXXX";
+			char dir[] = "/tmp/ipad-test-dir-XXXXXX", kp[64], p[320], bait[80];
+			static const char *const left[] = { "bait", "device.key", "device.key.tmp",
+			                                    "device.key.tmp.fresh", "device.key.tmp.lnk" };
+			struct timeval old_tv[2] = { { 1000000000, 0 }, { 1000000000, 0 } };
 			struct stat st;
-			mode_t old = umask(0);
-			int bfd = mkstemp(bait);
+			mode_t um;
+			FILE *f;
+			size_t i;
+			int kids, entries = 0, all = 1;
+			DIR *d;
+			struct dirent *e;
 
-			snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-			OK(bfd >= 0 && write(bfd, "bait", 4) == 4, "bait file");
-			close(bfd);
-			OK(symlink(bait, tmp) == 0, "stale temporary as a link");
-			OK(crypto_key_save(k, path) == 0, "save: over a stale linked temporary");
-			OK(stat(bait, &st) == 0 && st.st_size == 4, "save: the link's target is untouched");
-			OK(lstat(tmp, &st) != 0, "save: no temporary left");
-			OK(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600, "save: 0600 with umask 0");
-			umask(old);
-			unlink(path);
-			unlink(bait);
+			OK(mkdtemp(dir) != NULL, "temp dir");
+			snprintf(kp, sizeof(kp), "%s/device.key", dir);
+			snprintf(bait, sizeof(bait), "%s/bait", dir);
+			if ((f = fopen(bait, "w"))) {
+				fputs("bait", f);
+				fclose(f);
+			}
+			snprintf(p, sizeof(p), "%s.tmp", kp);
+			OK(symlink(bait, p) == 0, "a link where the old fixed temporary was");
+			snprintf(p, sizeof(p), "%s.tmp.lnk", kp);
+			OK(symlink(bait, p) == 0, "a link that looks like a temporary");
+			snprintf(p, sizeof(p), "%s.tmp.stale", kp);
+			if ((f = fopen(p, "w")))
+				fclose(f);
+			OK(utimes(p, old_tv) == 0, "a stale temporary");
+			snprintf(p, sizeof(p), "%s.tmp.fresh", kp);
+			if ((f = fopen(p, "w")))
+				fclose(f);
+
+			um = umask(0);
+			OK(crypto_key_save(k, kp) == 0, "save: with links and temporaries around");
+			umask(um);
+			OK(stat(bait, &st) == 0 && st.st_size == 4, "save: no link written through");
+			OK(stat(kp, &st) == 0 && (st.st_mode & 0777) == 0600, "save: 0600 with umask 0");
+			snprintf(p, sizeof(p), "%s.tmp.stale", kp);
+			OK(lstat(p, &st) != 0, "save: a stale temporary is removed");
+
+			/* savers at once: each renames its own file, the key is whole */
+			for (kids = 0; kids < 4; kids++)
+				if (fork() == 0) {
+					int j, bad = 0;
+
+					for (j = 0; j < 25; j++)
+						bad |= crypto_key_save(k, kp) != 0;
+					_exit(bad);
+				}
+			while (kids-- > 0) {
+				int ws;
+
+				wait(&ws);
+				all &= WIFEXITED(ws) && WEXITSTATUS(ws) == 0;
+			}
+			OK(all, "save: four savers at once all succeed");
+			back2 = crypto_key_load(kp);
+			OK(back2 != NULL, "save: the key loads after concurrent saves");
+			crypto_key_free(back2);
+
+			/* nothing else is left behind */
+			if ((d = opendir(dir))) {
+				while ((e = readdir(d))) {
+					if (e->d_name[0] == '.')
+						continue;
+					entries++;
+					for (i = 0; i < sizeof(left) / sizeof(left[0]); i++)
+						if (!strcmp(e->d_name, left[i]))
+							break;
+					if (i == sizeof(left) / sizeof(left[0]))
+						fprintf(stderr, "  left behind: %s\n", e->d_name);
+					snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+					unlink(p);
+				}
+				closedir(d);
+			}
+			OK(entries == 5, "save: no temporary of its own left");
+			rmdir(dir);
 		}
 
 		crypto_key_free(k);
