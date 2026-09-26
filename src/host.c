@@ -53,10 +53,24 @@ static size_t utf8_len(const unsigned char *s)
 	return n;
 }
 
+/* the whole string is well-formed UTF-8 */
+static bool utf8_ok(const char *s)
+{
+	const unsigned char *p = (const unsigned char *)s;
+	size_t n;
+
+	for (; *p; p += n)
+		if (!(n = utf8_len(p)))
+			return false;
+	return true;
+}
+
 /* JSON text is UTF-8 (RFC 8259 8.1). The strings come from the card (a
  * profile's APN and credentials are 8-bit text in whatever coding the
  * operator chose) and the eIM; a byte that is not UTF-8 would make the
- * whole line unreadable for the host's JSON parser, so it becomes U+FFFD. */
+ * whole line unreadable for the host's JSON parser, so it becomes U+FFFD —
+ * in text for display. A value the host acts on is checked before it gets
+ * here (ev_connectivity) and never altered. */
 void host_json_str(FILE *f, const char *s)
 {
 	const unsigned char *p = (const unsigned char *)s;
@@ -219,6 +233,8 @@ const card_ops HOST_CARD_OPS = { hc_open, hc_transmit, hc_close };
 
 /* ---- events ---- */
 
+static void ev_log(void *ud, int lvl, const char *msg);
+
 static const char *event_answer(host_link *h)
 {
 	fprintf(h->out, "}}\n");
@@ -256,6 +272,18 @@ static void ev_connectivity(void *ud, const char *iccid, const conn_params *p, b
 {
 	host_link *h = ud;
 
+	/* U+FFFD is for text a person reads. An APN or a credential the host
+	 * dials with must arrive as it is on the card or not at all: a
+	 * replaced byte would be a wrong password the network rejects, with
+	 * nothing to say why. The values themselves stay out of the log. */
+	if (p && (!utf8_ok(p->apn) || !utf8_ok(p->username) || !utf8_ok(p->password))) {
+		char msg[160];
+
+		snprintf(msg, sizeof(msg), "profile %.24s: APN or credentials are not UTF-8; connectivity parameters "
+		         "not handed to the host", iccid);
+		ev_log(h, LOG_ERR, msg);
+		return;
+	}
 	fprintf(h->out, "{\"type\":\"event\",\"payload\":{\"event\":\"connectivity\",\"iccid\":");
 	host_json_str(h->out, iccid);
 	fprintf(h->out, ",\"emulated\":%s,\"source\":\"%s\"", emulated ? "true" : "false", p ? "card" : "none");

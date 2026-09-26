@@ -92,5 +92,44 @@ int main(void)
 	JSON_EQ("\xf4\x90\x80\x80", "\"\\ufffd\\ufffd\\ufffd\\ufffd\"", "json: above U+10FFFF is refused");
 	JSON_EQ("x\xe2\x82", "\"x\\ufffd\\ufffd\"", "json: a sequence cut at the end");
 
+	/* the connectivity event: credentials that are not UTF-8 are not
+	 * sent mangled, the event is not sent at all */
+	{
+		static char answer[] = "{\"type\":\"event\",\"payload\":{}}\n";
+		conn_params p;
+		host_link h;
+		ipa_host hooks;
+		char *out = NULL;
+		size_t n = 0;
+		FILE *in = fmemopen(answer, sizeof(answer) - 1, "r"), *o = open_memstream(&out, &n);
+
+		host_init(&h, in, o);
+		memset(&hooks, 0, sizeof(hooks));
+		host_ipa_hooks(&h, &hooks, 0);
+		memset(&p, 0, sizeof(p));
+		snprintf(p.apn, sizeof(p.apn), "internet");
+		snprintf(p.username, sizeof(p.username), "user");
+		snprintf(p.password, sizeof(p.password), "p\xe4ss");   /* Latin-1 */
+		hooks.connectivity(hooks.ud, "8949000000000000001", &p, false);
+		fflush(o);
+		OK(n == 0, "event: Latin-1 password -> no event");
+		OK(strstr(h.last_error, "not UTF-8") && !strstr(h.last_error, "p\xe4ss") && !strstr(h.last_error, "user"),
+		   "event: the error says why, without the credentials");
+		snprintf(p.password, sizeof(p.password), "p\xc3\xa4ss");   /* the same in UTF-8 */
+		hooks.connectivity(hooks.ud, "8949000000000000001", &p, false);
+		fflush(o);
+		OK(n > 0 && strstr(out, "\"password\":\"p\xc3\xa4ss\""), "event: UTF-8 credentials sent as they are");
+		snprintf(p.apn, sizeof(p.apn), "inter\xffnet");
+		n = 0;
+		fseek(o, 0, SEEK_SET);
+		hooks.connectivity(hooks.ud, "8949000000000000001", &p, false);
+		fflush(o);
+		OK(n == 0, "event: an APN that is not UTF-8 -> no event");
+		fclose(o);
+		fclose(in);
+		free(out);
+		host_free(&h);
+	}
+
 	DONE("test_connectivity");
 }
