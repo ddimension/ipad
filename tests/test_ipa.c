@@ -704,6 +704,42 @@ int main(void)
 
 	ipa_close(a);
 	emu_close(eu.emu);
+
+	/* --- a trustedPublicKeyDataTls ipad cannot use: the CA bundle decides,
+	 * and the log says so (a fresh emulation state on the same card) --- */
+	{
+		char st2[] = "/tmp/ipad-test-ipa2-XXXXXX";
+		static const uint8_t junk[] = { 0x02, 0x01, 0x00 };
+		dbuf c0, c1;
+		der_tlv t;
+		size_t m0, m1;
+
+		close(mkstemp(st2));
+		unlink(st2);
+		ecfg.state_path = st2;
+		eu.emu = emu_open(&c, &ecfg);
+		db_init(&c0);
+		db_init(&c1);
+		eimpkg_cfg_ex(&c0, EIM, "eim.test.example:8443", 4, eim_key, false, NULL);
+		der_parse(c0.d, c0.len, &t);
+		m0 = der_begin(&c1, 0x30);
+		db_put(&c1, t.val, t.len);
+		m1 = der_begin(&c1, 0xA6);
+		der_put(&c1, 0xA1, junk, sizeof(junk));   /* a "certificate" that does not parse */
+		der_end(&c1, m1);
+		der_end(&c1, m0);
+		OK(eu.emu && ipa_add_initial_eim(&eu, c1.d, c1.len, err, sizeof(err)) == 0, "tls anchor: provisioned");
+		h.last_log[0] = 0;
+		a = ipa_open(&cfg);
+		OK(a && strstr(h.last_log, "trustedPublicKeyDataTls unusable (certificate does not parse)") &&
+		   strstr(h.last_log, "CA bundle"), "tls anchor: an unusable one is logged, the CA bundle named");
+		OK(a && !ipa_tls(a)->pin_spki && !ipa_tls(a)->ca_der, "tls anchor: neither pin nor CA taken from it");
+		ipa_close(a);
+		emu_close(eu.emu);
+		db_free(&c0);
+		db_free(&c1);
+		unlink(st2);
+	}
 	simcard_free(&s);
 	fake22_free(&fc);
 	for (mark = 0; mark < eim.ngot; mark++)
