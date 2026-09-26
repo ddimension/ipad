@@ -98,6 +98,20 @@ int main(void)
 		OK(der_parse(longtag, sizeof(longtag), &t) < 0, "malformed: tag longer than 4 octets");
 	}
 
+	/* a length that would wrap len + n is refused, not copied: the chunked
+	 * reader once handed db_put a peer's SIZE_MAX-ish chunk size */
+	{
+		uint8_t x[4] = { 1, 2, 3, 4 };
+
+		db_init(&b);
+		db_put(&b, x, sizeof(x));
+		db_put(&b, x, SIZE_MAX);
+		OK(b.err && b.len == 4, "db_put: len + n wrapping is refused");
+		db_put(&b, x, 1);
+		OK(b.len == 4, "db_put: the error is sticky");
+		db_free(&b);
+	}
+
 	/* every eIM vector: parse fully and re-encode to the identical bytes */
 	for (i = 0; i < sizeof(VECTORS) / sizeof(VECTORS[0]); i++) {
 		int n = hex_decode(VECTORS[i].hex, buf, sizeof(buf));

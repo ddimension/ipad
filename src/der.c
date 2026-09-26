@@ -122,12 +122,19 @@ static int db_reserve(dbuf *b, size_t n)
 	if (b->err)
 		return -1;
 
+	/* n comes from lengths a peer chose (chunk sizes, TLV lengths): len + n
+	 * must not wrap, or the check below passes and the copy runs off the
+	 * buffer; and doubling must not wrap to 0 and loop for ever */
+	if (n > SIZE_MAX - b->len) {
+		b->err = 1;
+		return -1;
+	}
 	if (b->len + n > b->cap) {
-		size_t cap = b->cap ? b->cap : 256;
+		size_t want = b->len + n, cap = b->cap ? b->cap : 256;
 		uint8_t *d;
 
-		while (cap < b->len + n)
-			cap *= 2;
+		while (cap < want)
+			cap = cap > SIZE_MAX / 2 ? want : cap * 2;
 		d = realloc(b->d, cap);
 		if (!d) {
 			b->err = 1;
