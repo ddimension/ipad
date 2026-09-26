@@ -1,9 +1,27 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * connectivity.c: httpParams (SGP.32 v1.3 2.4.4 Table 3) built per the ETSI
- * codings cited in connectivity.h, and read back to a connection config. */
+ * codings cited in connectivity.h, and read back to a connection config.
+ * The JSON string writer the parameters reach the host through. */
+#define _POSIX_C_SOURCE 200809L   /* open_memstream */
+#include <stdlib.h>
 #include "check.h"
 #include "connectivity.h"
 #include "hex.h"
+#include "host.h"
+
+/* host_json_str into a string */
+static char *json(const char *in)
+{
+	char *out = NULL;
+	size_t n = 0;
+	FILE *f = open_memstream(&out, &n);
+
+	host_json_str(f, in);
+	fclose(f);
+	return out;
+}
+
+#define JSON_EQ(in, want, msg) do { char *_j = json(in); OK(_j && !strcmp(_j, want), msg); free(_j); } while (0)
 
 static int parse_hex(const char *h, conn_params *o)
 {
@@ -61,6 +79,18 @@ int main(void)
 	OK(parse_hex("4705" "0961626364", &c) < 0, "malformed: label overruns the NAN");
 	OK(parse_hex("4705" "04612F6263", &c) < 0, "malformed: '/' is not an APN character");
 	OK(parse_hex("4709" "0461626364", &c) < 0, "malformed: TLV longer than the data");
+
+	/* a profile's credentials are 8-bit text in any coding: what is not
+	 * UTF-8 must not end up in the host's JSON line */
+	JSON_EQ("internet", "\"internet\"", "json: ASCII as is");
+	JSON_EQ("a\"b\\c\n\x7f", "\"a\\\"b\\\\c\\u000a\\u007f\"", "json: quote, backslash, controls escaped");
+	JSON_EQ("gr\xc3\xbc\xc3\x9f \xe2\x82\xac \xf0\x9f\x93\xb6", "\"gr\xc3\xbc\xc3\x9f \xe2\x82\xac \xf0\x9f\x93\xb6\"",
+	        "json: well-formed UTF-8 as is");
+	JSON_EQ("p\xe4ss", "\"p\\ufffdss\"", "json: a Latin-1 byte becomes U+FFFD");
+	JSON_EQ("\xc0\xaf", "\"\\ufffd\\ufffd\"", "json: an overlong form is refused");
+	JSON_EQ("\xed\xa0\x80", "\"\\ufffd\\ufffd\\ufffd\"", "json: a surrogate is refused");
+	JSON_EQ("\xf4\x90\x80\x80", "\"\\ufffd\\ufffd\\ufffd\\ufffd\"", "json: above U+10FFFF is refused");
+	JSON_EQ("x\xe2\x82", "\"x\\ufffd\\ufffd\"", "json: a sequence cut at the end");
 
 	DONE("test_connectivity");
 }

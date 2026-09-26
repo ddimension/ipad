@@ -25,18 +25,60 @@ void host_free(host_link *h)
 	h->line = NULL;
 }
 
+/* Length of the well-formed UTF-8 sequence at s (RFC 3629 4: no overlong
+ * forms, no surrogates, nothing above U+10FFFF), 0 when it is not one. */
+static size_t utf8_len(const unsigned char *s)
+{
+	size_t n, i;
+	uint32_t cp;
+
+	if (s[0] < 0x80)
+		return 1;
+	if (s[0] >= 0xC2 && s[0] <= 0xDF)
+		n = 2, cp = s[0] & 0x1F;
+	else if (s[0] >= 0xE0 && s[0] <= 0xEF)
+		n = 3, cp = s[0] & 0x0F;
+	else if (s[0] >= 0xF0 && s[0] <= 0xF4)
+		n = 4, cp = s[0] & 0x07;
+	else
+		return 0;
+	for (i = 1; i < n; i++) {
+		if ((s[i] & 0xC0) != 0x80)   /* also stops at the terminator */
+			return 0;
+		cp = (cp << 6) | (s[i] & 0x3F);
+	}
+	if ((n == 3 && cp < 0x800) || (n == 4 && (cp < 0x10000 || cp > 0x10FFFF)) ||
+	    (cp >= 0xD800 && cp <= 0xDFFF))
+		return 0;
+	return n;
+}
+
+/* JSON text is UTF-8 (RFC 8259 8.1). The strings come from the card (a
+ * profile's APN and credentials are 8-bit text in whatever coding the
+ * operator chose) and the eIM; a byte that is not UTF-8 would make the
+ * whole line unreadable for the host's JSON parser, so it becomes U+FFFD. */
 void host_json_str(FILE *f, const char *s)
 {
-	fputc('"', f);
-	for (; *s; s++) {
-		unsigned char c = (unsigned char)*s;
+	const unsigned char *p = (const unsigned char *)s;
+	size_t n;
 
-		if (c == '"' || c == '\\')
+	fputc('"', f);
+	while (*p) {
+		unsigned char c = *p;
+
+		if (c == '"' || c == '\\') {
 			fprintf(f, "\\%c", c);
-		else if (c < 0x20)
+			p++;
+		} else if (c < 0x20 || c == 0x7F) {
 			fprintf(f, "\\u%04x", c);
-		else
-			fputc(c, f);
+			p++;
+		} else if ((n = utf8_len(p)) > 0) {
+			fwrite(p, 1, n, f);
+			p += n;
+		} else {
+			fputs("\\ufffd", f);
+			p++;
+		}
 	}
 	fputc('"', f);
 }
