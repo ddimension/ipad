@@ -36,3 +36,21 @@ ipcert v6 /CN=ipad-test-ip IP:::1
 ipcert dns /CN=ipad-test-ip DNS:127.0.0.1
 ipcert wild /CN=ipad-test-ip 'DNS:*.0.0.1'
 ipcert cn /CN=127.0.0.1
+
+# Device keys as earlier ipad versions stored them, which must keep loading.
+# devkey-0d536a3.sec1.der was written by crypto_key_generate + crypto_key_save
+# built from commit 0d536a3 (SEC1 ECPrivateKey with parameters and public
+# key, as mbedtls_pk_write_key_der writes it) and is not regenerated here.
+# From its private scalar: SEC1 and PKCS#8 without the public key, which
+# mbedTLS derives; and the SPKI all three must yield, made by OpenSSL.
+python3 - <<'PY'
+d = open('devkey-0d536a3.sec1.der', 'rb').read()
+assert d[5:7] == b'\x04\x20'
+priv = d[7:39]
+p256, ec = bytes.fromhex('06082a8648ce3d030107'), bytes.fromhex('06072a8648ce3d0201')
+tlv = lambda t, v: bytes([t, len(v)]) + v
+bare = tlv(0x30, b'\x02\x01\x01' + tlv(0x04, priv))
+open('p256-nopub.sec1.der', 'wb').write(tlv(0x30, b'\x02\x01\x01' + tlv(0x04, priv) + tlv(0xa0, p256)))
+open('p256-nopub.pkcs8.der', 'wb').write(tlv(0x30, b'\x02\x01\x00' + tlv(0x30, ec + p256) + tlv(0x04, bare)))
+PY
+openssl pkey -inform DER -in devkey-0d536a3.sec1.der -pubout -outform DER -out devkey-0d536a3.spki.der

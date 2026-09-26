@@ -217,6 +217,34 @@ int main(void)
 		crypto_key_free(b);
 	}
 
+	/* device keys as earlier versions stored them still load: SEC1 as
+	 * 0d536a3 wrote it, and SEC1 / PKCS#8 without the public key (mbedTLS
+	 * derives it, and the pair check holds); all yield OpenSSL's SPKI */
+	{
+		static const char *const files[] = { "devkey-0d536a3.sec1.der", "p256-nopub.sec1.der",
+		                                     "p256-nopub.pkcs8.der" };
+		uint8_t want[128], got[128];
+		size_t wl = slurp("devkey-0d536a3.spki.der", want, sizeof(want)), i;
+
+		for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+			char p[512], msg1[96];
+			crypto_key *k, *pub;
+			int gl;
+
+			snprintf(p, sizeof(p), "%s/%s", FIXTURES, files[i]);
+			k = crypto_key_load(p);
+			gl = k ? crypto_key_spki(k, got, sizeof(got)) : -1;
+			snprintf(msg1, sizeof(msg1), "old key %s: loads, with the public key OpenSSL derives", files[i]);
+			OK(k && wl > 0 && (size_t)gl == wl && !memcmp(got, want, wl), msg1);
+			pub = crypto_pub_from_spki(want, wl);
+			snprintf(msg1, sizeof(msg1), "old key %s: signs verifiably", files[i]);
+			OK(k && pub && crypto_sign(k, msg, mlen, mine) == 0 && crypto_verify(pub, msg, mlen, mine, sizeof(mine)) == 0,
+			   msg1);
+			crypto_key_free(k);
+			crypto_key_free(pub);
+		}
+	}
+
 	/* a curve RSP does not use is refused, not trusted */
 	{
 		uint8_t rsa_spki[] = { 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 };
