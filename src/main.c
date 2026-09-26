@@ -17,6 +17,7 @@
 #include <dirent.h>
 
 #include <mbedtls/base64.h>
+#include <mbedtls/platform_util.h>
 
 #include "bundle.h"
 #include "crypto.h"
@@ -89,7 +90,7 @@ static int read_file(const char *path, dbuf *out)
 	fclose(f);
 	if (n > 0 && n <= READ_MAX)
 		db_put(out, buf, n);
-	memset(buf, 0, n);
+	mbedtls_platform_zeroize(buf, n);
 	free(buf);
 	return n > 0 && n <= READ_MAX && !out->err ? 0 : -1;
 }
@@ -786,7 +787,7 @@ int main(int argc, char **argv)
 			else
 				cfg.host.log(&hl, LOG_NOTICE, "eIM configuration and device key stored from the bundle");
 			/* the file held the private key: nothing of it stays in memory */
-			memset(f.d, 0, f.len);
+			mbedtls_platform_zeroize(f.d, f.len);
 		} else if (optind + 1 >= argc || f.err || der_or_hex(&f) < 0) {
 			snprintf(hl.last_error, sizeof(hl.last_error), "provision needs a readable EimConfigurationData file or bundle");
 			fprintf(stderr, "ipad: %s\n", hl.last_error);

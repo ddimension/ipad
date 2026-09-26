@@ -15,6 +15,7 @@
 #include <mbedtls/sha256.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#include <mbedtls/platform_util.h>
 
 #include "crypto.h"
 
@@ -153,7 +154,7 @@ crypto_key *crypto_key_load(const char *path)
 		crypto_key_free(k);
 		k = NULL;
 	}
-	memset(buf, 0, sizeof(buf));
+	mbedtls_platform_zeroize(buf, sizeof(buf));
 	return k;
 }
 
@@ -191,7 +192,7 @@ int crypto_key_save(const crypto_key *k, const char *path)
 		if (rc != 0)
 			unlink(tmp);
 	}
-	memset(buf, 0, sizeof(buf));
+	mbedtls_platform_zeroize(buf, sizeof(buf));
 	return rc;
 }
 

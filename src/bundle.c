@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include <mbedtls/base64.h>
+#include <mbedtls/platform_util.h>
 
 #include "bundle.h"
 
@@ -64,7 +65,7 @@ static int b64_into(const uint8_t *s, size_t n, dbuf *out)
 	rc = mbedtls_base64_decode(o, olen, &olen, s, n);
 	if (rc == 0)
 		db_put(out, o, olen);
-	memset(o, 0, olen);   /* may be the private key */
+	mbedtls_platform_zeroize(o, olen);   /* may be the private key */
 	free(o);
 	return rc == 0 && !out->err ? 0 : -1;
 }
@@ -248,7 +249,7 @@ bad:
 void bundle_free(bundle *b)
 {
 	if (b->device_key.d)
-		memset(b->device_key.d, 0, b->device_key.len);
+		mbedtls_platform_zeroize(b->device_key.d, b->device_key.len);
 	db_free(&b->device_key);
 	db_free(&b->eim_config);
 }
