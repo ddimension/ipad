@@ -1,0 +1,78 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2026 André Valentin <avalentin@marcant.net>
+ *
+ * Internals of the emulation, shared by emu.c (the ES10 functions) and
+ * emu_state.c (the state and the eIM configuration records).
+ */
+#ifndef IPAD_EMU_INT_H
+#define IPAD_EMU_INT_H
+
+#include <stdbool.h>
+#include "emu.h"
+#include "der.h"
+
+#define EMU_MAX_EIMS 8
+#define EMU_MAX_EPRS 16
+
+typedef struct {
+	dbuf cfg;              /* EimConfigurationData, universal SEQUENCE form */
+	char id[129];
+	int64_t counter;       /* replay counter (section 5.9.1) */
+	bool has_token;
+	int64_t token;         /* associationToken */
+	crypto_key *pub;       /* eimPublicKey / eimCertificate key, NULL if none */
+} emu_eim;
+
+struct emu {
+	card *card;
+	emu_config cfg;
+	char *state_path;                /* our copy: cfg.state_path need not outlive emu_open */
+	uint8_t eid[16];
+
+	emu_eim eims[EMU_MAX_EIMS];
+	int neims;
+
+	int64_t seq;                     /* last sequence number used */
+	dbuf eprs[EMU_MAX_EPRS];         /* stored signed EPRs, BF51 ... */
+	int64_t epr_seq[EMU_MAX_EPRS];
+	int neprs;
+
+	/* Profile Rollback (sections 3.3.2, 5.9.16): granted by an enable with
+	 * rollbackFlag, reset by the next eUICC Package */
+	bool rb_granted;
+	uint8_t rb_iccid[10];            /* the profile to go back to */
+	char rb_eim[129];
+	int64_t rb_counter;
+	uint8_t rb_txid[16];
+	size_t rb_txid_len;
+	int64_t rb_epr_seq;              /* the EPR a successful rollback discards (3.3.2 NOTE1) */
+
+	/* Fallback (sections 3.4.6, 3.4.7, 5.9.21, 5.9.22) */
+	bool fb_set;
+	uint8_t fb_iccid[10];
+	bool fb_active;
+	bool fb_prev_set;
+	uint8_t fb_prev[10];
+
+	/* Immediate Profile Enabling (sections 3.4.4, 3.4.5, 5.9.15) */
+	bool ie_flag;
+	dbuf ie_oid, ie_addr;
+	bool ie_ctx;                     /* a download just completed */
+	uint8_t ie_iccid[10];
+
+	int64_t token_ctr;               /* associationToken generation */
+};
+
+/* state file */
+int emu_state_load(emu *e);
+int emu_state_save(const emu *e);
+
+/* eIM configuration records */
+int emu_eim_from_cfg(emu_eim *m, const uint8_t *cfg, size_t len);   /* cfg: 30 ... */
+void emu_eim_free(emu_eim *m);
+emu_eim *emu_eim_find(emu *e, const char *id);
+
+/* the associationToken data object for signing: 84 <token> or 84 01 00 */
+void emu_assoc_do(const emu_eim *m, dbuf *b);
+
+#endif

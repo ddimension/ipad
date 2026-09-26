@@ -1,0 +1,15 @@
+# Decodes every ESipa message of a test run with the eIM's own ASN.1 types
+# (ddimension eim, crates/eim-asn1) and checks that re-encoding gives the same
+# bytes. Expects the eim checkout next to the wwand workspace; adjust the path
+# otherwise. Run through tools/esipa-check.sh.
+[package]
+name = "esipa-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+eim-asn1 = { path = "../../../../eim/crates/eim-asn1" }
+hex = "0.4"
+
+[workspace]

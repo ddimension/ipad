@@ -1,0 +1,1360 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2026 André Valentin <avalentin@marcant.net>
+ *
+ * The ES10 functions of the virtual SGP.32 ISD-R (see emu.h). Section
+ * numbers are SGP.32 v1.3 unless SGP.22 is named; the ASN.1 is
+ * spec/SGP32Definitions.asn and spec/RSPDefinitions.asn (SGP.22 v2.7).
+ */
+#define _POSIX_C_SOURCE 200809L   /* strdup */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "emu_int.h"
+
+/* --- small helpers ---------------------------------------------------------- */
+
+static void put_seq(dbuf *b, uint32_t tag, const dbuf *content)
+{
+	der_put(b, tag, content->d, content->len);
+}
+
+/* an ES10 function on the SGP.22 card */
+static int card_call(emu *e, const dbuf *req, dbuf *resp)
+{
+	return card_es10(e->card, req->d, req->len, resp);
+}
+
+/* the single INTEGER result inside a response like BF31 { 80 01 00 } */
+static int result_of(const dbuf *resp, uint32_t tag, int64_t *v)
+{
+	der_tlv t, r;
+
+	if (der_parse(resp->d, resp->len, &t) < 0 || t.tag != tag ||
+	    der_find(t.val, t.len, 0x80, &r) < 0 || der_get_int(&r, v) < 0)
+		return -1;
+	return 0;
+}
+
+/* ES10c.EnableProfile / DisableProfile (SGP.22 5.7.16/5.7.17): refreshFlag
+ * FALSE. The host resets the SIM after a change (wwand's apply after a
+ * profile switch); a REFRESH here would reset it a second time under it. */
+static int64_t card_switch(emu *e, uint32_t tag, const uint8_t iccid[10])
+{
+	dbuf req, resp;
+	size_t m, c;
+	int64_t v = 127;
+
+	db_init(&req);
+	db_init(&resp);
+	m = der_begin(&req, tag);
+	c = der_begin(&req, 0xA0);
+	der_put(&req, 0x5A, iccid, 10);
+	der_end(&req, c);
+	der_put_bool(&req, 0x81, false);
+	der_end(&req, m);
+
+	if (card_call(e, &req, &resp) < 0 || result_of(&resp, tag, &v) < 0)
+		v = 127;
+	db_free(&req);
+	db_free(&resp);
+	return v;
+}
+
+static int64_t card_delete(emu *e, const uint8_t iccid[10])
+{
+	dbuf req, resp;
+	size_t m;
+	int64_t v = 127;
+
+	db_init(&req);
+	db_init(&resp);
+	m = der_begin(&req, 0xBF33);   /* DeleteProfileRequest ::= [51] CHOICE, explicit */
+	der_put(&req, 0x5A, iccid, 10);
+	der_end(&req, m);
+
+	if (card_call(e, &req, &resp) < 0 || result_of(&resp, 0xBF33, &v) < 0)
+		v = 127;
+	db_free(&req);
+	db_free(&resp);
+	return v;
+}
+
+/* --- the card's profiles ------------------------------------------------------ */
+
+typedef struct {
+	uint8_t iccid[10];
+	bool enabled;
+	bool fallback_allowed;
+} prof;
+
+#define MAX_PROF 32
+
+static int profiles(emu *e, prof *out, int cap, dbuf *raw)
+{
+	uint8_t req[] = { 0xBF, 0x2D, 0x00 };
+	dbuf resp;
+	der_tlv t, list, it, x;
+	const uint8_t *p, *end;
+	int n = 0;
+
+	db_init(&resp);
+	if (card_es10(e->card, req, sizeof(req), &resp) < 0 ||
+	    der_parse(resp.d, resp.len, &t) < 0 || t.tag != 0xBF2D ||
+	    der_find(t.val, t.len, 0xA0, &list) < 0) {
+		db_free(&resp);
+		return -1;
+	}
+
+	for (p = list.val, end = list.val + list.len; p < end && n < cap; ) {
+		if (der_next(&p, end, &it) < 0 || it.tag != 0xE3)
+			break;
+		if (der_find(it.val, it.len, 0x5A, &x) < 0 || x.len != 10)
+			continue;
+		memcpy(out[n].iccid, x.val, 10);
+		out[n].enabled = der_find(it.val, it.len, 0x9F70, &x) == 0 && x.len == 1 && x.val[0] == 1;
+		out[n].fallback_allowed = e->cfg.fallback_allowed ||
+			(der_find(it.val, it.len, 0x9F67, &x) == 0 && x.len == 1 && x.val[0]);
+		n++;
+	}
+
+	if (raw)
+		db_put(raw, resp.d, resp.len);
+	db_free(&resp);
+	return n;
+}
+
+static prof *find_prof(prof *ps, int n, const uint8_t *iccid)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (!memcmp(ps[i].iccid, iccid, 10))
+			return &ps[i];
+	return NULL;
+}
+
+static prof *enabled_prof(prof *ps, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (ps[i].enabled)
+			return &ps[i];
+	return NULL;
+}
+
+/* --- signed results -------------------------------------------------------- */
+
+/* EuiccPackageResultDataSigned (2.11.2.1) signed with the device key and
+ * wrapped: BF51 { A0 { 30 {data}, 5F37 sig } }. Also stored, with its
+ * sequence number, until the IPA removes it after delivery (2.11.2). */
+static int sign_epr(emu *e, const emu_eim *m, const char *eim_id, int64_t counter,
+                    const uint8_t *txid, size_t txid_len, const dbuf *results, dbuf *out)
+{
+	dbuf data, input;
+	uint8_t sig[CRYPTO_SIG_LEN];
+	size_t d, a, r;
+	int64_t seq = e->seq < EMU_SEQ_BASE ? EMU_SEQ_BASE : e->seq + 1;
+
+	db_init(&data);
+	d = der_begin(&data, 0x30);
+	der_put_str(&data, 0x80, eim_id);
+	der_put_int(&data, 0x81, counter);
+	if (txid_len)
+		der_put(&data, 0x82, txid, txid_len);
+	der_put_int(&data, 0x83, seq);
+	put_seq(&data, 0x30, results);
+	der_end(&data, d);
+
+	db_init(&input);
+	db_put(&input, data.d, data.len);
+	emu_assoc_do(m, &input);
+
+	if (data.err || input.err || crypto_sign(e->cfg.key, input.d, input.len, sig) < 0) {
+		db_free(&data);
+		db_free(&input);
+		return -1;
+	}
+
+	a = der_begin(out, 0xBF51);
+	r = der_begin(out, 0xA0);
+	db_put(out, data.d, data.len);
+	der_put(out, 0x5F37, sig, sizeof(sig));
+	der_end(out, r);
+	der_end(out, a);
+	db_free(&data);
+	db_free(&input);
+
+	if (out->err)
+		return -1;
+
+	e->seq = seq;
+
+	/* keep it; at capacity the oldest goes, as 2.11.2 prescribes */
+	if (e->neprs == EMU_MAX_EPRS) {
+		db_free(&e->eprs[0]);
+		memmove(&e->eprs[0], &e->eprs[1], sizeof(e->eprs[0]) * (EMU_MAX_EPRS - 1));
+		memmove(&e->epr_seq[0], &e->epr_seq[1], sizeof(e->epr_seq[0]) * (EMU_MAX_EPRS - 1));
+		e->neprs--;
+	}
+	db_init(&e->eprs[e->neprs]);
+	db_put(&e->eprs[e->neprs], out->d, out->len);
+	e->epr_seq[e->neprs++] = seq;
+	return 0;
+}
+
+/* EuiccPackageErrorSigned: BF51 { A1 { 30 {80 id, 81 counter, 82 txid, 02 code}, 5F37 } } */
+static int sign_epe(emu *e, const emu_eim *m, int64_t counter, const uint8_t *txid, size_t txid_len,
+                    int64_t code, dbuf *out)
+{
+	dbuf data, input;
+	uint8_t sig[CRYPTO_SIG_LEN];
+	size_t d, a, r;
+	int rc = -1;
+
+	db_init(&data);
+	d = der_begin(&data, 0x30);
+	der_put_str(&data, 0x80, m->id);
+	der_put_int(&data, 0x81, counter);
+	if (txid_len)
+		der_put(&data, 0x82, txid, txid_len);
+	der_put_int(&data, 0x02, code);
+	der_end(&data, d);
+
+	db_init(&input);
+	db_put(&input, data.d, data.len);
+	emu_assoc_do(m, &input);
+
+	if (!data.err && !input.err && crypto_sign(e->cfg.key, input.d, input.len, sig) == 0) {
+		a = der_begin(out, 0xBF51);
+		r = der_begin(out, 0xA1);
+		db_put(out, data.d, data.len);
+		der_put(out, 0x5F37, sig, sizeof(sig));
+		der_end(out, r);
+		der_end(out, a);
+		rc = out->err ? -1 : 0;
+	}
+	db_free(&data);
+	db_free(&input);
+	return rc;
+}
+
+/* EuiccPackageErrorUnsigned: BF51 { A2 { 80 id, 82 txid, 84 token, 8F code } };
+ * the token if and only if one is configured (5.9.1) */
+static void unsigned_error(const char *eim_id, const emu_eim *m, const uint8_t *txid,
+                           size_t txid_len, int64_t code, dbuf *out)
+{
+	size_t a = der_begin(out, 0xBF51), r = der_begin(out, 0xA2);
+
+	der_put_str(out, 0x80, eim_id);
+	if (txid_len)
+		der_put(out, 0x82, txid, txid_len);
+	if (m && m->has_token)
+		der_put_int(out, 0x84, m->token);
+	if (code >= 0)
+		der_put_int(out, 0x8F, code);
+	der_end(out, r);
+	der_end(out, a);
+}
+
+/* --- ES10b.LoadEuiccPackage (5.9.1) ----------------------------------------- */
+
+typedef struct {
+	/* the marks of section 3.4, applied after the result is signed (3.3.1 step 8b) */
+	bool enable_done, disable_done;
+	bool to_enable, to_disable;
+	uint8_t enable_iccid[10], disable_iccid[10];
+	uint8_t del[8][10];
+	int ndel;
+	bool grant_rb;
+	uint8_t rb_iccid[10];
+	int del_eim;          /* index of an eIM deleted by deleteEim, applied after signing */
+} marks;
+
+static bool marked_delete(const marks *k, const uint8_t *iccid)
+{
+	int i;
+
+	for (i = 0; i < k->ndel; i++)
+		if (!memcmp(k->del[i], iccid, 10))
+			return true;
+	return false;
+}
+
+/* one PSMO; returns its result code (0 ok), writes its EuiccResultData */
+static int64_t psmo(emu *e, marks *k, prof *ps, int np, const der_tlv *op, dbuf *res)
+{
+	der_tlv x;
+	prof *p, *en;
+	int64_t v = 0;
+
+	switch (op->tag) {
+	case 0xA3:   /* enable (3.4.1) */
+		if (k->enable_done || der_find(op->val, op->len, 0x5A, &x) < 0 || x.len != 10) {
+			v = 127;
+		} else if (!(p = find_prof(ps, np, x.val))) {
+			v = 1;   /* iccidOrAidNotFound */
+		} else {
+			bool rb = der_find(op->val, op->len, 0x05, &x) == 0;   /* rollbackFlag NULL */
+
+			en = enabled_prof(ps, np);
+			if (p->enabled)
+				v = 2;    /* profileNotInDisabledState */
+			else if (rb && !en)
+				v = 20;   /* rollbackNotAvailable */
+			else {
+				k->enable_done = true;
+				k->to_enable = true;
+				memcpy(k->enable_iccid, p->iccid, 10);
+				if (en) {
+					k->to_disable = true;
+					memcpy(k->disable_iccid, en->iccid, 10);
+				}
+				if (rb) {
+					k->grant_rb = true;
+					memcpy(k->rb_iccid, en->iccid, 10);
+				}
+				/* enabling clears the fallback reference (3.4.1 step 3) */
+				e->fb_prev_set = false;
+			}
+		}
+		der_put_int(res, 0x83, v);
+		return v;
+
+	case 0xA4:   /* disable (3.4.2) */
+		if (k->enable_done || k->disable_done || der_find(op->val, op->len, 0x5A, &x) < 0 || x.len != 10)
+			v = 127;
+		else if (!(p = find_prof(ps, np, x.val)))
+			v = 1;
+		else if (!p->enabled)
+			v = 2;    /* profileNotInEnabledState */
+		else {
+			k->disable_done = true;
+			k->to_disable = true;
+			memcpy(k->disable_iccid, p->iccid, 10);
+		}
+		der_put_int(res, 0x84, v);
+		return v;
+
+	case 0xA5: { /* delete (3.4.3) */
+		bool marked_off, marked_on;
+
+		if (der_find(op->val, op->len, 0x5A, &x) < 0 || x.len != 10) {
+			v = 127;
+		} else if (!(p = find_prof(ps, np, x.val))) {
+			v = 1;
+		} else {
+			marked_off = k->to_disable && !memcmp(k->disable_iccid, p->iccid, 10);
+			marked_on = k->to_enable && !memcmp(k->enable_iccid, p->iccid, 10);
+
+			if ((p->enabled && !marked_off) || (!p->enabled && marked_on))
+				v = 2;    /* profileNotInDisabledState */
+			else if ((k->grant_rb && !memcmp(k->rb_iccid, p->iccid, 10)) ||
+			         (e->rb_granted && !memcmp(e->rb_iccid, p->iccid, 10)))
+				v = 20;   /* rollbackNotAvailable */
+			else if (e->fb_active && e->fb_prev_set && !memcmp(e->fb_prev, p->iccid, 10))
+				v = 21;   /* returnFallbackProfile */
+			else if (k->ndel < 8 && !marked_delete(k, p->iccid))
+				memcpy(k->del[k->ndel++], p->iccid, 10);
+		}
+		der_put_int(res, 0x85, v);
+		return v;
+	}
+
+	case 0xBF2D: { /* listProfileInfo: the card's own answer, [45] replacing [45] */
+		dbuf req, resp;
+
+		db_init(&req);
+		db_init(&resp);
+		db_put(&req, op->raw, op->raw_len);
+		if (card_call(e, &req, &resp) < 0) {
+			der_put_int(res, 0x02, 127);   /* processingTerminated undefinedError */
+			v = 127;
+		} else {
+			db_put(res, resp.d, resp.len);
+		}
+		db_free(&req);
+		db_free(&resp);
+		return v;
+	}
+
+	case 0xA6: { /* getRAT: SGP.22 ES10b.GetRAT, the table itself as [6] */
+		uint8_t req[] = { 0xBF, 0x43, 0x00 };
+		dbuf resp;
+		der_tlv t, rat;
+
+		db_init(&resp);
+		if (card_es10(e->card, req, sizeof(req), &resp) == 0 &&
+		    der_parse(resp.d, resp.len, &t) == 0 && der_find(t.val, t.len, 0xA0, &rat) == 0) {
+			der_put(res, 0xA6, rat.val, rat.len);
+		} else {
+			der_put_int(res, 0x02, 127);
+			v = 127;
+		}
+		db_free(&resp);
+		return v;
+	}
+
+	case 0xA7:   /* configureImmediateEnable (3.4.4) */
+		e->ie_flag = der_find(op->val, op->len, 0x80, &x) == 0;
+		if (der_find(op->val, op->len, 0x81, &x) == 0) {
+			e->ie_oid.len = 0;
+			db_put(&e->ie_oid, x.val, x.len);
+		}
+		if (der_find(op->val, op->len, 0x82, &x) == 0) {
+			e->ie_addr.len = 0;
+			db_put(&e->ie_addr, x.val, x.len);
+		}
+		der_put_int(res, 0x87, 0);
+		return 0;
+
+	case 0xA8:   /* setFallbackAttribute (3.4.6) */
+		if (der_find(op->val, op->len, 0x5A, &x) < 0 || x.len != 10)
+			v = 127;
+		else if (!(p = find_prof(ps, np, x.val)))
+			v = 1;
+		else if (e->fb_set && !memcmp(e->fb_iccid, p->iccid, 10))
+			v = 0;    /* already set: ok */
+		else if (!p->fallback_allowed)
+			v = 2;    /* fallbackNotAllowed */
+		else if (e->fb_set && e->fb_active)
+			v = 3;    /* fallbackProfileEnabled */
+		else {
+			e->fb_set = true;
+			memcpy(e->fb_iccid, p->iccid, 10);
+		}
+		der_put_int(res, 0x8D, v);
+		return v;
+
+	case 0xA9:   /* unsetFallbackAttribute (3.4.7) */
+		if (!e->fb_set)
+			v = 2;    /* noFallbackAttribute */
+		else if (e->fb_active)
+			v = 3;
+		else
+			e->fb_set = false;
+		der_put_int(res, 0x8E, v);
+		return v;
+
+	case 0xBF65: { /* setDefaultDpAddress: SGP.22 ES10a.SetDefaultDpAddress (BF3F) */
+		dbuf req, resp;
+		size_t m;
+		int64_t r = 127;
+
+		if (der_find(op->val, op->len, 0x80, &x) < 0) {
+			v = 127;
+		} else {
+			db_init(&req);
+			db_init(&resp);
+			m = der_begin(&req, 0xBF3F);
+			der_put(&req, 0x80, x.val, x.len);
+			der_end(&req, m);
+			if (card_call(e, &req, &resp) < 0 || result_of(&resp, 0xBF3F, &r) < 0)
+				r = 127;
+			db_free(&req);
+			db_free(&resp);
+			v = r == 0 ? 0 : 127;
+		}
+		m = der_begin(res, 0xBF65);
+		der_put_int(res, 0x80, v);
+		der_end(res, m);
+		return v;
+	}
+	}
+
+	der_put_int(res, 0x02, 2);   /* processingTerminated unknownOrDamagedCommand */
+	return 2;
+}
+
+/* rebuild a configuration: the stored one with the fields of an update laid
+ * over it, in the SEQUENCE's field order (DER) */
+static int merge_cfg(const dbuf *old, const uint8_t *upd, size_t ulen, dbuf *out)
+{
+	static const uint32_t order[] = { 0x80, 0x81, 0x82, 0x83, 0x84, 0xA5, 0xA6, 0x87, 0x88, 0x89, 0xAA };
+	der_tlv o, t;
+	size_t m, i;
+
+	if (der_parse(old->d, old->len, &o) < 0)
+		return -1;
+
+	m = der_begin(out, 0x30);
+	for (i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+		if (der_find(upd, ulen, order[i], &t) == 0 || der_find(o.val, o.len, order[i], &t) == 0)
+			db_put(out, t.raw, t.raw_len);
+	}
+	der_end(out, m);
+	return out->err ? -1 : 0;
+}
+
+/* one eCO (3.5.1); returns its result code, writes its EuiccResultData */
+static int64_t eco(emu *e, marks *k, const emu_eim *requester, const der_tlv *op, dbuf *res)
+{
+	der_tlv x;
+	dbuf cfg;
+	int64_t v = 0;
+	size_t m;
+	emu_eim *t;
+	int i;
+
+	switch (op->tag) {
+	case 0xA8:   /* addEim: [8] EimConfigurationData, implicitly tagged */
+	case 0xAA: { /* updateEim */
+		char id[129] = { 0 };
+
+		if (der_find(op->val, op->len, 0x80, &x) < 0 || x.len == 0 || x.len > 128) {
+			v = op->tag == 0xA8 ? 7 : 1;   /* commandError / eimNotFound */
+		} else {
+			memcpy(id, x.val, x.len);
+			t = emu_eim_find(e, id);
+			db_init(&cfg);
+
+			if (op->tag == 0xA8) {
+				int64_t tok = 0;
+				bool want_tok = der_find(op->val, op->len, 0x84, &x) == 0 && der_get_int(&x, &tok) == 0;
+
+				if (t)
+					v = 2;    /* associatedEimAlreadyExists */
+				else if (e->neims == EMU_MAX_EIMS)
+					v = 1;    /* insufficientMemory */
+				else if (want_tok && tok != -1)
+					v = 5;    /* invalidAssociationToken */
+				else {
+					dbuf stored;
+
+					/* a generated token replaces the -1 request in what is stored */
+					db_init(&stored);
+					m = der_begin(&stored, 0x30);
+					{
+						const uint8_t *p = op->val, *end = op->val + op->len;
+						der_tlv f;
+
+						while (p < end && der_next(&p, end, &f) == 0)
+							if (f.tag != 0x84)
+								db_put(&stored, f.raw, f.raw_len);
+					}
+					der_end(&stored, m);
+
+					if (emu_eim_from_cfg(&e->eims[e->neims], stored.d, stored.len) < 0) {
+						v = 7;
+					} else {
+						emu_eim *n = &e->eims[e->neims++];
+
+						if (want_tok) {
+							n->has_token = true;
+							n->token = ++e->token_ctr;
+							m = der_begin(res, 0xA8);
+							der_put_int(res, 0x84, n->token);
+							der_end(res, m);
+							db_free(&stored);
+							db_free(&cfg);
+							return 0;
+						}
+					}
+					db_free(&stored);
+				}
+				m = der_begin(res, 0xA8);
+				der_put_int(res, 0x02, v);
+				der_end(res, m);
+				db_free(&cfg);
+				return v;
+			}
+
+			/* updateEim */
+			if (!t)
+				v = 1;
+			else if (der_find(op->val, op->len, 0x84, &x) == 0)
+				v = 7;    /* the token cannot be updated */
+			else if (der_find(op->val, op->len, 0x83, &x) < 0 && der_find(op->val, op->len, 0xA5, &x) < 0 &&
+			         der_find(op->val, op->len, 0x82, &x) < 0 && der_find(op->val, op->len, 0x81, &x) < 0 &&
+			         der_find(op->val, op->len, 0x87, &x) < 0 && der_find(op->val, op->len, 0xA6, &x) < 0 &&
+			         der_find(op->val, op->len, 0x88, &x) < 0)
+				v = 7;    /* nothing to update */
+			else {
+				int64_t nc = t->counter;
+				bool key = der_find(op->val, op->len, 0xA5, &x) == 0;
+
+				if (der_find(op->val, op->len, 0x83, &x) == 0)
+					der_get_int(&x, &nc);
+				if (nc < t->counter && !key) {
+					v = 7;   /* a lower counter only together with a new key */
+				} else if (merge_cfg(&t->cfg, op->val, op->len, &cfg) < 0) {
+					v = 127;
+				} else {
+					emu_eim n;
+
+					if (emu_eim_from_cfg(&n, cfg.d, cfg.len) < 0) {
+						v = 127;
+					} else {
+						n.counter = nc;
+						n.has_token = t->has_token;
+						n.token = t->token;
+						emu_eim_free(t);
+						*t = n;
+					}
+				}
+			}
+			db_free(&cfg);
+			der_put_int(res, 0x8A, v);
+			return v;
+		}
+		if (op->tag == 0xA8) {
+			m = der_begin(res, 0xA8);
+			der_put_int(res, 0x02, v);
+			der_end(res, m);
+		} else {
+			der_put_int(res, 0x8A, v);
+		}
+		return v;
+	}
+
+	case 0xA9: { /* deleteEim */
+		char id[129] = { 0 };
+
+		if (der_find(op->val, op->len, 0x80, &x) < 0 || x.len == 0 || x.len > 128) {
+			v = 7;
+		} else {
+			memcpy(id, x.val, x.len);
+			if (!(t = emu_eim_find(e, id))) {
+				v = 1;   /* eimNotFound */
+			} else {
+				/* deleted after the result is signed: the requester may be
+				 * deleting itself, and it still signs this result (3.5.1) */
+				k->del_eim = (int)(t - e->eims);
+				v = e->neims == 1 ? 2 : 0;   /* lastEimDeleted */
+			}
+		}
+		der_put_int(res, 0x89, v);
+		return v == 2 ? 0 : v;
+	}
+
+	case 0xAB: { /* listEim: AB { A0 { 30 {80 id, 82 type}... } } */
+		size_t l, s;
+
+		(void)requester;
+		m = der_begin(res, 0xAB);
+		l = der_begin(res, 0xA0);
+		for (i = 0; i < e->neims; i++) {
+			der_tlv ty;
+			der_tlv w;
+
+			s = der_begin(res, 0x30);
+			der_put_str(res, 0x80, e->eims[i].id);
+			if (der_parse(e->eims[i].cfg.d, e->eims[i].cfg.len, &w) == 0 &&
+			    der_find(w.val, w.len, 0x82, &ty) == 0)
+				db_put(res, ty.raw, ty.raw_len);
+			der_end(res, s);
+		}
+		der_end(res, l);
+		der_end(res, m);
+		return 0;
+	}
+	}
+
+	der_put_int(res, 0x02, 2);   /* processingTerminated unknownOrDamagedCommand */
+	return 2;
+}
+
+static void apply_marks(emu *e, const marks *k)
+{
+	int i;
+
+	/* 3.3.1 step 8b. SGP.22 enabling switches away from the enabled profile
+	 * by itself; a disable is only needed when nothing is to be enabled */
+	if (k->to_enable)
+		card_switch(e, 0xBF31, k->enable_iccid);
+	else if (k->to_disable)
+		card_switch(e, 0xBF32, k->disable_iccid);
+
+	for (i = 0; i < k->ndel; i++)
+		card_delete(e, k->del[i]);
+}
+
+static int load_euicc_package(emu *e, const uint8_t *req, size_t len, dbuf *out)
+{
+	der_tlv top, signed_, sig, x, pkg, op;
+	char eim_id[129] = { 0 };
+	uint8_t txid[16];
+	size_t txid_len = 0;
+	int64_t counter = 0;
+	emu_eim *m;
+	dbuf input, results;
+	prof ps[MAX_PROF];
+	int np;
+	marks k;
+	const uint8_t *p, *end;
+
+	if (der_parse(req, len, &top) < 0 || top.tag != 0xBF51 ||
+	    der_find(top.val, top.len, 0x30, &signed_) < 0 ||
+	    der_find(top.val, top.len, 0x5F37, &sig) < 0 ||
+	    der_find(signed_.val, signed_.len, 0x80, &x) < 0 || x.len == 0 || x.len > 128) {
+		unsigned_error("", NULL, NULL, 0, 127, out);
+		return 0;
+	}
+	memcpy(eim_id, x.val, x.len);
+
+	if (der_find(signed_.val, signed_.len, 0x82, &x) == 0 && x.len <= sizeof(txid)) {
+		memcpy(txid, x.val, x.len);
+		txid_len = x.len;
+	}
+
+	/* unknown eIM: unsigned error with the eimId received */
+	if (!(m = emu_eim_find(e, eim_id)) || !m->pub) {
+		unsigned_error(eim_id, NULL, txid, txid_len, 127, out);
+		return 0;
+	}
+
+	/* the signature over the euiccPackageSigned data object AS RECEIVED,
+	 * followed by the associationToken data object */
+	db_init(&input);
+	db_put(&input, signed_.raw, signed_.raw_len);
+	emu_assoc_do(m, &input);
+	if (input.err || crypto_verify(m->pub, input.d, input.len, sig.val, sig.len) < 0) {
+		db_free(&input);
+		unsigned_error(eim_id, m, txid, txid_len, 127, out);
+		return 0;
+	}
+	db_free(&input);
+
+	if (der_find(signed_.val, signed_.len, 0x81, &x) < 0 || der_get_int(&x, &counter) < 0) {
+		unsigned_error(eim_id, m, txid, txid_len, 127, out);
+		return 0;
+	}
+
+	/* then the EID, then the replay counter; both as signed errors */
+	if (der_find(signed_.val, signed_.len, 0x5A, &x) < 0 || x.len != 16 || memcmp(x.val, e->eid, 16))
+		return sign_epe(e, m, counter, txid, txid_len, 3, out);   /* invalidEid */
+	if (counter <= m->counter)
+		return sign_epe(e, m, counter, txid, txid_len, 4, out);   /* replayError */
+
+	/* a new package resets any rollback authorisation (5.9.1) */
+	e->rb_granted = false;
+
+	memset(&k, 0, sizeof(k));
+	k.del_eim = -1;
+	db_init(&results);
+
+	if (der_find(signed_.val, signed_.len, 0xA0, &pkg) == 0) {   /* psmoList */
+		np = profiles(e, ps, MAX_PROF, NULL);
+		if (np < 0) {
+			der_put_int(&results, 0x02, 127);
+		} else {
+			for (p = pkg.val, end = pkg.val + pkg.len; p < end; ) {
+				if (der_next(&p, end, &op) < 0) {
+					der_put_int(&results, 0x02, 2);
+					break;
+				}
+				if (psmo(e, &k, ps, np, &op, &results) != 0)
+					break;   /* stop at the first failure (3.3.1 step 5) */
+			}
+		}
+	} else if (der_find(signed_.val, signed_.len, 0xA1, &pkg) == 0) {   /* ecoList */
+		for (p = pkg.val, end = pkg.val + pkg.len; p < end; ) {
+			if (der_next(&p, end, &op) < 0) {
+				der_put_int(&results, 0x02, 2);
+				break;
+			}
+			if (eco(e, &k, m, &op, &results) != 0)
+				break;
+		}
+	} else {
+		der_put_int(&results, 0x02, 2);
+	}
+
+	/* the counter moves with the package (5.9.1), before the eIM record can
+	 * be replaced by an update or deleted */
+	m->counter = counter;
+
+	if (sign_epr(e, m, eim_id, counter, txid, txid_len, &results, out) < 0) {
+		db_free(&results);
+		return -1;
+	}
+	db_free(&results);
+
+	if (k.grant_rb) {
+		e->rb_granted = true;
+		memcpy(e->rb_iccid, k.rb_iccid, 10);
+		snprintf(e->rb_eim, sizeof(e->rb_eim), "%s", eim_id);
+		e->rb_counter = counter;
+		memcpy(e->rb_txid, txid, txid_len);
+		e->rb_txid_len = txid_len;
+		e->rb_epr_seq = e->seq;   /* the result just signed */
+	}
+
+	if (k.del_eim >= 0) {
+		emu_eim_free(&e->eims[k.del_eim]);
+		memmove(&e->eims[k.del_eim], &e->eims[k.del_eim + 1],
+		        sizeof(e->eims[0]) * (size_t)(e->neims - k.del_eim - 1));
+		e->neims--;
+	}
+
+	/* The counter and the result are persisted BEFORE the card is switched.
+	 * The other order would let a crash between the two leave the counter
+	 * behind, and the same package would then execute a second time. Known
+	 * limit of emulating an atomic function over a card that is not: a
+	 * crash after this save and before the switch leaves a signed "ok" for
+	 * a change the card never made. The eIM sees it in the profile list;
+	 * an IoT eUICC cannot get into this state (5.9.1). */
+	if (emu_state_save(e) < 0)
+		return -1;
+
+	apply_marks(e, &k);
+	return 0;
+}
+
+/* --- the other SGP.32 functions -------------------------------------------- */
+
+static void simple_result(dbuf *out, uint32_t tag, uint32_t rtag, int64_t v)
+{
+	size_t m = der_begin(out, tag);
+
+	der_put_int(out, rtag, v);
+	der_end(out, m);
+}
+
+/* One EimConfigurationData as GetEimConfigurationData returns it (5.9.18):
+ * the stored configuration WITHOUT counterValue ("The eUICC SHALL NOT
+ * provide counterValue"), and with the associationToken the eUICC generated,
+ * not the -1 the eIM asked with. The stored copy keeps the eIM's request as
+ * it came; this is only the rendering. */
+static void put_eim_config(const emu_eim *m, dbuf *out)
+{
+	der_tlv whole, c;
+	const uint8_t *p, *end;
+	bool tok_done = !m->has_token;
+	size_t s = der_begin(out, 0x30);
+
+	if (der_parse(m->cfg.d, m->cfg.len, &whole) == 0)
+		for (p = whole.val, end = whole.val + whole.len; p < end && der_next(&p, end, &c) == 0; ) {
+			if (c.tag == 0x83 || c.tag == 0x84)
+				continue;
+			/* associationToken [4] sits between eimIdType [2] and
+			 * eimPublicKeyData [5]; DER keeps declaration order */
+			if (!tok_done && c.tag != 0x80 && c.tag != 0x81 && c.tag != 0x82) {
+				der_put_int(out, 0x84, m->token);
+				tok_done = true;
+			}
+			db_put(out, c.raw, c.raw_len);
+		}
+	if (!tok_done)
+		der_put_int(out, 0x84, m->token);
+	der_end(out, s);
+}
+
+/* ES10b.GetEimConfigurationData (5.9.18): BF55 { A0 { cfg... } } */
+static int get_eim_config(emu *e, const uint8_t *req, size_t len, dbuf *out)
+{
+	der_tlv top, sc, id;
+	size_t m, l;
+	int i;
+	char want[129] = { 0 };
+
+	if (der_parse(req, len, &top) == 0 && der_find(top.val, top.len, 0xA0, &sc) == 0 &&
+	    der_find(sc.val, sc.len, 0x80, &id) == 0 && id.len < sizeof(want))
+		memcpy(want, id.val, id.len);
+
+	m = der_begin(out, 0xBF55);
+	l = der_begin(out, 0xA0);
+	for (i = 0; i < e->neims; i++)
+		if (!want[0] || !strcmp(want, e->eims[i].id))
+			put_eim_config(&e->eims[i], out);
+	der_end(out, l);
+	der_end(out, m);
+	return 0;
+}
+
+/* ES10b.AddInitialEim (5.9.17, 3.5.2) */
+static int add_initial_eim(emu *e, const uint8_t *req, size_t len, dbuf *out)
+{
+	der_tlv top, list, c, x;
+	const uint8_t *p, *end;
+	dbuf oks;
+	size_t m;
+	int64_t code = -1;
+
+	db_init(&oks);
+
+	if (e->neims > 0)
+		code = 2;   /* associatedEimAlreadyExists */
+	else if (der_parse(req, len, &top) < 0 || der_find(top.val, top.len, 0xA0, &list) < 0)
+		code = 7;
+	else
+		for (p = list.val, end = list.val + list.len; p < end && code < 0; ) {
+			int64_t tok = 0;
+			bool want_tok;
+
+			if (der_next(&p, end, &c) < 0 || c.tag != 0x30) {
+				code = 7;
+				break;
+			}
+			want_tok = der_find(c.val, c.len, 0x84, &x) == 0 && der_get_int(&x, &tok) == 0;
+			if (want_tok && tok != -1) {
+				code = 5;   /* invalidAssociationToken */
+				break;
+			}
+			if (e->neims == EMU_MAX_EIMS) {
+				code = 1;
+				break;
+			}
+			if (emu_eim_from_cfg(&e->eims[e->neims], c.raw, c.raw_len) < 0) {
+				code = 7;
+				break;
+			}
+			if (want_tok) {
+				e->eims[e->neims].has_token = true;
+				e->eims[e->neims].token = ++e->token_ctr;
+				der_put_int(&oks, 0x84, e->eims[e->neims].token);
+			} else {
+				der_put_null(&oks, 0x05);   /* addOk */
+			}
+			e->neims++;
+		}
+
+	m = der_begin(out, 0xBF57);
+	if (code >= 0) {
+		/* nothing of a failed request is kept */
+		while (e->neims > 0 && code != 2)
+			emu_eim_free(&e->eims[--e->neims]);
+		der_put_int(out, 0x81, code);
+	} else {
+		der_put(out, 0xA0, oks.d, oks.len);
+	}
+	der_end(out, m);
+	db_free(&oks);
+
+	return (code < 0 && emu_state_save(e) < 0) ? -1 : 0;
+}
+
+/* ES10b.ProfileRollback (5.9.16) */
+static int profile_rollback(emu *e, dbuf *out)
+{
+	emu_eim *m;
+	dbuf results, epr;
+	size_t t;
+
+	if (!e->rb_granted || !(m = emu_eim_find(e, e->rb_eim))) {
+		simple_result(out, 0xBF58, 0x02, 1);   /* rollbackNotAllowed */
+		return 0;
+	}
+
+	if (card_switch(e, 0xBF31, e->rb_iccid) != 0) {
+		simple_result(out, 0xBF58, 0x02, 7);   /* commandError */
+		return 0;
+	}
+
+	db_init(&results);
+	db_init(&epr);
+	der_put_int(&results, 0x8C, 0);   /* rollbackResult ok */
+	if (sign_epr(e, m, e->rb_eim, e->rb_counter, e->rb_txid, e->rb_txid_len, &results, &epr) < 0) {
+		db_free(&results);
+		db_free(&epr);
+		return -1;
+	}
+	e->rb_granted = false;
+
+	/* the result of the package that granted the rollback is discarded
+	 * (3.3.2 NOTE1): the IPA sends only the rollback's */
+	{
+		int i;
+
+		for (i = 0; i < e->neprs; i++)
+			if (e->epr_seq[i] == e->rb_epr_seq) {
+				db_free(&e->eprs[i]);
+				memmove(&e->eprs[i], &e->eprs[i + 1], sizeof(e->eprs[0]) * (size_t)(e->neprs - i - 1));
+				memmove(&e->epr_seq[i], &e->epr_seq[i + 1], sizeof(e->epr_seq[0]) * (size_t)(e->neprs - i - 1));
+				e->neprs--;
+				break;
+			}
+	}
+
+	t = der_begin(out, 0xBF58);
+	der_put_int(out, 0x02, 0);
+	db_put(out, epr.d, epr.len);   /* [81] replaces EuiccPackageResult's own [81] */
+	der_end(out, t);
+
+	db_free(&results);
+	db_free(&epr);
+	return emu_state_save(e);
+}
+
+/* ES10b.ExecuteFallbackMechanism (5.9.21) / ReturnFromFallback (5.9.22) */
+static int fallback(emu *e, bool execute, dbuf *out)
+{
+	uint32_t tag = execute ? 0xBF5D : 0xBF5E;
+	prof ps[MAX_PROF], *en, *fb;
+	int np = profiles(e, ps, MAX_PROF, NULL);
+	int64_t v;
+
+	if (!e->fb_set) {
+		simple_result(out, tag, 0x80, 6);   /* fallbackNotAvailable */
+		return 0;
+	}
+	if (np < 0) {
+		simple_result(out, tag, 0x80, 127);
+		return 0;
+	}
+
+	en = enabled_prof(ps, np);
+	fb = find_prof(ps, np, e->fb_iccid);
+
+	if (execute) {
+		if (!fb || fb->enabled) {
+			simple_result(out, tag, 0x80, 2);   /* profileNotInDisabledState */
+			return 0;
+		}
+		v = card_switch(e, 0xBF31, e->fb_iccid);
+		if (v == 0) {
+			e->fb_active = true;
+			e->fb_prev_set = en != NULL;
+			if (en)
+				memcpy(e->fb_prev, en->iccid, 10);
+		}
+	} else {
+		if (!e->fb_active || !e->fb_prev_set) {
+			simple_result(out, tag, 0x80, 7);   /* commandError */
+			return 0;
+		}
+		v = card_switch(e, 0xBF31, e->fb_prev);
+		if (v == 0)
+			e->fb_active = false;
+	}
+
+	simple_result(out, tag, 0x80, v == 0 ? 0 : (v == 5 ? 5 : 127));
+	return emu_state_save(e);
+}
+
+/* ES10b.ImmediateEnable (5.9.15) */
+static int immediate_enable(emu *e, dbuf *out)
+{
+	int64_t v;
+
+	if (!e->ie_flag) {
+		simple_result(out, 0xBF5A, 0x80, 1);   /* immediateEnableNotAvailable */
+		return 0;
+	}
+	if (!e->ie_ctx) {
+		simple_result(out, 0xBF5A, 0x80, 4);   /* noSessionContext */
+		return 0;
+	}
+	v = card_switch(e, 0xBF31, e->ie_iccid);
+	e->ie_ctx = false;
+	simple_result(out, 0xBF5A, 0x80, v == 0 ? 0 : (v == 5 ? 5 : 127));
+	return 0;
+}
+
+/* ES10b.ConfigureImmediateProfileEnabling (5.9.19, 3.4.5) */
+static int configure_immediate(emu *e, const uint8_t *req, size_t len, dbuf *out)
+{
+	der_tlv top, x;
+
+	if (e->neims > 0) {
+		simple_result(out, 0xBF59, 0x80, 2);   /* eIM configuration present */
+		return 0;
+	}
+	if (der_parse(req, len, &top) < 0) {
+		simple_result(out, 0xBF59, 0x80, 127);
+		return 0;
+	}
+	e->ie_flag = der_find(top.val, top.len, 0x80, &x) == 0;
+	if (der_find(top.val, top.len, 0x81, &x) == 0) {
+		e->ie_oid.len = 0;
+		db_put(&e->ie_oid, x.val, x.len);
+	}
+	if (der_find(top.val, top.len, 0x82, &x) == 0) {
+		e->ie_addr.len = 0;
+		db_put(&e->ie_addr, x.val, x.len);
+	}
+	simple_result(out, 0xBF59, 0x80, 0);
+	return emu_state_save(e);
+}
+
+/* ES10b.RetrieveNotificationsList (5.9.10): the stored EPRs are answered
+ * here, notifications by the card */
+static int retrieve_notifications(emu *e, const uint8_t *req, size_t len, dbuf *out)
+{
+	der_tlv top, sc, x;
+	size_t m, l;
+	int i;
+	int64_t seq = -1;
+
+	if (der_parse(req, len, &top) < 0)
+		return -1;
+
+	if (der_find(top.val, top.len, 0xA0, &sc) == 0) {
+		bool eprs = der_find(sc.val, sc.len, 0x82, &x) == 0;
+
+		if (der_find(sc.val, sc.len, 0x80, &x) == 0)
+			der_get_int(&x, &seq);
+
+		if (eprs || seq >= EMU_SEQ_BASE) {
+			m = der_begin(out, 0xBF2B);
+			l = der_begin(out, 0xA2);
+			for (i = 0; i < e->neprs; i++)
+				if (eprs || e->epr_seq[i] == seq)
+					db_put(out, e->eprs[i].d, e->eprs[i].len);
+			der_end(out, l);
+			der_end(out, m);
+			return 0;
+		}
+	}
+	return card_es10(e->card, req, len, out);
+}
+
+/* ES10b.RemoveNotificationFromList (SGP.22 5.7.11) */
+static int remove_notification(emu *e, const uint8_t *req, size_t len, dbuf *out)
+{
+	der_tlv top, x;
+	int64_t seq;
+	int i;
+
+	if (der_parse(req, len, &top) < 0 || der_find(top.val, top.len, 0x80, &x) < 0 ||
+	    der_get_int(&x, &seq) < 0)
+		return -1;
+
+	if (seq < EMU_SEQ_BASE)
+		return card_es10(e->card, req, len, out);
+
+	for (i = 0; i < e->neprs; i++)
+		if (e->epr_seq[i] == seq) {
+			db_free(&e->eprs[i]);
+			memmove(&e->eprs[i], &e->eprs[i + 1], sizeof(e->eprs[0]) * (size_t)(e->neprs - i - 1));
+			memmove(&e->epr_seq[i], &e->epr_seq[i + 1], sizeof(e->epr_seq[0]) * (size_t)(e->neprs - i - 1));
+			e->neprs--;
+			simple_result(out, 0xBF30, 0x80, 0);
+			return emu_state_save(e);
+		}
+	simple_result(out, 0xBF30, 0x80, 1);   /* nothingToDelete */
+	return 0;
+}
+
+/* ES10b.eUICCMemoryReset (5.9.11): the SGP.22 options go to the card, the
+ * two SGP.32 ones are this state */
+static int memory_reset(emu *e, const uint8_t *req, size_t len, dbuf *out)
+{
+	der_tlv top, bits;
+	uint8_t b0 = 0;
+	int64_t card_rc = 1, eim_rc = -1, ie_rc = -1;
+	size_t m;
+
+	if (der_parse(req, len, &top) < 0 || der_find(top.val, top.len, 0x82, &bits) < 0 || bits.len < 1)
+		return -1;
+	if (bits.len >= 2)
+		b0 = bits.val[1];
+
+	if (b0 & 0xE0) {   /* bits 0-2: SGP.22 resetOptions */
+		uint8_t sub[3] = { 0, 0, 0 };
+		dbuf rq, rs;
+
+		sub[0] = (uint8_t)((b0 & 0x80) != 0);
+		sub[1] = (uint8_t)((b0 & 0x40) != 0);
+		sub[2] = (uint8_t)((b0 & 0x20) != 0);
+		db_init(&rq);
+		db_init(&rs);
+		m = der_begin(&rq, 0xBF34);
+		der_put_bits(&rq, 0x82, sub, 3);
+		der_end(&rq, m);
+		if (card_call(e, &rq, &rs) < 0 || result_of(&rs, 0xBF34, &card_rc) < 0)
+			card_rc = 127;
+		db_free(&rq);
+		db_free(&rs);
+	}
+	if (b0 & 0x04) {   /* bit 5: resetEimConfigData */
+		eim_rc = e->neims ? 0 : 1;
+		while (e->neims)
+			emu_eim_free(&e->eims[--e->neims]);
+	}
+	if (b0 & 0x02) {   /* bit 6: resetImmediateEnableConfig */
+		e->ie_flag = false;
+		e->ie_oid.len = e->ie_addr.len = 0;
+		ie_rc = 0;
+	}
+
+	m = der_begin(out, 0xBF64);
+	der_put_int(out, 0x80, (b0 & 0xE0) ? card_rc : (eim_rc == 0 || ie_rc == 0 ? 0 : 1));
+	if (eim_rc >= 0)
+		der_put_int(out, 0x81, eim_rc);
+	if (ie_rc >= 0)
+		der_put_int(out, 0x82, ie_rc);
+	der_end(out, m);
+	return emu_state_save(e);
+}
+
+/* ES10b.GetProfilesInfo: the card's list, with fallbackAttribute (9F26,
+ * DEFAULT FALSE, so only encoded when TRUE) added to the Fallback Profile;
+ * it follows every field an SGP.22 ProfileInfo has, so appending keeps the
+ * DER field order */
+static int profiles_info(emu *e, const uint8_t *req, size_t len, dbuf *out)
+{
+	dbuf resp;
+	der_tlv top, list, it, x;
+	const uint8_t *p, *end;
+	size_t m, l, s;
+
+	db_init(&resp);
+	if (card_es10(e->card, req, len, &resp) < 0) {
+		db_free(&resp);
+		return -1;
+	}
+
+	if (!e->fb_set || der_parse(resp.d, resp.len, &top) < 0 ||
+	    der_find(top.val, top.len, 0xA0, &list) < 0) {
+		db_put(out, resp.d, resp.len);
+		db_free(&resp);
+		return 0;
+	}
+
+	m = der_begin(out, 0xBF2D);
+	l = der_begin(out, 0xA0);
+	for (p = list.val, end = list.val + list.len; p < end; ) {
+		if (der_next(&p, end, &it) < 0)
+			break;
+		if (it.tag == 0xE3 && der_find(it.val, it.len, 0x5A, &x) == 0 && x.len == 10 &&
+		    !memcmp(x.val, e->fb_iccid, 10)) {
+			s = der_begin(out, 0xE3);
+			db_put(out, it.val, it.len);
+			der_put_bool(out, 0x9F26, true);
+			der_end(out, s);
+		} else {
+			db_put(out, it.raw, it.raw_len);
+		}
+	}
+	der_end(out, l);
+	der_end(out, m);
+	db_free(&resp);
+	return 0;
+}
+
+/* a completed download opens the Immediate Enable session context: the
+ * ICCID from the installation result's notification metadata (SGP.22
+ * ProfileInstallationResultData.notificationMetadata BF2F { 5A iccid }) */
+static void observe_install(emu *e, const dbuf *resp)
+{
+	der_tlv pir, data, meta, x, fin;
+
+	if (der_parse(resp->d, resp->len, &pir) < 0 || pir.tag != 0xBF37 ||
+	    der_find(pir.val, pir.len, 0xBF27, &data) < 0 ||
+	    der_find(data.val, data.len, 0xA2, &fin) < 0 ||
+	    der_find(fin.val, fin.len, 0xA0, &x) < 0 ||   /* successResult */
+	    der_find(data.val, data.len, 0xBF2F, &meta) < 0 ||
+	    der_find(meta.val, meta.len, 0x5A, &x) < 0 || x.len != 10)
+		return;
+	memcpy(e->ie_iccid, x.val, 10);
+	e->ie_ctx = true;
+}
+
+int emu_es10(emu *e, const uint8_t *req, size_t len, dbuf *resp)
+{
+	der_tlv t;
+	int rc;
+
+	/* LoadBoundProfilePackage arrives in segments (SGP.22 2.5.5), and the
+	 * header segments ('BF36' with the first TLV, 'A1'/'A3' tag and length
+	 * alone) are not complete TLVs. They are SGP.22's, so they go to the
+	 * card as they are, and so does whatever else this layer cannot parse. */
+	if (der_parse(req, len, &t) < 0) {
+		rc = card_es10(e->card, req, len, resp);
+		if (rc == 0 && resp->len)
+			observe_install(e, resp);
+		return rc;
+	}
+
+	switch (t.tag) {
+	case 0xBF51: return load_euicc_package(e, req, len, resp);
+	case 0xBF55: return get_eim_config(e, req, len, resp);
+	case 0xBF57: return add_initial_eim(e, req, len, resp);
+	case 0xBF56:   /* GetCerts: an SGP.22 card has no such function */
+		simple_result(resp, 0xBF56, 0x81, 127);
+		return 0;
+	case 0xBF58: return profile_rollback(e, resp);
+	case 0xBF59: return configure_immediate(e, req, len, resp);
+	case 0xBF5A: return immediate_enable(e, resp);
+	case 0xBF5B:   /* Enable/DisableEmergencyProfile: no emergency profile */
+	case 0xBF5C:
+		simple_result(resp, t.tag, 0x80, 8);   /* ecallNotAvailable */
+		return 0;
+	case 0xBF5D: return fallback(e, true, resp);
+	case 0xBF5E: return fallback(e, false, resp);
+	case 0xBF5F:   /* GetConnectivityParameters: none on an SGP.22 card */
+		simple_result(resp, 0xBF5F, 0x81, 1);   /* parametersNotAvailable */
+		return 0;
+	case 0xBF2B: return retrieve_notifications(e, req, len, resp);
+	case 0xBF30: return remove_notification(e, req, len, resp);
+	case 0xBF64: return memory_reset(e, req, len, resp);
+	case 0xBF2D: return profiles_info(e, req, len, resp);
+	}
+
+	/* everything else is SGP.22 and goes to the card as it is */
+	rc = card_es10(e->card, req, len, resp);
+	if (rc == 0 && resp->len)   /* a segment answering with the installation result */
+		observe_install(e, resp);
+	return rc;
+}
+
+int emu_eim_state(const emu *e, const char *eim_id, int64_t *counter, bool *has_token, int64_t *token)
+{
+	int i;
+
+	for (i = 0; i < e->neims; i++)
+		if (!eim_id || !strcmp(eim_id, e->eims[i].id)) {
+			*counter = e->eims[i].counter;
+			*has_token = e->eims[i].has_token;
+			*token = e->eims[i].token;
+			return 0;
+		}
+	return -1;
+}
+
+emu *emu_open(card *c, const emu_config *cfg)
+{
+	uint8_t req[] = { 0xBF, 0x3E, 0x03, 0x5C, 0x01, 0x5A };   /* GetEUICCData, tagList 5A */
+	dbuf resp;
+	der_tlv t, x;
+	emu *e = calloc(1, sizeof(*e));
+
+	if (!e)
+		return NULL;
+	e->card = c;
+	e->cfg = *cfg;
+	e->state_path = strdup(cfg->state_path ? cfg->state_path : "");
+	e->cfg.state_path = e->state_path;
+	if (!e->state_path) {
+		free(e);
+		return NULL;
+	}
+	e->seq = EMU_SEQ_BASE - 1;
+	db_init(&e->ie_oid);
+	db_init(&e->ie_addr);
+
+	db_init(&resp);
+	if (card_es10(c, req, sizeof(req), &resp) < 0 || der_parse(resp.d, resp.len, &t) < 0 ||
+	    der_find(t.val, t.len, 0x5A, &x) < 0 || x.len != 16) {
+		db_free(&resp);
+		free(e->state_path);
+		free(e);
+		return NULL;
+	}
+	memcpy(e->eid, x.val, 16);
+	db_free(&resp);
+
+	if (emu_state_load(e) < 0) {
+		emu_close(e);
+		return NULL;
+	}
+	return e;
+}
+
+void emu_close(emu *e)
+{
+	int i;
+
+	if (!e)
+		return;
+	for (i = 0; i < e->neims; i++)
+		emu_eim_free(&e->eims[i]);
+	for (i = 0; i < e->neprs; i++)
+		db_free(&e->eprs[i]);
+	db_free(&e->ie_oid);
+	db_free(&e->ie_addr);
+	free(e->state_path);
+	free(e);
+}
