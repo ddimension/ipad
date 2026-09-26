@@ -43,6 +43,16 @@ static void say(const ipa *a, int lvl, const char *fmt, ...)
 	a->c.host.log(a->c.host.ud, lvl, buf);
 }
 
+/* The eIM configuration names a TLS trust anchor ipad cannot use. The
+ * connection still goes ahead on the CA bundle, as it would without one
+ * (SGP.32 leaves trustedPublicKeyDataTls optional), but the operator meant
+ * something stricter and should hear that it is not in force. */
+static void tls_unusable(const ipa *a, const char *why)
+{
+	say(a, LOG_WARNING, "eIM %s: trustedPublicKeyDataTls unusable (%s); the CA bundle %s decides instead",
+	    a->eim_id, why, a->c.tls.ca_file ? a->c.tls.ca_file : "/etc/ssl/certs/ca-certificates.crt");
+}
+
 /* one ES10 function; the answer must be a single TLV with the request's tag */
 static int es10(euicc *eu, const uint8_t *req, size_t len, dbuf *resp, der_tlv *t)
 {
@@ -1085,6 +1095,7 @@ static int pick_eim(ipa *a)
 	der_tlv t, list, c, x, y;
 	const uint8_t *p, *end;
 	int rc = -1;
+	bool tls_given;
 
 	db_init(&r);
 	if (es10_empty(a->c.eu, 0xBF55, &r, &t) < 0 || der_find(t.val, t.len, 0xA0, &list) < 0)
@@ -1107,7 +1118,10 @@ static int pick_eim(ipa *a)
 
 		/* trustedPublicKeyDataTls [6]: A0 key | A1 certificate of the
 		 * eIM or of its CA; without it the system CAs decide */
-		if (der_find(c.val, c.len, 0xA6, &x) == 0 && der_parse(x.val, x.len, &y) == 0) {
+		tls_given = der_find(c.val, c.len, 0xA6, &x) == 0;
+		if (tls_given && der_parse(x.val, x.len, &y) < 0) {
+			tls_unusable(a, "not one DER value");
+		} else if (tls_given) {
 			dbuf w;
 			int is_ca = 0, n;
 
@@ -1127,6 +1141,9 @@ static int pick_eim(ipa *a)
 					a->c.tls.pin_spki = a->pin;
 					a->c.tls.pin_spki_len = (size_t)n;
 				}
+			} else {
+				tls_unusable(a, y.tag == 0xA0 ? "key too large" : y.tag == 0xA1 ? "certificate does not parse"
+				                                                   : "neither a key nor a certificate");
 			}
 			db_free(&w);
 		}
