@@ -26,13 +26,17 @@ static void err(http_resp *r, const char *what, int rc)
 
 static int hexval(uint8_t c);
 
-/* a dotted-quad IPv4 literal (RFC 3986 3.2.2 IPv4address) */
+/* a dotted-quad IPv4 literal (RFC 3986 3.2.2 IPv4address, dec-octet) */
 static bool is_ipv4(const char *s)
 {
 	int parts = 0, digits = 0, v = 0;
 
 	for (;; s++) {
 		if (*s >= '0' && *s <= '9') {
+			/* dec-octet has no leading zero: 010 is octal 8 to
+			 * inet_aton */
+			if (digits == 1 && v == 0)
+				return false;
 			v = v * 10 + (*s - '0');
 			if (++digits > 3 || v > 255)
 				return false;
@@ -48,11 +52,38 @@ static bool is_ipv4(const char *s)
 	}
 }
 
+/* the last label (a trailing dot ignored) is decimal digits or 0x and hex
+ * digits */
+static bool ends_in_number(const char *host)
+{
+	size_t n = strlen(host), i;
+	const char *l;
+
+	if (n && host[n - 1] == '.')
+		n--;
+	for (l = host + n; l > host && l[-1] != '.'; l--)
+		;
+	n -= (size_t)(l - host);
+	if (!n)
+		return false;
+	if (n >= 2 && l[0] == '0' && (l[1] | 0x20) == 'x') {
+		for (i = 2; i < n; i++)
+			if (hexval((uint8_t)l[i]) < 0)
+				return false;
+		return true;
+	}
+	for (i = 0; i < n; i++)
+		if (l[i] < '0' || l[i] > '9')
+			return false;
+	return true;
+}
+
 int http_split_url(const char *url, http_url *u)
 {
 	const char *h, *e, *c, *x;
 	size_t n;
 	unsigned long port = 0;
+	uint8_t want6[16];
 
 	memset(u, 0, sizeof(*u));
 	if (!strncmp(url, "https://", 8)) {
@@ -70,10 +101,13 @@ int http_split_url(const char *url, http_url *u)
 		if ((unsigned char)*x <= 0x20 || (unsigned char)*x >= 0x7f)
 			return -1;
 
-	e = strchr(h, '/');
-	u->path = e ? e : "/";
-	if (!e)
-		e = h + strlen(h);
+	/* the authority ends at the first "/", "?" or "#" (RFC 3986 3.2). A
+	 * query right after it would need a "/" put in front for the request
+	 * line, and a fragment is never sent: an eIM URL has neither */
+	e = h + strcspn(h, "/?#");
+	if (*e == '?' || strchr(e, '#'))
+		return -1;
+	u->path = *e ? e : "/";
 	if (memchr(h, '@', (size_t)(e - h)))
 		return -1;   /* no userinfo: nothing here would send it */
 
@@ -87,10 +121,12 @@ int http_split_url(const char *url, http_url *u)
 		n = (size_t)(rb - h - 1);
 		if (n < 2 || n >= sizeof(u->host))
 			return -1;
-		for (x = h + 1; x < rb; x++)
-			if (!(hexval((uint8_t)*x) >= 0 || *x == ':' || *x == '.'))
-				return -1;
 		memcpy(u->host, h + 1, n);
+		u->host[n] = '\0';
+		/* what the brackets hold must be an IPv6 address: [cafe.de] or
+		 * [1.2.3.4] would otherwise go to the resolver as a name */
+		if (inet_pton(AF_INET6, u->host, want6) != 1)
+			return -1;
 		u->ip = true;
 		c = rb + 1;
 		if (c < e && *c != ':')
@@ -103,7 +139,16 @@ int http_split_url(const char *url, http_url *u)
 		if (n == 0 || n >= sizeof(u->host))
 			return -1;
 		memcpy(u->host, h, n);
+		u->host[n] = '\0';
 		u->ip = is_ipv4(u->host);
+		/* A name whose last label is a number is an address to
+		 * inet_aton and so to getaddrinfo: 127.1, 2130706433, 0x7f.1 and
+		 * 0177.0.0.1 all reach 127.0.0.1 while SNI and the certificate
+		 * check would use the spelling. Only the canonical dotted quad
+		 * is taken as an address; the WHATWG URL standard ("ends in a
+		 * number") likewise never reads such a host as a name. */
+		if (!u->ip && ends_in_number(u->host))
+			return -1;
 	}
 	u->host[n] = '\0';
 

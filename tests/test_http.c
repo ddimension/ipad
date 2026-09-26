@@ -263,6 +263,30 @@ static const struct ucase URLS[] = {
 	{ "https://[::ffff:192.0.2.1]/", 0, "::ffff:192.0.2.1", "443", "", "[::ffff:192.0.2.1]", "/" },
 	/* four numbers are an address, anything else a name */
 	{ "https://192.0.2.1.example/", 0, "192.0.2.1.example", "443", "192.0.2.1.example", "192.0.2.1.example", "/" },
+	/* an address in another spelling would reach getaddrinfo as a name
+	 * and come back as the address it spells to inet_aton */
+	{ "https://127.1/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://2130706433/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://0x7f.1/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://0x7f000001/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://0177.0.0.1/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://010.0.0.1/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://127.0.0.1./", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://1.2.3.4.5/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://example.123/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://10.0.0.0/", 0, "10.0.0.0", "443", "", "10.0.0.0", "/" },
+	{ "https://cafe/", 0, "cafe", "443", "cafe", "cafe", "/" },
+	{ "https://0xcafe.example/", 0, "0xcafe.example", "443", "0xcafe.example", "0xcafe.example", "/" },
+	/* brackets hold an IPv6 address and nothing else */
+	{ "https://[cafe.de]/x", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://[1.2.3.4]/x", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://[:::::]/x", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://[::]/x", 0, "::", "443", "", "[::]", "/x" },
+	/* a query needs a path before it, a fragment is never sent */
+	{ "https://eim.example?q=1", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim.example/x#f", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim.example#f", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim.example/x?q=1", 0, "eim.example", "443", "eim.example", "eim.example", "/x?q=1" },
 	{ "https://[2001:db8::1/x", -1, NULL, NULL, NULL, NULL, NULL },
 	{ "https://[2001:db8::1]x/", -1, NULL, NULL, NULL, NULL, NULL },
 	{ "https://[fe80::1%25eth0]/", -1, NULL, NULL, NULL, NULL, NULL },
