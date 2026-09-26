@@ -275,14 +275,16 @@ static int parse_status(const uint8_t *p, const uint8_t *eol, int *minor, int *s
 	return 0;
 }
 
-int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
+/* body NULL only checks; *delimited tells a message whose end the framing
+ * marks (Content-Length, chunked, no body) from one read to the close */
+static int parse_resp(const uint8_t *p, size_t len, http_resp *r, dbuf *body, bool *delimited)
 {
 	const uint8_t *end = p + len, *hend, *q, *b;
 	int minor, te;
 	bool have_clen;
 	size_t clen;
 
-	r->retry_after = -1;
+	*delimited = false;
 
 	/* interim 1xx answers (100 Continue, 103 Early Hints) come before the
 	 * final one and carry no body (RFC 9110 15.2); 101 would switch
@@ -295,6 +297,9 @@ int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
 		    !lone_free(p, eol))
 			return -1;
 
+		/* per answer: a Retry-After on a 1xx says nothing about the
+		 * final one */
+		r->retry_after = -1;
 		te = 0;
 		have_clen = false;
 		clen = 0;
@@ -358,16 +363,20 @@ int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
 	}
 
 	/* RFC 9112 6.1: Transfer-Encoding in an HTTP/1.0 message means the
-	 * framing is faulty. 6.3: with both fields, Transfer-Encoding would win,
-	 * but a sender MUST NOT send both (6.2) and the RFC says the message
-	 * "ought to be handled as an error" — a response framed two ways is read
-	 * one way here and another way by a middlebox, so it is refused. */
+	 * framing is faulty. RFC 9112 6.3 (item 3): with both fields,
+	 * Transfer-Encoding would win, but a sender MUST NOT send both (6.2)
+	 * and such a message "ought to be handled as an error" — a response
+	 * framed two ways is read one way here and another way by a middlebox,
+	 * so it is refused. The only peers are the eIM's ESipa and bind
+	 * endpoints, which never send both; refusing costs nothing there. */
 	if ((te && minor == 0) || (te && have_clen) || te == 1)
 		return -1;
 
 	/* 204 and 304 have no body whatever the fields say (RFC 9112 6.3) */
-	if (r->status == 204 || r->status == 304)
+	if (r->status == 204 || r->status == 304) {
+		*delimited = true;
 		return 0;
+	}
 
 	if (te) {
 		for (;;) {
@@ -400,6 +409,7 @@ int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
 			if (n == 0) {
 				/* the trailer section ends with an empty line; it is
 				 * read past, not interpreted (RFC 9112 7.1.2) */
+				*delimited = true;
 				if (end - b >= 2 && b[0] == '\r' && b[1] == '\n')
 					return 0;
 				return find_crlf2(b, end) ? 0 : -1;
@@ -408,9 +418,11 @@ int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
 				return -1;
 			if (b[n] != '\r' || b[n + 1] != '\n')
 				return -1;   /* chunk data is followed by CRLF */
-			db_put(&r->body, b, (size_t)n);
-			if (r->body.err)
-				return -1;
+			if (body) {
+				db_put(body, b, (size_t)n);
+				if (body->err)
+					return -1;
+			}
 			b += n + 2;
 		}
 	}
@@ -418,12 +430,36 @@ int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
 	if (have_clen) {
 		if ((size_t)(end - b) < clen)
 			return -1;
-		db_put(&r->body, b, clen);
-		return r->body.err ? -1 : 0;
+		*delimited = true;
+		if (body)
+			db_put(body, b, clen);
+		return body && body->err ? -1 : 0;
 	}
 
-	db_put(&r->body, b, (size_t)(end - b));   /* read to close */
-	return r->body.err ? -1 : 0;
+	if (body)
+		db_put(body, b, (size_t)(end - b));   /* read to close */
+	return body && body->err ? -1 : 0;
+}
+
+int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
+{
+	bool delimited;
+
+	return parse_resp(p, len, r, &r->body, &delimited);
+}
+
+/* Whether what arrived so far is a whole answer the framing delimits. The
+ * request says Connection: close, but a load balancer may keep the
+ * connection open regardless; waiting for the close would then cost the
+ * read timeout on every exchange. Parsed again as data arrives: without the
+ * body copy that is the header section and the chunk size lines. */
+static bool response_complete(const uint8_t *p, size_t len)
+{
+	http_resp t;
+	bool delimited;
+
+	memset(&t, 0, sizeof(t));
+	return parse_resp(p, len, &t, NULL, &delimited) == 0 && delimited;
 }
 
 /* the server's leaf key must be the pinned one; checked after the handshake
@@ -620,6 +656,8 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 			err(r, "response too large", (int)raw.len);
 			goto out;
 		}
+		if (response_complete(raw.d, raw.len))
+			break;
 	}
 #undef SEND
 #undef RECV

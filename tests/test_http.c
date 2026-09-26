@@ -4,6 +4,7 @@
  * trust holds: the right CA or pin passes, a wrong pin or name does not.
  * The response parser on its own against malformed and hostile framing. */
 #include <stdlib.h>
+#include <time.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -178,6 +179,10 @@ static void parse_cases(void)
 	/* Retry-After: delay-seconds only, bounded at a day */
 	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After: 120\r\n\r\n") == 120, "Retry-After: seconds");
 	OK(retry_after("HTTP/1.1 429 Too Many\r\n\r\n") == -1, "Retry-After: absent");
+	OK(retry_after("HTTP/1.1 103 Early Hints\r\nRetry-After: 5\r\n\r\nHTTP/1.1 429 Too Many\r\n\r\n") == -1,
+	   "Retry-After: one on a 1xx is not the final answer's");
+	OK(retry_after("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 429 Too Many\r\nRetry-After: 7\r\n\r\n") == 7,
+	   "Retry-After: the final answer's after a 1xx");
 	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After: Fri, 31 Dec 2027 23:59:59 GMT\r\n\r\n") == -1,
 	   "Retry-After: a date is not read");
 	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After:\r\n\r\n") == -1, "Retry-After: empty");
@@ -239,6 +244,53 @@ static void url_cases(void)
 	}
 }
 
+/* a server that answers and keeps the connection open (tests/hold_open.py):
+ * the answer ends where its framing says, not at the read timeout */
+static void hold_open(void)
+{
+	int fd[2];
+	pid_t pid = -1;
+	char port[16] = { 0 }, url[128];
+	static const char *const paths[] = { "cl", "chunked" };
+	http_tls t;
+	http_resp r;
+	size_t i;
+
+	if (pipe(fd) == 0 && (pid = fork()) == 0) {
+		dup2(fd[1], 1);
+		execlp("python3", "python3", TESTS "/hold_open.py", (char *)NULL);
+		_exit(127);
+	}
+	close(fd[1]);
+	OK(pid > 0 && read(fd[0], port, sizeof(port) - 1) > 0, "hold_open: server started");
+	close(fd[0]);
+	port[strcspn(port, "\n")] = 0;
+	memset(&t, 0, sizeof(t));
+	t.timeout_ms = 5000;
+	for (i = 0; i < 2; i++) {
+		struct timespec a, b;
+		char msg[80];
+
+		snprintf(url, sizeof(url), "http://127.0.0.1:%s/%s", port, paths[i]);
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		snprintf(msg, sizeof(msg), "hold_open %s: read without waiting for the close", paths[i]);
+		OK(http_post(url, NULL, (const uint8_t *)"x", 1, &t, &r) == 0 && r.status == 200 && r.body.len == 2 &&
+		   !memcmp(r.body.d, "ok", 2), msg);
+		clock_gettime(CLOCK_MONOTONIC, &b);
+		snprintf(msg, sizeof(msg), "hold_open %s: well within the read timeout", paths[i]);
+		OK(b.tv_sec - a.tv_sec < 2, msg);
+		db_free(&r.body);
+	}
+	/* no framing: the close ends it, as before */
+	snprintf(url, sizeof(url), "http://127.0.0.1:%s/close", port);
+	OK(http_post(url, NULL, (const uint8_t *)"x", 1, &t, &r) == 0 && r.body.len == 2, "hold_open: read to close");
+	db_free(&r.body);
+	if (pid > 0) {
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, 0);
+	}
+}
+
 int main(void)
 {
 	uint8_t ca[2048], pin[256], bad[256];
@@ -257,6 +309,7 @@ int main(void)
 
 	parse_cases();
 	url_cases();
+	hold_open();
 
 	OK(pid > 0, "server started");
 
