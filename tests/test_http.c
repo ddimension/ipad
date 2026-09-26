@@ -135,6 +135,19 @@ static const struct pcase PARSE[] = {
 	{ "a field line without a colon", "HTTP/1.1 200 OK\r\nbroken\r\n\r\nhi", NULL, -1, 0 },
 };
 
+static long retry_after(const char *in)
+{
+	http_resp r;
+	long v = -2;
+
+	memset(&r, 0, sizeof(r));
+	db_init(&r.body);
+	if (http_parse_response((const uint8_t *)in, strlen(in), &r) == 0)
+		v = r.retry_after;
+	db_free(&r.body);
+	return v;
+}
+
 static void parse_cases(void)
 {
 	size_t i;
@@ -162,6 +175,16 @@ static void parse_cases(void)
 		db_free(&r.body);
 		free(buf);
 	}
+	/* Retry-After: delay-seconds only, bounded at a day */
+	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After: 120\r\n\r\n") == 120, "Retry-After: seconds");
+	OK(retry_after("HTTP/1.1 429 Too Many\r\n\r\n") == -1, "Retry-After: absent");
+	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After: Fri, 31 Dec 2027 23:59:59 GMT\r\n\r\n") == -1,
+	   "Retry-After: a date is not read");
+	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After:\r\n\r\n") == -1, "Retry-After: empty");
+	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After: -5\r\n\r\n") == -1, "Retry-After: negative");
+	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After: 86401\r\n\r\n") == -1, "Retry-After: over a day");
+	OK(retry_after("HTTP/1.1 429 Too Many\r\nRetry-After: 99999999999999999999999\r\n\r\n") == -1,
+	   "Retry-After: no overflow");
 }
 
 struct ucase {

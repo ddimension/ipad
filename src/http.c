@@ -282,6 +282,8 @@ int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
 	bool have_clen;
 	size_t clen;
 
+	r->retry_after = -1;
+
 	/* interim 1xx answers (100 Continue, 103 Early Hints) come before the
 	 * final one and carry no body (RFC 9110 15.2); 101 would switch
 	 * protocols, which ipad never asks for */
@@ -333,6 +335,17 @@ int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
 			} else if (ieq(q, (size_t)(colon - q), "Transfer-Encoding")) {
 				if (parse_te(vp, ve, &te) < 0)
 					return -1;
+			} else if (ieq(q, (size_t)(colon - q), "Retry-After")) {
+				/* delay-seconds = 1*DIGIT (RFC 9110 10.2.3); the
+				 * HTTP-date form is left unread (-1), a caller then
+				 * keeps its own backoff */
+				const uint8_t *d0 = vp;
+				long v = 0;
+
+				for (r->retry_after = -1; vp < ve && is_digit(*vp) && v <= HTTP_MAX_RETRY_AFTER; vp++)
+					v = v * 10 + (*vp - '0');
+				if (vp == ve && vp > d0 && v <= HTTP_MAX_RETRY_AFTER)
+					r->retry_after = v;
 			}
 			q = le + 2;
 		}
@@ -462,6 +475,7 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 	int timeout = (t && t->timeout_ms) ? t->timeout_ms : 30000;
 
 	memset(r, 0, sizeof(*r));
+	r->retry_after = -1;
 	db_init(&r->body);
 	db_init(&raw);
 

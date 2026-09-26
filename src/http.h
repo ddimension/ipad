@@ -31,9 +31,13 @@ typedef struct {
 
 /* the most ipad reads from one answer: a bound package is a few hundred kB */
 #define HTTP_MAX_BODY ((size_t)4 << 20)
+/* a longer Retry-After is not taken: a day is already more than any
+ * rate limit should ask of a device */
+#define HTTP_MAX_RETRY_AFTER 86400L
 
 typedef struct {
 	int status;                   /* HTTP status, 0 when none was read */
+	long retry_after;             /* Retry-After in seconds; -1 absent, a date or over a day */
 	dbuf body;
 	char error[160];              /* what failed, for the log */
 } http_resp;

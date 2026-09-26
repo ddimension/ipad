@@ -38,6 +38,7 @@
 #define BIND_PENDING "bind.pending"
 #define BIND_REFUSED_FILE "bind.refused"
 #define BIND_DONE_FILE "bind.done"
+#define BIND_AFTER_FILE "bind.after"   /* a 429's Retry-After: not before this time */
 #define EXIT_BIND_REFUSED 4
 
 static void usage(FILE *f)
@@ -361,6 +362,8 @@ static int provision_bundle(euicc *eu, const char *dir, const char *path, const 
 		unlink(mtmp);
 		snprintf(mtmp, sizeof(mtmp), "%s/" BIND_DONE_FILE, dir);
 		unlink(mtmp);
+		snprintf(mtmp, sizeof(mtmp), "%s/" BIND_AFTER_FILE, dir);
+		unlink(mtmp);
 	} else {
 		/* an IoT eUICC signs with its own certificate: the bundle's key has
 		 * nothing to sign, and the card is registered by its EUM data */
@@ -386,7 +389,7 @@ static int bind_card(ipa *a, euicc *eu, crypto_key *key, const char *dir, const 
                      const char *imei, bool direct, const uint8_t eid[16],
                      void (*logf)(void *, int, const char *), void *lud)
 {
-	char mpath[512], rpath[512], url[512], msg[300];
+	char mpath[512], rpath[512], apath[512], url[512], msg[300];
 	static const char *const hdrs[] = { "Content-Type: application/json", NULL };
 	char *body = NULL;
 	size_t blen = 0;
@@ -401,6 +404,30 @@ static int bind_card(ipa *a, euicc *eu, crypto_key *key, const char *dir, const 
 	}
 	if (eu->kind != EUICC_EMU || access(mpath, F_OK) != 0)
 		return 0;
+	/* RFC 6585 4 / RFC 9110 10.2.3: a 429 may say how long to wait. The
+	 * host's poll backoff decides when ipad runs; until then each run
+	 * leaves the eIM alone and ends as a retry. A time more than a day
+	 * ahead means the clock went back since (routers set it late): it
+	 * is dropped rather than obeyed. */
+	snprintf(apath, sizeof(apath), "%s/" BIND_AFTER_FILE, dir);
+	{
+		FILE *m = fopen(apath, "r");
+		long long after = 0;
+		time_t now = time(NULL);
+
+		if (m) {
+			if (fscanf(m, "%lld", &after) != 1)
+				after = 0;
+			fclose(m);
+			if (after > (long long)now && after - (long long)now <= HTTP_MAX_RETRY_AFTER) {
+				snprintf(msg, sizeof(msg), "binding deferred: the eIM asked to wait %lld s more (Retry-After)",
+				         after - (long long)now);
+				logf(lud, LOG_WARNING, msg);
+				return 1;
+			}
+			unlink(apath);
+		}
+	}
 	if (bind_url(ipa_url(a), url, sizeof(url)) < 0) {
 		logf(lud, LOG_ERR, "no eIM URL to bind at");
 		return 1;
@@ -458,8 +485,20 @@ static int bind_card(ipa *a, euicc *eu, crypto_key *key, const char *dir, const 
 		rc = EXIT_BIND_REFUSED;
 		break;
 	case BIND_RETRY:
-		snprintf(msg, sizeof(msg), "binding not done (%s): again on the next poll",
-		         r.status ? (r.status == 429 ? "429 rate limited" : "server error") : (r.error[0] ? r.error : "no answer"));
+		if (r.status == 429 && r.retry_after > 0) {
+			FILE *m = fopen(apath, "w");
+
+			if (m) {
+				fprintf(m, "%lld\n", (long long)time(NULL) + r.retry_after);
+				fclose(m);
+			}
+			snprintf(msg, sizeof(msg), "binding not done (429 rate limited): again after %ld s (Retry-After)",
+			         r.retry_after);
+		} else {
+			snprintf(msg, sizeof(msg), "binding not done (%s): again on the next poll",
+			         r.status ? (r.status == 429 ? "429 rate limited" : "server error")
+			                  : (r.error[0] ? r.error : "no answer"));
+		}
 		logf(lud, LOG_WARNING, msg);
 		break;
 	case BIND_BAD:
@@ -478,7 +517,8 @@ static int bind_card(ipa *a, euicc *eu, crypto_key *key, const char *dir, const 
  * card itself; removing that is an eIM's eCO (deleteEim), not ours. */
 static int cmd_reset(const char *dir)
 {
-	static const char *const fixed[] = { "device.key", BIND_PENDING, BIND_REFUSED_FILE, BIND_DONE_FILE };
+	static const char *const fixed[] = { "device.key", BIND_PENDING, BIND_REFUSED_FILE, BIND_DONE_FILE,
+	                                     BIND_AFTER_FILE };
 	char p[768];
 	DIR *d;
 	struct dirent *e;

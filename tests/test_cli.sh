@@ -82,6 +82,22 @@ eim 429,204
 out=$(run -s "$w/b" -u "$url" poll)
 ok 'echo "$out" | grep -q "\"code\":1,\"message\":\"bind\""' 'bind 429: poll ends with 1, no GetEimPackage'
 ok '[ -e "$w/b/bind.pending" ]' 'bind 429: still pending'
+ok '[ ! -e "$w/b/bind.after" ]' 'bind 429 without Retry-After: the next poll may bind'
+# 429 with Retry-After: the next poll leaves the eIM alone until then
+eim 429:120
+out=$(run -s "$w/b" -u "$url" poll)
+ok '[ -e "$w/b/bind.after" ] && [ "$(binds)" = 1 ]' 'bind 429 Retry-After: the time is kept'
+out=$(run -s "$w/b" -u "$url" poll)
+ok 'echo "$out" | grep -q "\"code\":1,\"message\":\"bind\"" && [ "$(binds)" = 1 ]' \
+	'bind 429 Retry-After: the next poll does not ask the eIM'
+ok 'echo "$out" | grep -q "\"event\":\"summary\",\"command\":\"poll\",\"code\":1,.*\"error\":\"binding deferred"' 'bind 429 Retry-After: the summary says why'
+echo $(( $(date +%s) + 999999 )) >"$w/b/bind.after"
+out=$(run -s "$w/b" -u "$url" poll)
+ok '[ "$(binds)" = 2 ]' 'bind 429 Retry-After: more than a day ahead (the clock went back) is not obeyed'
+echo $(( $(date +%s) - 1 )) >"$w/b/bind.after"
+eim 429,204
+out=$(run -s "$w/b" -u "$url" poll)
+ok '[ "$(binds)" = 1 ] && [ ! -e "$w/b/bind.after" ]' 'bind 429 Retry-After: asked again once the time has passed'
 out=$(run -s "$w/b" -u "$url" poll)
 ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"poll\""' 'bind 204: then the poll runs'
 ok '[ -e "$w/b/bind.done" ] && [ ! -e "$w/b/bind.pending" ]' 'bind 204: bound'

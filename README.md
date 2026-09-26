@@ -56,7 +56,9 @@ ipad [options] poll | provision <file> | export <file> | connectivity | notify |
   the next `poll` binds the card first (`POST /ipad/v1/bind`, same host and
   TLS as ESipa): 204/409 bound, 403 refused — `poll` then exits 4 until an
   operator acts —, 429/5xx/no answer tried again on the next poll; 400/413
-  are errors, the binding stays pending. `info` reports `bind` (none,
+  are errors, the binding stays pending. A 429 with `Retry-After` in
+  seconds (at most a day) is honoured: until then `poll` does not ask the
+  eIM and ends as a retry (exit 1, `binding deferred` in the summary). `info` reports `bind` (none,
   pending, done, refused) and the eIM `counter`.
   - The reader takes the bundle as the eIM writes it and nothing else: one
     flat object, string and integer values without escapes, each field
