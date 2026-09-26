@@ -164,6 +164,58 @@ static void parse_cases(void)
 	}
 }
 
+struct ucase {
+	const char *url;
+	int rc;
+	const char *host, *port, *sni, *host_hdr, *path;
+};
+
+static const struct ucase URLS[] = {
+	{ "https://eim.example/gsma/rsp2/asn1", 0, "eim.example", "443", "eim.example", "eim.example", "/gsma/rsp2/asn1" },
+	{ "https://eim.example", 0, "eim.example", "443", "eim.example", "eim.example", "/" },
+	/* RFC 9110 7.2: the port in Host unless it is the default */
+	{ "https://eim.example:8443/x", 0, "eim.example", "8443", "eim.example", "eim.example:8443", "/x" },
+	{ "https://eim.example:443/x", 0, "eim.example", "443", "eim.example", "eim.example", "/x" },
+	{ "http://eim.example:443/x", 0, "eim.example", "443", "eim.example", "eim.example:443", "/x" },
+	/* RFC 6066 3: no trailing dot in SNI, no IP literal */
+	{ "https://eim.example./x", 0, "eim.example.", "443", "eim.example", "eim.example.", "/x" },
+	{ "https://192.0.2.1:8443/x", 0, "192.0.2.1", "8443", "", "192.0.2.1:8443", "/x" },
+	{ "https://[2001:db8::1]/x", 0, "2001:db8::1", "443", "", "[2001:db8::1]", "/x" },
+	{ "https://[2001:db8::1]:8443/x", 0, "2001:db8::1", "8443", "", "[2001:db8::1]:8443", "/x" },
+	{ "https://[::ffff:192.0.2.1]/", 0, "::ffff:192.0.2.1", "443", "", "[::ffff:192.0.2.1]", "/" },
+	/* four numbers are an address, anything else a name */
+	{ "https://192.0.2.1.example/", 0, "192.0.2.1.example", "443", "192.0.2.1.example", "192.0.2.1.example", "/" },
+	{ "https://[2001:db8::1/x", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://[2001:db8::1]x/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://[fe80::1%25eth0]/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim.example:0/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim.example:65536/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim.example:/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim.example:44x/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://user@eim.example/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim.example\r\nX: y/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://eim example/", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https:///x", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "https://./x", -1, NULL, NULL, NULL, NULL, NULL },
+	{ "ftp://eim.example/", -1, NULL, NULL, NULL, NULL, NULL },
+};
+
+static void url_cases(void)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(URLS) / sizeof(URLS[0]); i++) {
+		const struct ucase *c = &URLS[i];
+		http_url u;
+		int rc = http_split_url(c->url, &u);
+
+		OK(rc == c->rc, c->url);
+		if (rc == 0 && c->rc == 0)
+			OK(!strcmp(u.host, c->host) && !strcmp(u.port, c->port) && !strcmp(u.sni, c->sni) &&
+			   !strcmp(u.host_hdr, c->host_hdr) && !strcmp(u.path, c->path), c->url);
+	}
+}
+
 int main(void)
 {
 	uint8_t ca[2048], pin[256], bad[256];
@@ -181,6 +233,7 @@ int main(void)
 	http_tls t;
 
 	parse_cases();
+	url_cases();
 
 	OK(pid > 0, "server started");
 
@@ -199,6 +252,34 @@ int main(void)
 	EQ_HEX(r.body.d, r.body.len, want, sizeof(want) - 1, "chunked: reassembled");
 	db_free(&r.body);
 
+	/* Host carries a port that is not the default (RFC 9110 7.2) */
+	snprintf(url, sizeof(url), "https://localhost:%d/host", port);
+	OK(http_post(url, hdrs, body, sizeof(body), &t, &r) == 0, "host: read");
+	{
+		char h[64];
+
+		snprintf(h, sizeof(h), "localhost:%d", port);
+		EQ_HEX(r.body.d, r.body.len, h, strlen(h), "host: the port is in Host");
+	}
+	db_free(&r.body);
+
+	/* a trailing dot is a name the certificate (localhost) still matches:
+	 * it is removed from SNI and from the name checked */
+	snprintf(url, sizeof(url), "https://localhost.:%d/gsma/rsp2/asn1", port);
+	OK(http_post(url, hdrs, body, sizeof(body), &t, &r) == 0 && r.status == 200, "name: a trailing dot is not part of it");
+	db_free(&r.body);
+
+	/* a request head that does not fit is refused, not overrun */
+	{
+		static char big[3000];
+		const char *bh[] = { big, NULL };
+
+		memset(big, 'a', sizeof(big) - 1);
+		memcpy(big, "X-Big: ", 7);
+		OK(http_post(url, bh, body, sizeof(body), &t, &r) < 0 && strstr(r.error, "too long"), "headers: too long is an error");
+		db_free(&r.body);
+	}
+
 	/* pinned server key, no CA needed */
 	memset(&t, 0, sizeof(t));
 	t.pin_spki = pin;
@@ -212,12 +293,15 @@ int main(void)
 	OK(http_post(url, hdrs, body, sizeof(body), &t, &r) < 0, "pin: another key is refused");
 	db_free(&r.body);
 
-	/* the CA is right but the name is not: 127.0.0.1 is not in the SAN */
+	/* the CA is right but the name is not: 127.0.0.1 is not in the SAN. An IP
+	 * literal goes out without SNI (RFC 6066 3); its address is checked
+	 * against the certificate after the handshake */
 	memset(&t, 0, sizeof(t));
 	t.ca_der = ca;
 	t.ca_der_len = ca_len;
 	snprintf(url, sizeof(url), "https://127.0.0.1:%d/gsma/rsp2/asn1", port);
-	OK(http_post(url, hdrs, body, sizeof(body), &t, &r) < 0, "name: a certificate for another name is refused");
+	OK(http_post(url, hdrs, body, sizeof(body), &t, &r) < 0 && strstr(r.error, "this address"),
+	   "name: a certificate for another name is refused");
 	db_free(&r.body);
 
 	/* an unknown CA (the system bundle does not know this self-signed cert) */

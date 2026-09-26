@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A stand-in eIM endpoint for test_http: HTTPS on 127.0.0.1:<port>, answers a
 POST with its own body behind a marker, and reports the two ESipa headers it
-saw. Chunked when the path asks for it."""
+saw. Chunked when the path asks for it; /host answers with the Host field."""
 import http.server, ssl, sys
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -10,6 +10,8 @@ class H(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers['Content-Length']))
         out = b'echo:' + self.headers.get('Content-Type', '').encode() + b'|' + \
               self.headers.get('X-Admin-Protocol', '').encode() + b'|' + body
+        if self.path.endswith('host'):
+            out = self.headers.get('Host', '').encode()
         self.send_response(200)
         if self.path.endswith('chunked'):
             self.send_header('Transfer-Encoding', 'chunked')

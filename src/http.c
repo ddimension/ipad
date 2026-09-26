@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 André Valentin <avalentin@marcant.net>
  */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,44 +23,119 @@ static void err(http_resp *r, const char *what, int rc)
 	snprintf(r->error, sizeof(r->error), "%s (%d)", what, rc);
 }
 
-/* "https://host:port/path" into parts; default ports 443 / 80 */
-static int split_url(const char *url, bool *tls, char *host, size_t hcap, char *port,
-                     size_t pcap, const char **path)
-{
-	const char *h, *e, *c;
-	size_t n;
+static int hexval(uint8_t c);
 
+/* a dotted-quad IPv4 literal (RFC 3986 3.2.2 IPv4address) */
+static bool is_ipv4(const char *s)
+{
+	int parts = 0, digits = 0, v = 0;
+
+	for (;; s++) {
+		if (*s >= '0' && *s <= '9') {
+			v = v * 10 + (*s - '0');
+			if (++digits > 3 || v > 255)
+				return false;
+		} else if (*s == '.' || !*s) {
+			if (!digits || ++parts > 4)
+				return false;
+			if (!*s)
+				return parts == 4;
+			digits = v = 0;
+		} else {
+			return false;
+		}
+	}
+}
+
+int http_split_url(const char *url, http_url *u)
+{
+	const char *h, *e, *c, *x;
+	size_t n;
+	unsigned long port = 0;
+
+	memset(u, 0, sizeof(*u));
 	if (!strncmp(url, "https://", 8)) {
-		*tls = true;
+		u->tls = true;
 		h = url + 8;
 	} else if (!strncmp(url, "http://", 7)) {
-		*tls = false;
 		h = url + 7;
 	} else {
 		return -1;
 	}
+	/* the URL goes into the request line and Host: a space or control
+	 * character (the FQDN can come from the card's eIM configuration) would
+	 * be header injection */
+	for (x = url; *x; x++)
+		if ((unsigned char)*x <= 0x20 || (unsigned char)*x >= 0x7f)
+			return -1;
 
 	e = strchr(h, '/');
-	*path = e ? e : "/";
+	u->path = e ? e : "/";
 	if (!e)
 		e = h + strlen(h);
+	if (memchr(h, '@', (size_t)(e - h)))
+		return -1;   /* no userinfo: nothing here would send it */
 
-	c = memchr(h, ':', (size_t)(e - h));
-	n = (size_t)((c ? c : e) - h);
-	if (n == 0 || n >= hcap)
-		return -1;
-	memcpy(host, h, n);
-	host[n] = '\0';
+	if (*h == '[') {
+		/* IP-literal (RFC 3986 3.2.2): only IPv6address, no zone and no
+		 * IPvFuture */
+		const char *rb = memchr(h, ']', (size_t)(e - h));
+
+		if (!rb)
+			return -1;
+		n = (size_t)(rb - h - 1);
+		if (n < 2 || n >= sizeof(u->host))
+			return -1;
+		for (x = h + 1; x < rb; x++)
+			if (!(hexval((uint8_t)*x) >= 0 || *x == ':' || *x == '.'))
+				return -1;
+		memcpy(u->host, h + 1, n);
+		u->ip = true;
+		c = rb + 1;
+		if (c < e && *c != ':')
+			return -1;
+		if (c == e)
+			c = NULL;
+	} else {
+		c = memchr(h, ':', (size_t)(e - h));
+		n = (size_t)((c ? c : e) - h);
+		if (n == 0 || n >= sizeof(u->host))
+			return -1;
+		memcpy(u->host, h, n);
+		u->ip = is_ipv4(u->host);
+	}
+	u->host[n] = '\0';
 
 	if (c) {
-		n = (size_t)(e - c - 1);
-		if (n == 0 || n >= pcap)
+		for (x = c + 1; x < e; x++) {
+			if (*x < '0' || *x > '9' || (port = port * 10 + (unsigned long)(*x - '0')) > 65535)
+				return -1;
+		}
+		if (x == c + 1 || port == 0)
 			return -1;
-		memcpy(port, c + 1, n);
-		port[n] = '\0';
 	} else {
-		snprintf(port, pcap, "%s", *tls ? "443" : "80");
+		port = u->tls ? 443 : 80;
 	}
+	snprintf(u->port, sizeof(u->port), "%lu", port);
+
+	/* RFC 6066 3: HostName is a DNS name without the trailing dot, and an
+	 * IP literal is never sent. The same name is what the certificate is
+	 * checked against, where "eim.example." would never match. */
+	if (!u->ip) {
+		snprintf(u->sni, sizeof(u->sni), "%s", u->host);
+		n = strlen(u->sni);
+		if (u->sni[n - 1] == '.') {
+			if (n == 1)
+				return -1;
+			u->sni[n - 1] = '\0';
+		}
+	}
+
+	/* RFC 9110 7.2: Host is uri-host [":" port], the port given when it is
+	 * not the scheme's default; an IPv6 literal keeps its brackets */
+	n = (size_t)snprintf(u->host_hdr, sizeof(u->host_hdr), u->ip && strchr(u->host, ':') ? "[%s]" : "%s", u->host);
+	if (port != (u->tls ? 443u : 80u))
+		n += (size_t)snprintf(u->host_hdr + n, sizeof(u->host_hdr) - n, ":%lu", port);
 	return 0;
 }
 
@@ -352,13 +428,30 @@ static int pinned_ok(const mbedtls_ssl_context *ssl, const http_tls *t)
 	       !memcmp(buf + sizeof(buf) - n, t->pin_spki, (size_t)n);
 }
 
+/* appends to the request head; -1 once it would not fit, so the offset can
+ * never pass the buffer and turn the remaining size negative */
+static int hdr_add(char *buf, size_t cap, size_t *off, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(buf + *off, cap - *off, fmt, ap);
+	va_end(ap);
+	if (n < 0 || (size_t)n >= cap - *off)
+		return -1;
+	*off += (size_t)n;
+	return 0;
+}
+
 int http_post(const char *url, const char *const *headers, const uint8_t *body, size_t len,
               const http_tls *t, http_resp *r)
 {
-	char host[256], port[8], hdr[2048];
-	const char *path;
+	char hdr[2048];
+	http_url u;
 	bool tls;
-	int rc = -1, hn, i;
+	int rc = -1, i, k;
+	size_t hn;
 	mbedtls_net_context net;
 	mbedtls_ssl_context ssl;
 	mbedtls_ssl_config conf;
@@ -372,18 +465,19 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 	db_init(&r->body);
 	db_init(&raw);
 
-	if (split_url(url, &tls, host, sizeof(host), port, sizeof(port), &path) < 0) {
+	if (http_split_url(url, &u) < 0) {
 		err(r, "bad url", 0);
 		return -1;
 	}
+	tls = u.tls;
 
-	hn = snprintf(hdr, sizeof(hdr), "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: ipad\r\n"
-	              "Content-Length: %zu\r\nConnection: close\r\n", path, host, len);
-	for (i = 0; headers && headers[i]; i++)
-		hn += snprintf(hdr + hn, sizeof(hdr) - (size_t)hn, "%s\r\n", headers[i]);
-	hn += snprintf(hdr + hn, sizeof(hdr) - (size_t)hn, "\r\n");
-	if (hn >= (int)sizeof(hdr)) {
-		err(r, "headers too long", hn);
+	hn = 0;
+	i = hdr_add(hdr, sizeof(hdr), &hn, "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: ipad\r\n"
+	            "Content-Length: %zu\r\nConnection: close\r\n", u.path, u.host_hdr, len);
+	for (k = 0; i == 0 && headers && headers[k]; k++)
+		i = hdr_add(hdr, sizeof(hdr), &hn, "%s\r\n", headers[k]);
+	if (i < 0 || hdr_add(hdr, sizeof(hdr), &hn, "\r\n") < 0) {
+		err(r, "headers too long", (int)hn);
 		return -1;
 	}
 
@@ -401,7 +495,7 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 	mbedtls_entropy_init(&ent);
 	mbedtls_ctr_drbg_init(&drbg);
 
-	if ((i = mbedtls_net_connect(&net, host, port, MBEDTLS_NET_PROTO_TCP)) != 0) {
+	if ((i = mbedtls_net_connect(&net, u.host, u.port, MBEDTLS_NET_PROTO_TCP)) != 0) {
 		err(r, "connect failed", i);
 		goto out;
 	}
@@ -435,8 +529,11 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 			mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 		}
 
+		/* SNI and the name the certificate is checked against are one
+		 * setting in mbedTLS. An IP literal must not go out as SNI (RFC
+		 * 6066 3), so it gets none and its name is checked below. */
 		if ((i = mbedtls_ssl_setup(&ssl, &conf)) != 0 ||
-		    (i = mbedtls_ssl_set_hostname(&ssl, host)) != 0) {   /* SNI + name check */
+		    (i = mbedtls_ssl_set_hostname(&ssl, u.ip ? NULL : u.sni)) != 0) {
 			err(r, "tls setup failed", i);
 			goto out;
 		}
@@ -452,6 +549,19 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 			err(r, "server key does not match the pinned eIM TLS key", 0);
 			goto out;
 		}
+		/* the chain was verified in the handshake; for an IP literal the
+		 * name was not: once more with the address, which mbedTLS matches
+		 * against the iPAddress entries of the subjectAltName */
+		if (u.ip && !(t && (t->insecure || t->pin_spki))) {
+			uint32_t flags = 0;
+			const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&ssl);
+
+			if (!peer || mbedtls_x509_crt_verify((mbedtls_x509_crt *)peer, &ca, NULL, u.host, &flags,
+			                                     NULL, NULL) != 0) {
+				err(r, "certificate not issued for this address", (int)flags);
+				goto out;
+			}
+		}
 	}
 
 #define SEND(buf, n) (tls ? mbedtls_ssl_write(&ssl, (buf), (n)) : mbedtls_net_send(&net, (buf), (n)))
@@ -459,7 +569,6 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 	{
 		const uint8_t *parts[2] = { (const uint8_t *)hdr, body };
 		size_t lens[2] = { (size_t)hn, len };
-		int k;
 
 		for (k = 0; k < 2; k++) {
 			size_t off = 0;

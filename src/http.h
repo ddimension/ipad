@@ -38,6 +38,23 @@ typedef struct {
 	char error[160];              /* what failed, for the log */
 } http_resp;
 
+/* A URL taken apart: host is what is connected to (an IPv6 literal without
+ * its brackets), sni the TLS server name and certificate name (empty for an
+ * IP literal, trailing dot removed), host_hdr the Host field value. */
+typedef struct {
+	bool tls;
+	bool ip;                      /* host is an IPv4 or IPv6 literal */
+	char host[256];
+	char port[6];
+	char sni[256];
+	char host_hdr[264];
+	const char *path;             /* points into the URL */
+} http_url;
+
+/* http(s)://host[:port][/path] and http(s)://[v6][:port][/path]; -1 on
+ * anything else (userinfo, a zone id, a control character or space) */
+int http_split_url(const char *url, http_url *u);
+
 /* url: http(s)://host[:port]/path. headers: "Name: value" lines, NULL-terminated.
  * Returns 0 when an HTTP answer was read (any status), -1 on a transport or
  * TLS failure (resp->error says which). resp->body must be freed by the caller. */
