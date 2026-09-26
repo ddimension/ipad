@@ -29,6 +29,9 @@ typedef struct {
 	int timeout_ms;               /* per read/connect, default 30000 */
 } http_tls;
 
+/* the most ipad reads from one answer: a bound package is a few hundred kB */
+#define HTTP_MAX_BODY ((size_t)4 << 20)
+
 typedef struct {
 	int status;                   /* HTTP status, 0 when none was read */
 	dbuf body;
@@ -41,7 +44,8 @@ typedef struct {
 int http_post(const char *url, const char *const *headers, const uint8_t *body, size_t len,
               const http_tls *tls, http_resp *resp);
 
-/* exposed for tests: parse a complete HTTP/1.1 response */
+/* exposed for tests: parse a complete HTTP/1.1 response. resp must be zeroed
+ * with its body initialised (db_init) first; -1 on anything malformed. */
 int http_parse_response(const uint8_t *p, size_t len, http_resp *resp);
 
 #endif

@@ -16,7 +16,6 @@
 
 #include "http.h"
 
-#define MAX_RESPONSE (4u << 20)   /* a bound package is a few hundred kB; 4 MB is ample */
 
 static void err(http_resp *r, const char *what, int rc)
 {
@@ -64,75 +63,278 @@ static int split_url(const char *url, bool *tls, char *host, size_t hcap, char *
 	return 0;
 }
 
-static const uint8_t *find_crlf2(const uint8_t *p, size_t len)
-{
-	size_t i;
+/* ---- response parsing (RFC 9112) -------------------------------------------
+ * Everything here reads bytes a server, or whoever sits in the path before the
+ * TLS check has a say, chose. Nothing is parsed with the C string functions:
+ * the buffer is not NUL-terminated, and a number is read digit by digit with
+ * its own bound, so a length can never wrap an addition further down. */
 
-	for (i = 0; i + 3 < len; i++)
-		if (p[i] == '\r' && p[i + 1] == '\n' && p[i + 2] == '\r' && p[i + 3] == '\n')
-			return p + i;
+static const uint8_t *find_crlf(const uint8_t *p, const uint8_t *end)
+{
+	for (; p + 1 < end; p++)
+		if (p[0] == '\r' && p[1] == '\n')
+			return p;
 	return NULL;
+}
+
+static const uint8_t *find_crlf2(const uint8_t *p, const uint8_t *end)
+{
+	for (; p + 3 < end; p++)
+		if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n')
+			return p;
+	return NULL;
+}
+
+static bool is_digit(uint8_t c)
+{
+	return c >= '0' && c <= '9';
+}
+
+static int hexval(uint8_t c)
+{
+	if (is_digit(c))
+		return c - '0';
+	c |= 0x20;
+	return (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+}
+
+/* RFC 9110 5.6.2 tchar: what a field name and a transfer coding consist of */
+static bool is_tchar(uint8_t c)
+{
+	return (c >= '0' && c <= '9') || ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') ||
+	       (c && strchr("!#$%&'*+-.^_`|~", c));
+}
+
+static bool ieq(const uint8_t *p, size_t n, const char *s)
+{
+	return strlen(s) == n && !strncasecmp((const char *)p, s, n);
+}
+
+/* A CR or LF on its own inside a line: RFC 9112 2.2 lets a recipient take a
+ * bare LF as a line end, so a field hidden behind one would be seen by a
+ * parser that does and missed by this one. Refused rather than guessed. */
+static bool lone_free(const uint8_t *p, const uint8_t *e)
+{
+	return !memchr(p, '\n', (size_t)(e - p)) && !memchr(p, '\r', (size_t)(e - p));
+}
+
+/* trims OWS (SP / HTAB) from both ends of [*p, *e) */
+static void trim_ows(const uint8_t **p, const uint8_t **e)
+{
+	while (*p < *e && (**p == ' ' || **p == '\t'))
+		(*p)++;
+	while (*e > *p && ((*e)[-1] == ' ' || (*e)[-1] == '\t'))
+		(*e)--;
+}
+
+/* Content-Length = 1*DIGIT (RFC 9110 8.6); a list of equal values, which some
+ * servers send after merging duplicates, is one value. Bounded at
+ * HTTP_MAX_BODY: nothing larger could have been received anyway. */
+static int parse_clen(const uint8_t *p, const uint8_t *e, size_t *out)
+{
+	bool have = false;
+	size_t v = 0;
+
+	while (p <= e) {
+		const uint8_t *c = memchr(p, ',', (size_t)(e - p)), *ve = c ? c : e, *vp = p;
+		size_t x = 0;
+
+		trim_ows(&vp, &ve);
+		if (vp == ve)
+			return -1;
+		for (; vp < ve; vp++) {
+			if (!is_digit(*vp) || x > HTTP_MAX_BODY)
+				return -1;
+			x = x * 10 + (size_t)(*vp - '0');
+		}
+		if (x > HTTP_MAX_BODY || (have && x != v))
+			return -1;
+		v = x;
+		have = true;
+		if (!c)
+			break;
+		p = c + 1;
+	}
+	*out = v;
+	return 0;
+}
+
+/* Transfer-Encoding is a list of codings, applied in order, possibly over
+ * several field lines (RFC 9112 6.1). The message is framed by chunked only
+ * when chunked is the final coding; ipad asks for no other coding and
+ * decodes none, so any other coding anywhere is an error. */
+static int parse_te(const uint8_t *p, const uint8_t *e, int *te)
+{
+	while (p <= e) {
+		const uint8_t *c = memchr(p, ',', (size_t)(e - p)), *ve = c ? c : e, *vp = p, *q;
+
+		trim_ows(&vp, &ve);
+		if (vp != ve) {   /* empty list elements are allowed (RFC 9110 5.6.1) */
+			for (q = vp; q < ve && is_tchar(*q); q++)
+				;
+			/* chunked has no parameters; codings are case-insensitive */
+			if (q != ve || !ieq(vp, (size_t)(ve - vp), "chunked") || *te == 2)
+				return -1;   /* another coding, or chunked twice */
+			*te = 2;
+		}
+		if (!c)
+			break;
+		p = c + 1;
+	}
+	if (*te == 0)
+		*te = 1;   /* present, but empty */
+	return 0;
+}
+
+/* status-line = HTTP-version SP status-code SP [ reason-phrase ] (RFC 9112
+ * 4); a missing SP before an empty reason phrase is tolerated. */
+static int parse_status(const uint8_t *p, const uint8_t *eol, int *minor, int *status)
+{
+	if (eol - p < 12 || memcmp(p, "HTTP/1.", 7) || !is_digit(p[7]) || p[8] != ' ' ||
+	    p[9] < '1' || p[9] > '5' || !is_digit(p[10]) || !is_digit(p[11]) ||
+	    (eol - p > 12 && p[12] != ' '))
+		return -1;
+	*minor = p[7] - '0';
+	*status = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+	return 0;
 }
 
 int http_parse_response(const uint8_t *p, size_t len, http_resp *r)
 {
-	const uint8_t *hend = find_crlf2(p, len), *b, *end = p + len;
-	long clen = -1;
-	bool chunked = false;
-	char line[512];
-	const uint8_t *q;
+	const uint8_t *end = p + len, *hend, *q, *b;
+	int minor, te;
+	bool have_clen;
+	size_t clen;
 
-	if (!hend || len < 12 || memcmp(p, "HTTP/1.", 7))
+	/* interim 1xx answers (100 Continue, 103 Early Hints) come before the
+	 * final one and carry no body (RFC 9110 15.2); 101 would switch
+	 * protocols, which ipad never asks for */
+	for (;;) {
+		const uint8_t *eol = find_crlf(p, end), *prev = NULL;
+		size_t prev_len = 0;
+
+		if (!eol || !(hend = find_crlf2(p, end)) || parse_status(p, eol, &minor, &r->status) < 0 ||
+		    !lone_free(p, eol))
+			return -1;
+
+		te = 0;
+		have_clen = false;
+		clen = 0;
+		for (q = eol + 2; q < hend + 2; ) {
+			const uint8_t *le = find_crlf(q, hend + 2), *colon, *vp, *ve;
+
+			if (!lone_free(q, le))
+				return -1;
+			if (*q == ' ' || *q == '\t') {
+				/* obs-fold: continues the previous field (RFC 9112 5.2).
+				 * For the two fields that frame the body a continuation
+				 * would change what the value means: refused. */
+				if (!prev || ieq(prev, prev_len, "Content-Length") || ieq(prev, prev_len, "Transfer-Encoding"))
+					return -1;
+				q = le + 2;
+				continue;
+			}
+			colon = memchr(q, ':', (size_t)(le - q));
+			if (!colon || colon == q)
+				return -1;
+			/* no whitespace between name and colon (RFC 9112 5.1): a
+			 * server that sends it is being read differently by someone */
+			for (vp = q; vp < colon; vp++)
+				if (!is_tchar(*vp))
+					return -1;
+			prev = q;
+			prev_len = (size_t)(colon - q);
+			vp = colon + 1;
+			ve = le;
+			trim_ows(&vp, &ve);
+			if (ieq(q, (size_t)(colon - q), "Content-Length")) {
+				size_t v;
+
+				if (parse_clen(vp, ve, &v) < 0 || (have_clen && v != clen))
+					return -1;
+				clen = v;
+				have_clen = true;
+			} else if (ieq(q, (size_t)(colon - q), "Transfer-Encoding")) {
+				if (parse_te(vp, ve, &te) < 0)
+					return -1;
+			}
+			q = le + 2;
+		}
+		b = hend + 4;
+		if (r->status >= 200)
+			break;
+		if (r->status == 101)
+			return -1;
+		p = b;
+	}
+
+	/* RFC 9112 6.1: Transfer-Encoding in an HTTP/1.0 message means the
+	 * framing is faulty. 6.3: with both fields, Transfer-Encoding would win,
+	 * but a sender MUST NOT send both (6.2) and the RFC says the message
+	 * "ought to be handled as an error" — a response framed two ways is read
+	 * one way here and another way by a middlebox, so it is refused. */
+	if ((te && minor == 0) || (te && have_clen) || te == 1)
 		return -1;
 
-	r->status = atoi((const char *)p + 9);
-
-	/* headers: only the two that decide how the body is framed */
-	for (q = p; q < hend; ) {
-		const uint8_t *nl = memchr(q, '\n', (size_t)(hend - q));
-		size_t n = (size_t)((nl ? nl : hend) - q);
-
-		if (n >= sizeof(line))
-			n = sizeof(line) - 1;
-		memcpy(line, q, n);
-		line[n] = '\0';
-		if (!strncasecmp(line, "Content-Length:", 15))
-			clen = atol(line + 15);
-		else if (!strncasecmp(line, "Transfer-Encoding:", 18) && strstr(line + 18, "chunked"))
-			chunked = true;
-		q = nl ? nl + 1 : hend;
-	}
-
-	b = hend + 4;
-
-	if (chunked) {
-		while (b < end) {
-			char *ep;
-			unsigned long n = strtoul((const char *)b, &ep, 16);
-			const uint8_t *data = memchr(b, '\n', (size_t)(end - b));
-
-			if (!data)
-				return -1;
-			data++;
-			if (n == 0)
-				return 0;
-			if ((size_t)(end - data) < n + 2)
-				return -1;
-			db_put(&r->body, data, n);
-			b = data + n + 2;
-		}
-		return -1;   /* no terminating chunk */
-	}
-
-	if (clen >= 0) {
-		if ((size_t)(end - b) < (size_t)clen)
-			return -1;
-		db_put(&r->body, b, (size_t)clen);
+	/* 204 and 304 have no body whatever the fields say (RFC 9112 6.3) */
+	if (r->status == 204 || r->status == 304)
 		return 0;
+
+	if (te) {
+		for (;;) {
+			const uint8_t *eol = find_crlf(b, end), *x;
+			uint64_t n = 0;
+			int d, digits = 0;
+
+			if (!eol)
+				return -1;
+			/* chunk-size = 1*HEXDIG, read by hand: at most 16 digits, so the
+			 * value fits 64 bits and is compared against what is there
+			 * before anything is added to it */
+			for (x = b; x < eol && (d = hexval(*x)) >= 0; x++) {
+				if (++digits > 16)
+					return -1;
+				n = (n << 4) | (uint64_t)d;
+			}
+			if (!digits)
+				return -1;   /* not a chunk size; never a last chunk */
+			/* chunk-ext (RFC 9112 7.1.1) is allowed and ignored:
+			 * BWS ";" ... up to the line end */
+			while (x < eol && (*x == ' ' || *x == '\t'))
+				x++;
+			if (x < eol && *x != ';')
+				return -1;
+			for (; x < eol; x++)
+				if (*x == '\n' || *x == '\r')
+					return -1;
+			b = eol + 2;
+			if (n == 0) {
+				/* the trailer section ends with an empty line; it is
+				 * read past, not interpreted (RFC 9112 7.1.2) */
+				if (end - b >= 2 && b[0] == '\r' && b[1] == '\n')
+					return 0;
+				return find_crlf2(b, end) ? 0 : -1;
+			}
+			if (n > (uint64_t)(end - b) || (size_t)(end - b) - (size_t)n < 2)
+				return -1;
+			if (b[n] != '\r' || b[n + 1] != '\n')
+				return -1;   /* chunk data is followed by CRLF */
+			db_put(&r->body, b, (size_t)n);
+			if (r->body.err)
+				return -1;
+			b += n + 2;
+		}
+	}
+
+	if (have_clen) {
+		if ((size_t)(end - b) < clen)
+			return -1;
+		db_put(&r->body, b, clen);
+		return r->body.err ? -1 : 0;
 	}
 
 	db_put(&r->body, b, (size_t)(end - b));   /* read to close */
-	return 0;
+	return r->body.err ? -1 : 0;
 }
 
 /* the server's leaf key must be the pinned one; checked after the handshake
@@ -291,7 +493,7 @@ int http_post(const char *url, const char *const *headers, const uint8_t *body, 
 			goto out;
 		}
 		db_put(&raw, buf, (size_t)i);
-		if (raw.len > MAX_RESPONSE) {
+		if (raw.len > HTTP_MAX_BODY) {
 			err(r, "response too large", (int)raw.len);
 			goto out;
 		}
