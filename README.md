@@ -30,7 +30,7 @@ Section numbers are SGP.32 v1.3.
 | Direct download (3.2.3.1) | the host's ES9+ client (lpac) downloads; ipad reports the PIR as `ProfileDownloadTriggerResult` |
 | Notifications (3.7) | delivered through `ESipa.HandleNotification`, removed once the eIM has them |
 | Connectivity parameters (5.9.24) | APN, PDP type and credentials of the enabled profile, handed to the host. An emulated SGP.22 card has none. |
-| Transport (6.1.1) | HTTPS with the ASN.1 binding. The trust anchor comes from the eIM configuration (`trustedPublicKeyDataTls`: a pinned key, the eIM's certificate or its CA), otherwise the system CAs; an anchor that cannot be used is logged. SNI carries host names only (no IP literals, no trailing dot, RFC 6066 3). The response reader is strict about framing (RFC 9112: chunked as the final coding, no Content-Length beside it). |
+| Transport (6.1.1) | HTTPS with the ASN.1 binding. The trust anchor comes from the eIM configuration (`trustedPublicKeyDataTls`: a pinned key, the eIM's certificate or its CA), otherwise the system CAs; an anchor that cannot be used is logged. SNI carries host names only (no IP literals, no trailing dot, RFC 6066 3). The response reader is strict about framing (RFC 9112: chunked as the final coding, no Content-Length beside it) and stops where the framing ends, even when a load balancer keeps the connection open. An IP-literal URL (`https://[::1]/…`) needs an iPAddress SAN; hosts like `127.1` or `0x7f.1` are refused. |
 
 Every message ipad sends or receives in the test suite is decoded with the
 eIM's own ASN.1 types and re-encoded byte-identically (`tools/esipa-check.sh`).
