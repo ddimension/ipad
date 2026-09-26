@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 André Valentin <avalentin@marcant.net>
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -169,29 +170,71 @@ crypto_key *crypto_key_parse(const uint8_t *der, size_t len)
 	return k;
 }
 
-/* written to a temporary file created 0600 and renamed over the target, so a
- * crash leaves either the old key or the new one, never half of one, and the
- * key is never readable by others for a moment */
+/* the directory entry of a rename is durable only once the directory is
+ * synced; without it a power cut (routers have no shutdown) can bring back
+ * the old key after the new one was reported stored */
+static int sync_dir(const char *path)
+{
+	char dir[4096];
+	const char *slash = strrchr(path, '/');
+	int fd, rc;
+
+	if (!slash)
+		snprintf(dir, sizeof(dir), ".");
+	else if (snprintf(dir, sizeof(dir), "%.*s", (int)(slash == path ? 1 : slash - path), path) >= (int)sizeof(dir))
+		return -1;
+	fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	rc = fsync(fd);
+	close(fd);
+	return rc;
+}
+
+/* Written to a temporary file and renamed over the target, so a crash
+ * leaves either the old key or the new one, never half of one. The
+ * temporary is created afresh (O_EXCL) and not through a link (O_NOFOLLOW):
+ * a stale one is removed first, and anything put there in between makes
+ * the save fail instead of writing the key where a link points. 0600 is set
+ * on the descriptor as well, whatever the umask. */
 int crypto_key_save(const crypto_key *k, const char *path)
 {
 	uint8_t buf[512];
 	char tmp[4096];
 	int n, fd, rc = -1;
+	size_t off = 0;
 
 	n = mbedtls_pk_write_key_der((mbedtls_pk_context *)&k->pk, buf, sizeof(buf));
 	if (n <= 0 || snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
-		return -1;
+		goto out;
 
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd >= 0) {
-		if (write(fd, buf + sizeof(buf) - n, (size_t)n) == n && fsync(fd) == 0)
+	if (unlink(tmp) != 0 && errno != ENOENT)
+		goto out;
+	fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0)
+		goto out;
+	if (fchmod(fd, 0600) == 0) {
+		while (off < (size_t)n) {
+			ssize_t w = write(fd, buf + sizeof(buf) - n + off, (size_t)n - off);
+
+			if (w < 0 && errno == EINTR)
+				continue;
+			if (w <= 0)
+				break;
+			off += (size_t)w;
+		}
+		if (off == (size_t)n && fsync(fd) == 0)
 			rc = 0;
-		close(fd);
-		if (rc == 0 && rename(tmp, path) != 0)
-			rc = -1;
-		if (rc != 0)
-			unlink(tmp);
 	}
+	if (close(fd) != 0)
+		rc = -1;
+	if (rc == 0 && rename(tmp, path) != 0)
+		rc = -1;
+	if (rc != 0)
+		unlink(tmp);
+	else if (sync_dir(path) != 0)
+		rc = -1;   /* renamed, but not known to be on disk */
+out:
 	mbedtls_platform_zeroize(buf, sizeof(buf));
 	return rc;
 }

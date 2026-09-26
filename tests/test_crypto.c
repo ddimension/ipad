@@ -4,6 +4,7 @@
  * own signatures verify; anything altered does not. */
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "check.h"
 #include "crypto.h"
 
@@ -82,6 +83,28 @@ int main(void)
 		OK(back && crypto_sign(back, msg, mlen, mine) == 0 &&
 		   crypto_verify(pub, msg, mlen, mine, sizeof(mine)) == 0, "load: the same key signs");
 		unlink(path);
+
+		/* a stale temporary that is a link is removed, not written
+		 * through: the key lands in the target, the link's file is
+		 * untouched; the key file is 0600 whatever the umask */
+		{
+			char tmp[64], bait[] = "/tmp/ipad-test-bait-XXXXXX";
+			struct stat st;
+			mode_t old = umask(0);
+			int bfd = mkstemp(bait);
+
+			snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+			OK(bfd >= 0 && write(bfd, "bait", 4) == 4, "bait file");
+			close(bfd);
+			OK(symlink(bait, tmp) == 0, "stale temporary as a link");
+			OK(crypto_key_save(k, path) == 0, "save: over a stale linked temporary");
+			OK(stat(bait, &st) == 0 && st.st_size == 4, "save: the link's target is untouched");
+			OK(lstat(tmp, &st) != 0, "save: no temporary left");
+			OK(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600, "save: 0600 with umask 0");
+			umask(old);
+			unlink(path);
+			unlink(bait);
+		}
 
 		crypto_key_free(k);
 		crypto_key_free(pub);
