@@ -53,6 +53,22 @@ ipad [options] poll | provision <file> | export <file> | connectivity | notify |
 
 See `ipad -h` for the options.
 
+### A lost device key
+
+The eIM refuses a second import of a card unless it is told to replace the key
+(`eimctl euicc import --replace-key`), and even then only when the file's
+`counter` is not below the counter the eIM holds for the card: a replayed old
+file must not win. `export` writes the counter the emulation holds for the eIM.
+
+- **Key lost, state kept** (`device.key` gone, `<EID>.state` still there): the
+  counter is current. Run `export` (a new key is created) and import with
+  `--replace-key`.
+- **Key and state lost**: the emulation starts from the counter in the eIM
+  configuration it is provisioned with. Read the eIM's counter
+  (`eimctl euicc show <EID>`), write a configuration that starts there
+  (`eimctl eim-config <file> --fqdn … --counter <that counter>`), `provision`
+  it, then `export` and import with `--replace-key`.
+
 ## Build and test
 
 ```sh
