@@ -92,6 +92,7 @@ void ipa_put_capabilities(dbuf *b, uint32_t tag, bool direct);
 
 const uint8_t *ipa_eid(const ipa *a);
 const char *ipa_url(const ipa *a);
+const char *ipa_eim_id(const ipa *a);   /* the configured eIM this IPA talks to */
 const http_tls *ipa_tls(const ipa *a);   /* with the eIM's pin/CA applied */
 
 /* The ICCID of the enabled profile as a string, "" when none; -1 on error */

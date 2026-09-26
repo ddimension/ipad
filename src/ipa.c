@@ -1187,6 +1187,11 @@ const char *ipa_url(const ipa *a)
 	return a->url;
 }
 
+const char *ipa_eim_id(const ipa *a)
+{
+	return a->eim_id;
+}
+
 const http_tls *ipa_tls(const ipa *a)
 {
 	return &a->c.tls;

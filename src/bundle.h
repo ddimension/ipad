@@ -20,6 +20,7 @@
 #include "der.h"
 
 #define BUNDLE_FORMAT "eim-ipad-provision/1"
+#define BUNDLE_MAX 16384   /* bytes: the eIM writes about 700 */
 
 typedef struct {
 	char issuance_id[64];
@@ -35,7 +36,10 @@ bool bundle_is(const uint8_t *p, size_t len);
 
 /* Parse the flat object. The eIM writes string and integer values only, in a
  * fixed order and with nothing that needs escaping (D-69) — anything else is
- * refused rather than guessed at. 0, or -1 with err set. */
+ * refused rather than guessed at: escapes, nesting, booleans, a field given
+ * twice, a negative or overflowing counter, data after the object. Unknown
+ * fields of the known types are ignored. 0, or -1 with err set; err never
+ * carries bundle content. */
 int bundle_parse(const uint8_t *p, size_t len, bundle *b, char *err, size_t errlen);
 void bundle_free(bundle *b);
 

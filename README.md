@@ -39,7 +39,11 @@ eIM's own ASN.1 types and re-encoded byte-identically (`tools/esipa-check.sh`).
 
 The card is reached through the host over stdin/stdout (`src/host.h`):
 APDUs in lpac's stdio protocol, plus three events that only the host can
-handle (`profile_changed`, `download`, `connectivity`).
+handle (`profile_changed`, `download`, `connectivity`) and two that tell it
+what ipad did: `info` at the start of a run and for `info` (EID, backend,
+device key, and for an emulated card the binding and the counter), and
+`summary` at the end of `poll` and `provision` (exit code, packages,
+acknowledged results, binding, and the last error when the run failed).
 
 ```
 ipad [options] poll | provision <file> | export <file> | connectivity | notify | info | reset
@@ -51,8 +55,17 @@ ipad [options] poll | provision <file> | export <file> | connectivity | notify |
   key replaces the generated one (0600), the file is deleted once stored, and
   the next `poll` binds the card first (`POST /ipad/v1/bind`, same host and
   TLS as ESipa): 204/409 bound, 403 refused — `poll` then exits 4 until an
-  operator acts —, 429/5xx/no answer tried again on the next poll. `info`
-  reports `bind` (none, pending, done, refused) and the eIM `counter`.
+  operator acts —, 429/5xx/no answer tried again on the next poll; 400/413
+  are errors, the binding stays pending. `info` reports `bind` (none,
+  pending, done, refused) and the eIM `counter`.
+  - The reader takes the bundle as the eIM writes it and nothing else: one
+    flat object, string and integer values without escapes, each field
+    once, nothing after it, at most 16 KiB. An expired bundle, another
+    format, a field twice, a negative counter are refused, and a refused
+    bundle is left in place (it holds the key: delete it or retry).
+  - The binding is sent only while the emulation's counter is the bundle's
+    start counter, which the eIM requires; the file is the one `export`
+    writes, for the eIM the IPA polls.
 - `reset` forgets the emulation's eIM configuration, state, device key and
   binding (no card needed); a new bundle starts from nothing.
 - `export` writes the `eim-euicc-import/1` file for the eIM
@@ -82,7 +95,8 @@ file must not win. `export` writes the counter the emulation holds for the eIM.
 ```sh
 tools/fetch-mbedtls.sh            # mbedTLS 3.6.7 LTS, checksum-verified
 cmake -S . -B build && cmake --build build
-(cd build && ctest)               # unit + procedure tests (simulated card, scripted eIM)
+(cd build && ctest)               # unit + procedure tests (simulated card, scripted eIM);
+                                  # cli: provision/bind/reset of a bundle against a stand-in eIM
 tools/esipa-check.sh              # every ESipa message against the eIM's ASN.1 types
 tools/e2e-eim.sh ../../eim        # end to end against a real eIM (needs its postgres)
 ```

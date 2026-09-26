@@ -232,18 +232,47 @@ static void ev_connectivity(void *ud, const char *iccid, const conn_params *p, b
 	event_answer(h);
 }
 
-void host_event_info(host_link *h, const char *eid, const char *backend, const char *fp)
+void host_event_info(host_link *h, const char *eid, const char *backend, const char *fp,
+                     const char *bind, long long counter)
 {
 	fprintf(h->out, "{\"type\":\"event\",\"payload\":{\"event\":\"info\",\"eid\":\"%s\",\"backend\":\"%s\"",
 	        eid, backend);
 	if (fp)
 		fprintf(h->out, ",\"key_fingerprint\":\"%s\"", fp);
+	if (bind)
+		fprintf(h->out, ",\"bind\":\"%s\"", bind);
+	if (counter >= 0)
+		fprintf(h->out, ",\"counter\":%lld", counter);
+	event_answer(h);
+}
+
+void host_event_summary(host_link *h, const char *cmd, int code, const ipa_summary *s, const char *bind)
+{
+	fprintf(h->out, "{\"type\":\"event\",\"payload\":{\"event\":\"summary\",\"command\":\"%s\",\"code\":%d",
+	        cmd, code);
+	if (s)
+		fprintf(h->out, ",\"packages\":%d,\"acknowledged\":%d,\"downloads\":%d,\"notifications\":%d,"
+		        "\"changed\":%d,\"rolled_back\":%d", s->packages, s->acknowledged, s->downloads,
+		        s->notifications, s->profile_changed, s->rolled_back);
+	if (bind)
+		fprintf(h->out, ",\"bind\":\"%s\"", bind);
+	/* only what went wrong in a run that failed: a warning a good run got
+	 * over (a retried connection) is not its outcome */
+	if (code != 0 && h->last_error[0]) {
+		fprintf(h->out, ",\"error\":");
+		host_json_str(h->out, h->last_error);
+	}
 	event_answer(h);
 }
 
 static void ev_log(void *ud, int lvl, const char *msg)
 {
-	(void)ud;
+	host_link *h = ud;
+
+	/* the host reads the run's outcome from the summary event; the messages
+	 * logged here never carry keys, bundles or activation codes */
+	if (h && lvl <= LOG_WARNING)
+		snprintf(h->last_error, sizeof(h->last_error), "%s", msg);
 	syslog(lvl, "%s", msg);
 	if (verbose_log)
 		fprintf(stderr, "ipad: %s\n", msg);

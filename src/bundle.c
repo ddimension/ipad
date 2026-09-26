@@ -2,6 +2,7 @@
  * Copyright (C) 2026 André Valentin <avalentin@marcant.net>
  */
 #define _DEFAULT_SOURCE   /* timegm */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,25 +69,45 @@ static int b64_into(const uint8_t *s, size_t n, dbuf *out)
 	return rc == 0 && !out->err ? 0 : -1;
 }
 
+/* the issuance id is a UUID; it goes into the bind marker and the log, so
+ * nothing but hex digits and dashes is let through */
+static bool id_ok(const uint8_t *s, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f') || (s[i] >= 'A' && s[i] <= 'F') ||
+		      s[i] == '-'))
+			return false;
+	return n > 0;
+}
+
 int bundle_parse(const uint8_t *p, size_t len, bundle *b, char *err, size_t errlen)
 {
 	const uint8_t *end = p + len, *k, *v;
 	size_t kn, vn;
-	bool fmt = false, have_ctr = false;
+	bool fmt = false, have_ctr = false, have_id = false, have_exp = false;
 
 	memset(b, 0, sizeof(*b));
 	db_init(&b->eim_config);
 	db_init(&b->device_key);
 
+	/* the eIM's file is about 0.7 kB; a big one is not a bundle, and reading
+	 * it would only cost memory on the router */
+	if (len > BUNDLE_MAX) {
+		set_err(err, errlen, "too large for a bundle");
+		return -1;
+	}
 	skip_ws(&p, end);
 	if (p >= end || *p++ != '{') {
 		set_err(err, errlen, "not a JSON object");
 		return -1;
 	}
+	skip_ws(&p, end);
+	if (p < end && *p == '}')
+		goto closed;
 	for (;;) {
 		skip_ws(&p, end);
-		if (p < end && *p == '}')
-			break;
 		if (read_str(&p, end, &k, &kn) < 0) {
 			set_err(err, errlen, "malformed key");
 			goto bad;
@@ -105,25 +126,42 @@ int bundle_parse(const uint8_t *p, size_t len, bundle *b, char *err, size_t errl
 				goto bad;
 			}
 			if (KEY("format")) {
+				if (fmt)
+					goto dup;
 				if (vn != sizeof(BUNDLE_FORMAT) - 1 || memcmp(v, BUNDLE_FORMAT, vn)) {
 					set_err(err, errlen, "not an " BUNDLE_FORMAT " bundle");
 					goto bad;
 				}
 				fmt = true;
 			} else if (KEY("issuance_id")) {
+				if (have_id)
+					goto dup;
 				if (vn >= sizeof(b->issuance_id))
 					goto toolong;
+				if (!id_ok(v, vn)) {
+					set_err(err, errlen, "issuance_id is not a UUID");
+					goto bad;
+				}
 				memcpy(b->issuance_id, v, vn);
+				have_id = true;
 			} else if (KEY("expires_at")) {
+				if (have_exp)
+					goto dup;
 				if (vn >= sizeof(b->expires_at))
 					goto toolong;
 				memcpy(b->expires_at, v, vn);
+				have_exp = true;
 			} else if (KEY("eim_configuration")) {
+				/* a second one would be appended to the first */
+				if (b->eim_config.len)
+					goto dup;
 				if (b64_into(v, vn, &b->eim_config) < 0) {
 					set_err(err, errlen, "eim_configuration is not base64");
 					goto bad;
 				}
 			} else if (KEY("device_key")) {
+				if (b->device_key.len)
+					goto dup;
 				if (b64_into(v, vn, &b->device_key) < 0) {
 					set_err(err, errlen, "device_key is not base64");
 					goto bad;
@@ -139,12 +177,20 @@ int bundle_parse(const uint8_t *p, size_t len, bundle *b, char *err, size_t errl
 			while (p < end && n < sizeof(num) - 1 && (*p == '-' || (*p >= '0' && *p <= '9')))
 				num[n++] = (char)*p++;
 			num[n] = 0;
+			errno = 0;
 			x = strtoll(num, &e, 10);
-			if (*e) {
+			if (!n || *e || errno == ERANGE) {
 				set_err(err, errlen, "malformed number");
 				goto bad;
 			}
 			if (KEY("counter")) {
+				if (have_ctr)
+					goto dup;
+				/* counterValue is never negative (SGP.32 2.11.1.1.1) */
+				if (x < 0) {
+					set_err(err, errlen, "counter is negative");
+					goto bad;
+				}
 				b->counter = x;
 				have_ctr = true;
 			}
@@ -165,6 +211,15 @@ int bundle_parse(const uint8_t *p, size_t len, bundle *b, char *err, size_t errl
 		set_err(err, errlen, "missing ',' or '}'");
 		goto bad;
 	}
+closed:
+	/* one object and nothing after it: a second one appended would be read
+	 * by nobody, and a file like that was not written by the eIM */
+	p++;
+	skip_ws(&p, end);
+	if (p != end) {
+		set_err(err, errlen, "data after the object");
+		goto bad;
+	}
 
 	if (!fmt) {
 		set_err(err, errlen, "no format field");
@@ -180,6 +235,9 @@ int bundle_parse(const uint8_t *p, size_t len, bundle *b, char *err, size_t errl
 	}
 	return 0;
 
+dup:
+	set_err(err, errlen, "a field appears twice");
+	goto bad;
 toolong:
 	set_err(err, errlen, "a field is too long");
 bad:

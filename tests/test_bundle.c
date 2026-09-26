@@ -52,6 +52,49 @@ int main(void)
 	         "\"device_key\":\"" KEY64 "\",\"counter\":0,\"expires_at\":\"2027-01-01T00:00:00Z\"}", &b, err) < 0,
 	   "refused: not base64");
 
+#define GOOD_TAIL "\"eim_configuration\":\"" CFG64 "\",\"device_key\":\"" KEY64 "\",\"expires_at\":\"2027-01-01T00:00:00Z\""
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0," GOOD_TAIL "}", &b, err) == 0,
+	   "parse: the variant used below is good");
+	bundle_free(&b);
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0," GOOD_TAIL
+	         ",\"device_key\":\"" KEY64 "\"}", &b, err) < 0, "refused: a field twice (a second key would be appended)");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0,\"counter\":1,"
+	         GOOD_TAIL "}", &b, err) < 0, "refused: the counter twice");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":-1," GOOD_TAIL "}", &b, err) < 0,
+	   "refused: a negative counter");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":99999999999999999999,"
+	         GOOD_TAIL "}", &b, err) < 0, "refused: a counter past 64 bits");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":-," GOOD_TAIL "}", &b, err) < 0,
+	   "refused: a lone minus");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab/../1\",\"counter\":0," GOOD_TAIL "}", &b, err) < 0,
+	   "refused: an issuance id that is not a UUID");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0," GOOD_TAIL "}{}", &b, err) < 0,
+	   "refused: data after the object");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0," GOOD_TAIL ",}", &b, err) < 0,
+	   "refused: a trailing comma");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0,\"x\":true," GOOD_TAIL "}", &b, err) < 0,
+	   "refused: a boolean");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0,\"x\":[1]," GOOD_TAIL "}", &b, err) < 0,
+	   "refused: an array");
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0,\"note\":\"later\",\"n\":2,"
+	         GOOD_TAIL "}", &b, err) == 0, "parse: unknown string and integer fields are ignored");
+	bundle_free(&b);
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0," GOOD_TAIL, &b, err) < 0,
+	   "refused: truncated");
+	OK(parse("{}", &b, err) < 0, "refused: empty object");
+	{
+		char *big = calloc(1, BUNDLE_MAX + 2);
+
+		memset(big, ' ', BUNDLE_MAX + 1);
+		big[0] = '{';
+		OK(big && bundle_parse((const uint8_t *)big, BUNDLE_MAX + 1, &b, err, sizeof(err)) < 0 &&
+		   strstr(err, "too large"), "refused: larger than a bundle can be");
+		free(big);
+	}
+	OK(parse("{\"format\":\"eim-ipad-provision/1\",\"issuance_id\":\"ab-1\",\"counter\":0,"
+	         "\"eim_configuration\":\"" CFG64 "\",\"device_key\":\"SECRETKEY@\",\"expires_at\":\"2027-01-01T00:00:00Z\"}",
+	         &b, err) < 0 && !strstr(err, "SECRET"), "refused: the error never quotes the key");
+
 	/* --- bundle or DER ---------------------------------------------------------- */
 	OK(bundle_is((const uint8_t *)" \n{\"format\"", 11), "is: a JSON object, leading whitespace allowed");
 	OK(!bundle_is((const uint8_t *)"\x30\x03", 2), "is: DER is not a bundle");

@@ -4,8 +4,10 @@
  * commands in a row against the same card, so a provision, an export and a
  * poll see one card state:
  *
- *   hostsim [-o] [-a] [-P iccid[,iccid...]] -- ipad <args> [-- ipad <args> ...]
+ *   hostsim [-o] [-a] [-E eid] [-P iccid[,iccid...]] -- ipad <args> [-- ipad <args> ...]
  *
+ *   -E   the card's EID, 32 hex digits (default fake22's): several cards
+ *        against one eIM, whose registrations outlive a test run
  *   -P   profiles on the card, the first enabled (default: two test ICCIDs)
  *   -o   answer profile_changed with online:false
  *   -a   refuse the download event
@@ -136,18 +138,23 @@ static int run(char **argv)
 int main(int argc, char **argv)
 {
 	int i, rc = 0, opt;
-	const char *profiles = "98001032547698103214,98001032547698103224";
+	const char *profiles = "98001032547698103214,98001032547698103224", *eid = NULL;
 
-	while ((opt = getopt(argc, argv, "oaP:")) != -1) {
+	while ((opt = getopt(argc, argv, "oaE:P:")) != -1) {
 		switch (opt) {
 		case 'o': offline = 1; break;
 		case 'a': refuse_download = 1; break;
+		case 'E': eid = optarg; break;
 		case 'P': profiles = optarg; break;
 		default: return 2;
 		}
 	}
 
 	fake22_init(&fcard);
+	if (eid && (strlen(eid) != 32 || hex_decode(eid, fcard.eid, 16) != 16)) {
+		fprintf(stderr, "hostsim: -E wants 32 hex digits\n");
+		return 2;
+	}
 	{
 		char buf[512], *tok, *save = NULL;
 		int first = 1;
