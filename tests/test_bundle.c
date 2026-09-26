@@ -103,6 +103,30 @@ int main(void)
 	OK(rfc3339_time("2027-03-25T12:00:00Z", &t) == 0 && t == 1805976000, "time: Z");
 	OK(rfc3339_time("2027-03-25T14:00:00.123+02:00", &t) == 0 && t == 1805976000, "time: offset and fraction");
 	OK(rfc3339_time("2027-03-25 12:00", &t) < 0, "time: not RFC 3339");
+	OK(rfc3339_time("2028-02-29T00:00:00Z", &t) == 0 && t == 1835395200, "time: 29 February of a leap year");
+	OK(rfc3339_time("2027-02-29T00:00:00Z", &t) < 0, "time: 29 February of another year");
+	OK(rfc3339_time("2027-02-31T00:00:00Z", &t) < 0, "time: 31 February");
+	OK(rfc3339_time("2027-04-31T00:00:00Z", &t) < 0, "time: 31 April");
+	OK(rfc3339_time("2100-02-29T00:00:00Z", &t) < 0, "time: 2100 is no leap year");
+	OK(rfc3339_time("2027-03-25T12:00:00+24:00", &t) < 0, "time: offset hour 24");
+	OK(rfc3339_time("2027-03-25T12:00:00+01:60", &t) < 0, "time: offset minute 60");
+	OK(rfc3339_time("2027-03-25T12:00:00-23:59", &t) == 0 && t == 1805976000 + 23 * 3600 + 59 * 60,
+	   "time: offset -23:59");
+	OK(rfc3339_time("2027-03-25T12:00:00.Z", &t) < 0, "time: a fraction without digits");
+	{
+		/* the offset cut short at the end of the buffer: an exact-size heap
+		 * copy, so a read past the terminator shows under ASan */
+		const char *cut[] = { "2027-03-25T12:00:00+", "2027-03-25T12:00:00+0", "2027-03-25T12:00:00+01",
+		                      "2027-03-25T12:00:00+01:", "2027-03-25T12:00:00+01:0" };
+		size_t i;
+
+		for (i = 0; i < sizeof(cut) / sizeof(cut[0]); i++) {
+			char *c = strdup(cut[i]);
+
+			OK(c && rfc3339_time(c, &t) < 0, "time: a truncated offset");
+			free(c);
+		}
+	}
 
 	/* --- the bind answers (D-69) ------------------------------------------------- */
 	OK(bind_outcome_of(204) == BIND_DONE, "bind: 204 bound");

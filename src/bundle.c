@@ -267,11 +267,24 @@ static int digits(const char *s, int n, int *out)
 	return 0;
 }
 
+static int days_in(int y, int mo)
+{
+	static const int d[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+	if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0))
+		return 29;
+	return d[mo - 1];
+}
+
+/* RFC 3339 5.6 date-time. Every byte is looked at only after the length
+ * says it is there; the date must exist (no 31 February, which timegm would
+ * quietly turn into 3 March), and the offset stays within ±23:59. */
 int rfc3339_time(const char *s, time_t *out)
 {
 	struct tm tm;
 	int y, mo, d, h, mi, sec, oh = 0, om = 0, sign = 0;
 	const char *p;
+	time_t t;
 
 	if (strlen(s) < 20 || s[4] != '-' || s[7] != '-' || (s[10] != 'T' && s[10] != 't' && s[10] != ' ') ||
 	    s[13] != ':' || s[16] != ':' ||
@@ -279,20 +292,27 @@ int rfc3339_time(const char *s, time_t *out)
 	    digits(s + 11, 2, &h) || digits(s + 14, 2, &mi) || digits(s + 17, 2, &sec))
 		return -1;
 	p = s + 19;
-	if (*p == '.')
+	if (*p == '.') {
+		/* time-secfrac = "." 1*DIGIT */
+		if (!(p[1] >= '0' && p[1] <= '9'))
+			return -1;
 		for (p++; *p >= '0' && *p <= '9'; p++)
 			;
+	}
 	if (*p == 'Z' || *p == 'z') {
 		p++;
 	} else if (*p == '+' || *p == '-') {
 		sign = (*p == '-') ? -1 : 1;
-		if (p[3] != ':' || digits(p + 1, 2, &oh) || digits(p + 4, 2, &om))
+		if (strlen(p) < 6 || p[3] != ':' || digits(p + 1, 2, &oh) || digits(p + 4, 2, &om) ||
+		    oh > 23 || om > 59)
 			return -1;
 		p += 6;
 	} else {
 		return -1;
 	}
-	if (*p || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60)
+	/* sec 60 is a leap second (RFC 3339 5.7), which timegm folds into the
+	 * next minute */
+	if (*p || mo < 1 || mo > 12 || d < 1 || d > days_in(y, mo) || h > 23 || mi > 59 || sec > 60)
 		return -1;
 
 	memset(&tm, 0, sizeof(tm));
@@ -302,7 +322,13 @@ int rfc3339_time(const char *s, time_t *out)
 	tm.tm_hour = h;
 	tm.tm_min = mi;
 	tm.tm_sec = sec;
-	*out = timegm(&tm) - sign * (oh * 3600 + om * 60);
+	/* -1 is also 1969-12-31T23:59:59Z; only with errno set is it a failure
+	 * (a year past a 32-bit time_t) */
+	errno = 0;
+	t = timegm(&tm);
+	if (t == (time_t)-1 && errno)
+		return -1;
+	*out = t - sign * (oh * 3600 + om * 60);
 	return 0;
 }
 
