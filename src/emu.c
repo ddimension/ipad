@@ -91,18 +91,45 @@ typedef struct {
 
 #define MAX_PROF 32
 
-static int profiles(emu *e, prof *out, int cap, dbuf *raw)
+/* GetProfilesInfo (SGP.22 5.7.15) as a parsed answer: 0 with *list set,
+ * -1 on an error status word or a profileInfoListError (no A0 in it) */
+static int profiles_query(emu *e, const uint8_t *req, size_t len, dbuf *resp, der_tlv *list)
 {
-	uint8_t req[] = { 0xBF, 0x2D, 0x00 };
+	der_tlv t;
+
+	resp->len = 0;
+	if (card_es10(e->card, req, len, resp) < 0 ||
+	    der_parse(resp->d, resp->len, &t) < 0 || t.tag != 0xBF2D ||
+	    der_find(t.val, t.len, 0xA0, list) < 0)
+		return -1;
+	return 0;
+}
+
+/* The card's profiles, with state and fallbackAllowed.
+ *
+ * fallbackAllowed ('9F67') has to be asked for by name: the default tag
+ * list ('BF2D 00') holds only the tags SGP.22 5.7.15 marks (*), and 9F67 is
+ * not one of them, so a card that stores the flag still leaves it out of a
+ * default answer, and every setFallbackAttribute (3.4.6 step 4) would be
+ * fallbackNotAllowed. A card that does not know 9F67 may refuse the whole
+ * tag list (SGP.22 5.7.20, GetEID, answers an unsupported tag list with an
+ * error status word; 5.7.15 does not say), so the default list is asked next,
+ * and the flag then counts as absent, which is what 3.4.6 makes of an
+ * absent flag anyway. */
+static int profiles(emu *e, prof *out, int cap)
+{
+	static const uint8_t with_fb[] = {   /* 5C { 5A 9F70 9F67 } */
+		0xBF, 0x2D, 0x07, 0x5C, 0x05, 0x5A, 0x9F, 0x70, 0x9F, 0x67
+	};
+	static const uint8_t dflt[] = { 0xBF, 0x2D, 0x00 };
 	dbuf resp;
-	der_tlv t, list, it, x;
+	der_tlv list, it, x;
 	const uint8_t *p, *end;
 	int n = 0;
 
 	db_init(&resp);
-	if (card_es10(e->card, req, sizeof(req), &resp) < 0 ||
-	    der_parse(resp.d, resp.len, &t) < 0 || t.tag != 0xBF2D ||
-	    der_find(t.val, t.len, 0xA0, &list) < 0) {
+	if (profiles_query(e, with_fb, sizeof(with_fb), &resp, &list) < 0 &&
+	    profiles_query(e, dflt, sizeof(dflt), &resp, &list) < 0) {
 		db_free(&resp);
 		return -1;
 	}
@@ -120,8 +147,6 @@ static int profiles(emu *e, prof *out, int cap, dbuf *raw)
 		n++;
 	}
 
-	if (raw)
-		db_put(raw, resp.d, resp.len);
 	db_free(&resp);
 	return n;
 }
@@ -144,6 +169,187 @@ static prof *enabled_prof(prof *ps, int n)
 		if (!ps[i].gone && ps[i].enabled)
 			return &ps[i];
 	return NULL;
+}
+
+/* The Fallback Profile as the card has it: the profile carrying the
+ * attribute, NULL when no profile does or it is no longer on the card. Its
+ * state comes from the card's list (and, inside a package, from what the
+ * package did to it), never from a record of what ipad last did: the card's
+ * profiles also change through lpac, an eUICCMemoryReset or an eIM enable. */
+static prof *fallback_prof(const emu *e, prof *ps, int np)
+{
+	return e->fb_set ? find_prof(ps, np, e->fb_iccid) : NULL;
+}
+
+/* --- ProfileInfo lists with the fallback attribute ----------------------------- */
+
+/* An SGP.22 card has no fallbackAttribute ('9F26'); the emulation keeps it
+ * and writes it into the card's ProfileInfo. ProfileInfo is a SEQUENCE, so
+ * DER puts its members in declaration order (X.690 8.9.2 via 10): in
+ * SGP32Definitions.asn only fallbackAllowed '9F67' and iotSpecificProfileInfo
+ * 'BF64' follow fallbackAttribute, so 9F26 goes before the first of those. It
+ * is DEFAULT FALSE, and DER omits a default value (X.690 11.5), so only the
+ * Fallback Profile carries it, as TRUE. */
+static void put_profile_info(dbuf *out, const der_tlv *it, bool add_fb, bool keep_iccid)
+{
+	size_t s = der_begin(out, 0xE3);
+	const uint8_t *p = it->val, *end = it->val + it->len;
+	der_tlv c;
+
+	while (p < end && der_next(&p, end, &c) == 0) {
+		if (add_fb && (c.tag == 0x9F67 || c.tag == 0xBF64)) {
+			der_put_bool(out, 0x9F26, true);
+			add_fb = false;
+		}
+		/* the ICCID was asked for only to find the Fallback Profile */
+		if ((c.tag == 0x5A && !keep_iccid) || c.tag == 0x9F26)
+			continue;
+		db_put(out, c.raw, c.raw_len);
+	}
+	if (add_fb)
+		der_put_bool(out, 0x9F26, true);
+	der_end(out, s);
+}
+
+/* the card's ProfileInfoListResponse with 9F26 on the Fallback Profile when
+ * with_fb; -1 when it is no list (an error the caller passes on as it is) */
+static int put_profile_list(const emu *e, const dbuf *resp, bool with_fb, bool keep_iccid, dbuf *out)
+{
+	der_tlv top, list, it, x;
+	const uint8_t *p, *end;
+	size_t m, l;
+
+	if (der_parse(resp->d, resp->len, &top) < 0 || top.tag != 0xBF2D ||
+	    der_find(top.val, top.len, 0xA0, &list) < 0)
+		return -1;
+
+	m = der_begin(out, 0xBF2D);
+	l = der_begin(out, 0xA0);
+	for (p = list.val, end = list.val + list.len; p < end; ) {
+		if (der_next(&p, end, &it) < 0)
+			break;
+		if (it.tag != 0xE3) {
+			db_put(out, it.raw, it.raw_len);
+			continue;
+		}
+		put_profile_info(out, &it, with_fb && e->fb_set &&
+		                 der_find(it.val, it.len, 0x5A, &x) == 0 && x.len == 10 &&
+		                 !memcmp(x.val, e->fb_iccid, 10), keep_iccid);
+	}
+	der_end(out, l);
+	der_end(out, m);
+	return 0;
+}
+
+/* the tags of a tag list ('5C' value) in order; their count */
+static int tag_list(const uint8_t *v, size_t len, uint32_t *tags, int cap)
+{
+	const uint8_t *p = v, *end = v + len;
+	int n = 0;
+
+	while (p < end && n < cap) {
+		uint32_t t = *p++;
+
+		if ((t & 0x1F) == 0x1F)   /* multi-byte tag: more follow while b8 is set */
+			while (p < end) {
+				uint8_t b = *p++;
+
+				t = t << 8 | b;
+				if (!(b & 0x80))
+					break;
+			}
+		tags[n++] = t;
+	}
+	return n;
+}
+
+static void put_tag(dbuf *b, uint32_t t)
+{
+	uint8_t o[4];
+	size_t n = t > 0xFFFFFF ? 4 : t > 0xFFFF ? 3 : t > 0xFF ? 2 : 1, i;
+
+	for (i = 0; i < n; i++)
+		o[i] = (uint8_t)(t >> (8 * (n - 1 - i)));
+	db_put(b, o, n);
+}
+
+static bool has_tag(const uint32_t *tags, int n, uint32_t t)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (tags[i] == t)
+			return true;
+	return false;
+}
+
+/* PSMO listProfileInfo (2.11.1.1.3, 5.9.14): its result is a
+ * ProfileInfoListResponse, which goes into the results as [45] itself.
+ *
+ * - Without a tag list SGP.32 has its own default (2.11.1.1.3: 5A 4F 9F70 91
+ *   92 95 9F7B 9F26 9F67), not SGP.22's, which has 90 93 94 and none of the
+ *   SGP.32 tags; so the card is always sent an explicit tag list.
+ * - 9F26 is never asked of the card; it comes from the emulation's record,
+ *   and only when the list (the eIM's or the default) contains it.
+ * - The ICCID is always asked for, as the only way to find the Fallback
+ *   Profile in the answer, and dropped again when the eIM did not ask.
+ * - A card that refuses the list for an SGP.32 tag it does not know (9F7B,
+ *   9F67) is asked once more without them; a requested data object that a
+ *   profile does not have is omitted (SGP.22 5.7.15), which is what an
+ *   SGP.22 card's profile is for those tags.
+ * searchCriteria and iotSpecificTagList go to the card as the eIM sent them. */
+static int64_t list_profile_info(emu *e, const der_tlv *op, dbuf *res)
+{
+	static const uint32_t dflt[] = { 0x5A, 0x4F, 0x9F70, 0x91, 0x92, 0x95, 0x9F7B, 0x9F26, 0x9F67 };
+	uint32_t want[64];
+	int nwant, i, attempt;
+	der_tlv x;
+	dbuf req, resp;
+	bool with_fb, keep_iccid, sent = false;
+	int64_t v = 0;
+
+	if (der_find(op->val, op->len, 0x5C, &x) == 0) {
+		nwant = tag_list(x.val, x.len, want, 64);
+	} else {
+		nwant = (int)(sizeof(dflt) / sizeof(dflt[0]));
+		memcpy(want, dflt, sizeof(dflt));
+	}
+	with_fb = has_tag(want, nwant, 0x9F26);
+	keep_iccid = has_tag(want, nwant, 0x5A);
+
+	db_init(&req);
+	db_init(&resp);
+	for (attempt = 0; attempt < 2 && !sent; attempt++) {
+		size_t m, l;
+
+		if (attempt == 1 && !has_tag(want, nwant, 0x9F7B) && !has_tag(want, nwant, 0x9F67))
+			break;   /* nothing left to leave out */
+		req.len = resp.len = 0;
+		m = der_begin(&req, 0xBF2D);
+		if (der_find(op->val, op->len, 0xA0, &x) == 0)
+			db_put(&req, x.raw, x.raw_len);
+		l = der_begin(&req, 0x5C);
+		if (!keep_iccid)
+			put_tag(&req, 0x5A);
+		for (i = 0; i < nwant; i++)
+			if (want[i] != 0x9F26 && !(attempt == 1 && (want[i] == 0x9F7B || want[i] == 0x9F67)))
+				put_tag(&req, want[i]);
+		der_end(&req, l);
+		if (der_find(op->val, op->len, 0x5D, &x) == 0)
+			db_put(&req, x.raw, x.raw_len);
+		der_end(&req, m);
+		sent = !req.err && card_call(e, &req, &resp) == 0;
+	}
+
+	if (!sent) {
+		der_put_int(res, 0x02, 127);   /* processingTerminated undefinedError */
+		v = 127;
+	} else if (put_profile_list(e, &resp, with_fb, keep_iccid, res) < 0) {
+		db_put(res, resp.d, resp.len);   /* the card's profileInfoListError */
+	}
+	db_free(&req);
+	db_free(&resp);
+	return v;
 }
 
 /* --- signed results -------------------------------------------------------- */
@@ -373,29 +579,16 @@ static int64_t psmo(emu *e, pkgrun *k, prof *ps, int np, const der_tlv *op, dbuf
 		else if ((k->grant_rb && !memcmp(k->rb_iccid, p->iccid, 10)) ||
 		         (e->rb_granted && !memcmp(e->rb_iccid, p->iccid, 10)))
 			v = 20;   /* rollbackNotAvailable */
-		else if (e->fb_active && e->fb_prev_set && !memcmp(e->fb_prev, p->iccid, 10))
-			v = 21;   /* returnFallbackProfile */
+		else if ((en = fallback_prof(e, ps, np)) && en->enabled &&
+		         e->fb_prev_set && !memcmp(e->fb_prev, p->iccid, 10))
+			v = 21;   /* returnFallbackProfile: the way back from the enabled Fallback Profile */
 		else if ((v = psmo_code(0xBF33, card_delete(e, p->iccid))) == 0)
 			p->gone = true;
 		der_put_int(res, 0x85, v);
 		return v;
 
-	case 0xBF2D: { /* listProfileInfo: the card's own answer, [45] replacing [45] */
-		dbuf req, resp;
-
-		db_init(&req);
-		db_init(&resp);
-		db_put(&req, op->raw, op->raw_len);
-		if (card_call(e, &req, &resp) < 0) {
-			der_put_int(res, 0x02, 127);   /* processingTerminated undefinedError */
-			v = 127;
-		} else {
-			db_put(res, resp.d, resp.len);
-		}
-		db_free(&req);
-		db_free(&resp);
-		return v;
-	}
+	case 0xBF2D:   /* listProfileInfo */
+		return list_profile_info(e, op, res);
 
 	case 0xA6: { /* getRAT: SGP.22 ES10b.GetRAT, the table itself as [6] */
 		uint8_t req[] = { 0xBF, 0x43, 0x00 };
@@ -436,8 +629,8 @@ static int64_t psmo(emu *e, pkgrun *k, prof *ps, int np, const der_tlv *op, dbuf
 			v = 0;    /* already set: ok */
 		else if (!p->fallback_allowed)
 			v = 2;    /* fallbackNotAllowed */
-		else if (e->fb_set && e->fb_active)
-			v = 3;    /* fallbackProfileEnabled */
+		else if ((en = fallback_prof(e, ps, np)) && en->enabled)
+			v = 3;    /* fallbackProfileEnabled (step 6a) */
 		else {
 			e->fb_set = true;
 			memcpy(e->fb_iccid, p->iccid, 10);
@@ -446,10 +639,10 @@ static int64_t psmo(emu *e, pkgrun *k, prof *ps, int np, const der_tlv *op, dbuf
 		return v;
 
 	case 0xA9:   /* unsetFallbackAttribute (3.4.7) */
-		if (!e->fb_set)
-			v = 2;    /* noFallbackAttribute */
-		else if (e->fb_active)
-			v = 3;
+		if (!(en = fallback_prof(e, ps, np)))
+			v = 2;    /* noFallbackAttribute: none set, or its profile deleted */
+		else if (en->enabled)
+			v = 3;    /* fallbackProfileEnabled */
 		else
 			e->fb_set = false;
 		der_put_int(res, 0x8E, v);
@@ -784,7 +977,7 @@ static int load_euicc_package(emu *e, const uint8_t *req, size_t len, dbuf *out)
 	db_init(&results);
 
 	if (psmos) {   /* psmoList */
-		np = profiles(e, ps, MAX_PROF, NULL);
+		np = profiles(e, ps, MAX_PROF);
 		if (np < 0) {
 			der_put_int(&results, 0x02, 127);
 		} else {
@@ -1014,46 +1207,63 @@ static int profile_rollback(emu *e, dbuf *out)
 	return emu_state_save(e);
 }
 
-/* ES10b.ExecuteFallbackMechanism (5.9.20) / ReturnFromFallback (5.9.21) */
+/* ES10b.ExecuteFallbackMechanism (5.9.20) / ReturnFromFallback (5.9.21).
+ *
+ * Which profile is enabled is asked of the card every time (fallback_prof):
+ * a return judged from a record of the last execute would switch the card
+ * away from a profile the fallback never enabled. The checks run in the
+ * order each section lists them, which decides the code when more than one
+ * fails. */
 static int fallback(emu *e, bool execute, dbuf *out)
 {
 	uint32_t tag = execute ? 0xBF5D : 0xBF5E;
-	prof ps[MAX_PROF], *en, *fb;
-	int np = profiles(e, ps, MAX_PROF, NULL);
+	prof ps[MAX_PROF], *en, *fb, *prev;
+	int np = profiles(e, ps, MAX_PROF);
 	int64_t v;
 
-	if (!e->fb_set) {
-		simple_result(out, tag, 0x80, 6);   /* fallbackNotAvailable */
-		return 0;
-	}
 	if (np < 0) {
 		simple_result(out, tag, 0x80, 127);
 		return 0;
 	}
 
 	en = enabled_prof(ps, np);
-	fb = find_prof(ps, np, e->fb_iccid);
+	/* an attribute whose profile is no longer on the card is set for no
+	 * Profile on the eUICC (5.9.20), so it counts as not set */
+	fb = fallback_prof(e, ps, np);
 
 	if (execute) {
-		if (!fb || fb->enabled) {
-			simple_result(out, tag, 0x80, 2);   /* profileNotInDisabledState */
-			return 0;
-		}
-		v = card_switch(e, 0xBF31, e->fb_iccid);
-		if (v == 0) {
-			e->fb_active = true;
-			e->fb_prev_set = en != NULL;
-			if (en)
-				memcpy(e->fb_prev, en->iccid, 10);
-		}
-	} else {
-		if (!e->fb_active || !e->fb_prev_set) {
+		if (!en) {
 			simple_result(out, tag, 0x80, 7);   /* commandError */
 			return 0;
 		}
-		v = card_switch(e, 0xBF31, e->fb_prev);
-		if (v == 0)
-			e->fb_active = false;
+		if (!fb) {
+			simple_result(out, tag, 0x80, 6);   /* fallbackNotAvailable */
+			return 0;
+		}
+		/* the Emergency Profile check (ecallActive): an SGP.22 card has none */
+		if (fb->enabled) {
+			simple_result(out, tag, 0x80, 2);   /* profileNotInDisabledState */
+			return 0;
+		}
+		v = card_switch(e, 0xBF31, fb->iccid);
+		if (v == 0) {
+			e->fb_prev_set = true;
+			memcpy(e->fb_prev, en->iccid, 10);
+			/* 5.9.20 resets it with the switch: a rollback granted before
+			 * would otherwise switch the card from the Fallback Profile to
+			 * the profile recorded before the eIM's enable, past
+			 * ReturnFromFallback, and leave the fallback record behind */
+			e->rb_granted = false;
+		}
+	} else {
+		/* all three checks answer fallbackNotAvailable (5.9.21) */
+		if (!fb || fb != en || !e->fb_prev_set || !(prev = find_prof(ps, np, e->fb_prev))) {
+			simple_result(out, tag, 0x80, 6);
+			return 0;
+		}
+		/* 5.9.21 lists the reset with its checks, before the switch */
+		e->rb_granted = false;
+		v = card_switch(e, 0xBF31, prev->iccid);
 	}
 
 	simple_result(out, tag, 0x80, v == 0 ? 0 : (v == 5 ? 5 : 127));
@@ -1216,47 +1426,19 @@ static int memory_reset(emu *e, const uint8_t *req, size_t len, dbuf *out)
 	return emu_state_save(e);
 }
 
-/* ES10b.GetProfilesInfo: the card's list, with fallbackAttribute (9F26,
- * DEFAULT FALSE, so only encoded when TRUE) added to the Fallback Profile;
- * it follows every field an SGP.22 ProfileInfo has, so appending keeps the
- * DER field order */
+/* ES10b.GetProfilesInfo: the card's list, with fallbackAttribute added to
+ * the Fallback Profile (put_profile_list) */
 static int profiles_info(emu *e, const uint8_t *req, size_t len, dbuf *out)
 {
 	dbuf resp;
-	der_tlv top, list, it, x;
-	const uint8_t *p, *end;
-	size_t m, l, s;
 
 	db_init(&resp);
 	if (card_es10(e->card, req, len, &resp) < 0) {
 		db_free(&resp);
 		return -1;
 	}
-
-	if (!e->fb_set || der_parse(resp.d, resp.len, &top) < 0 ||
-	    der_find(top.val, top.len, 0xA0, &list) < 0) {
+	if (!e->fb_set || put_profile_list(e, &resp, true, true, out) < 0)
 		db_put(out, resp.d, resp.len);
-		db_free(&resp);
-		return 0;
-	}
-
-	m = der_begin(out, 0xBF2D);
-	l = der_begin(out, 0xA0);
-	for (p = list.val, end = list.val + list.len; p < end; ) {
-		if (der_next(&p, end, &it) < 0)
-			break;
-		if (it.tag == 0xE3 && der_find(it.val, it.len, 0x5A, &x) == 0 && x.len == 10 &&
-		    !memcmp(x.val, e->fb_iccid, 10)) {
-			s = der_begin(out, 0xE3);
-			db_put(out, it.val, it.len);
-			der_put_bool(out, 0x9F26, true);
-			der_end(out, s);
-		} else {
-			db_put(out, it.raw, it.raw_len);
-		}
-	}
-	der_end(out, l);
-	der_end(out, m);
 	db_free(&resp);
 	return 0;
 }

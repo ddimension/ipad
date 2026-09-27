@@ -153,7 +153,6 @@ int emu_state_save(const emu *e)
 	if (e->fb_set) {
 		m = der_begin(&b, 0xA6);
 		der_put(&b, 0x5A, e->fb_iccid, 10);
-		der_put_bool(&b, 0x81, e->fb_active);
 		if (e->fb_prev_set)
 			der_put(&b, 0x82, e->fb_prev, 10);
 		der_end(&b, m);
@@ -285,7 +284,10 @@ int emu_state_load(emu *e)
 	    der_find(t.val, t.len, 0x5A, &x) == 0 && x.len == 10) {
 		e->fb_set = true;
 		memcpy(e->fb_iccid, x.val, 10);
-		e->fb_active = der_find(t.val, t.len, 0x81, &x) == 0 && x.len == 1 && x.val[0];
+		/* a [1] BOOLEAN ("fallback active") in the record is ignored:
+		 * whether the Fallback Profile is enabled is the card's to say
+		 * (emu.c fallback_prof), and a stored copy goes stale whenever the
+		 * card changes without ipad */
 		if (der_find(t.val, t.len, 0x82, &x) == 0 && x.len == 10) {
 			e->fb_prev_set = true;
 			memcpy(e->fb_prev, x.val, 10);

@@ -7,6 +7,7 @@
 #include "check.h"
 #include "fake22.h"
 #include "emu.h"
+#include "emu_int.h"   /* test_fallback sets a rollback record directly */
 #include "euicc.h"
 #include "hex.h"
 #include "eimpkg.h"
@@ -291,6 +292,292 @@ static void test_card_outcomes(void)
 	rig_close(&r);
 
 	db_free(&ops);
+	db_free(&resp);
+}
+
+/* ExecuteFallbackMechanism (execute) or ReturnFromFallback, refreshFlag
+ * FALSE; the result code */
+static int64_t fallback_code(rig *r, bool execute)
+{
+	uint8_t rq[] = { 0xBF, 0x5D, 0x03, 0x01, 0x01, 0x00 };
+	dbuf resp;
+	der_tlv t;
+	int64_t v = -999;
+
+	if (!execute)
+		rq[1] = 0x5E;
+	db_init(&resp);
+	if (emu_es10(r->e, rq, sizeof(rq), &resp) == 0 && der_parse(resp.d, resp.len, &t) == 0 &&
+	    t.tag == (execute ? 0xBF5Du : 0xBF5Eu))
+		v = int_in(&t, 0x80);
+	db_free(&resp);
+	return v;
+}
+
+/* setFallbackAttribute (3.4.6) in a package; its result code */
+static int64_t set_fallback(rig *r, const char *iccid)
+{
+	dbuf ops, resp;
+	der_tlv res;
+	int64_t v = -999;
+
+	db_init(&ops);
+	db_init(&resp);
+	eimpkg_op(&ops, 0xA8, iccid, false);
+	if (rig_run(r, &ops, &resp, &res))
+		v = int_in(&res, 0x8D);
+	db_free(&ops);
+	db_free(&resp);
+	return v;
+}
+
+static void test_fallback(void)
+{
+	static const char *B = "98001032547698103224", *C = "98001032547698103234";
+	rig r;
+	dbuf ops, resp;
+	der_tlv res;
+
+	db_init(&ops);
+	db_init(&resp);
+
+	/* fallbackAllowed is not in SGP.22's default tag list: the emulation
+	 * has to ask for 9F67 by name to see it (3.4.6 step 4) */
+	OK(rig_open(&r, 2) == 0, "fallback: rig");
+	r.f.p[2].fallback_allowed = 2;   /* C: FALSE */
+	OK(set_fallback(&r, C) == 2, "fallback: fallbackAllowed FALSE is fallbackNotAllowed(2)");
+	r.f.p[1].fallback_allowed = 1;   /* B: TRUE */
+	OK(set_fallback(&r, B) == 0, "fallback: fallbackAllowed TRUE on the card, the attribute is set");
+
+	/* not in fallback: fallbackNotAvailable(6), not commandError (5.9.21) */
+	OK(fallback_code(&r, false) == 6, "return: not in fallback is fallbackNotAvailable(6)");
+
+	/* 5.9.20 resets a granted rollback: C enabled with rollbackFlag, then
+	 * the fallback; the rollback must not leave B for A any more */
+	eimpkg_op(&ops, 0xA3, C, true);
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x83) == 0 && fake22_enabled(&r.f) == 2,
+	   "fallback: C enabled with rollbackFlag");
+	OK(fallback_code(&r, true) == 0 && fake22_enabled(&r.f) == 1, "execute: ok, B (the fallback) enabled");
+	OK(rollback_code(&r) == 1 && fake22_enabled(&r.f) == 1,
+	   "execute: the rollback authorisation is gone (rollbackNotAllowed), B stays");
+	OK(fallback_code(&r, false) == 0 && fake22_enabled(&r.f) == 2, "return: ok, back to C");
+
+	/* the card changed under the emulation (a switch through lpac): the
+	 * fallback profile is no longer the enabled one, whatever the record
+	 * says, and C must not be enabled over A */
+	OK(fallback_code(&r, true) == 0 && fake22_enabled(&r.f) == 1, "execute: B again");
+	r.f.p[1].enabled = 0;
+	r.f.p[0].enabled = 1;
+	r.f.enables = 0;
+	OK(fallback_code(&r, false) == 6 && fake22_enabled(&r.f) == 0 && r.f.enables == 0,
+	   "return: A enabled on the card, not the fallback: fallbackNotAvailable(6), nothing switched");
+
+	/* no enabled profile: commandError(7) (5.9.20), the fallback not enabled */
+	r.f.p[0].enabled = 0;
+	OK(fallback_code(&r, true) == 7 && fake22_enabled(&r.f) == -1 && r.f.enables == 0,
+	   "execute: no enabled profile is commandError(7), nothing switched");
+
+	/* 5.9.21 resets a rollback authorisation too; the emulation grants none
+	 * while in fallback, so it is set here as a state file written without
+	 * the 5.9.20 reset would carry it */
+	r.f.p[0].enabled = 1;
+	OK(fallback_code(&r, true) == 0 && fake22_enabled(&r.f) == 1, "execute: A to B");
+	r.e->rb_granted = true;
+	memcpy(r.e->rb_iccid, r.f.p[2].iccid, 10);
+	snprintf(r.e->rb_eim, sizeof(r.e->rb_eim), "%s", EIM);
+	OK(fallback_code(&r, false) == 0 && fake22_enabled(&r.f) == 0, "return: B to A");
+	OK(rollback_code(&r) == 1 && fake22_enabled(&r.f) == 0,
+	   "return: the rollback authorisation is gone (rollbackNotAllowed), A stays");
+	rig_close(&r);
+
+	/* a card that refuses 9F67 in a tag list: the default list is asked
+	 * instead, and the flag counts as absent */
+	OK(rig_open(&r, 2) == 0, "fallback: rig, tag list refused");
+	r.f.refuse_taglist = 1;
+	r.f.p[1].fallback_allowed = 1;
+	OK(set_fallback(&r, "98001032547698103244") == 1,
+	   "fallback, tag list refused: the profiles are still read (iccidOrAidNotFound for an unknown one)");
+	OK(set_fallback(&r, B) == 2, "fallback, tag list refused: fallbackAllowed absent, fallbackNotAllowed(2)");
+	rig_close(&r);
+
+	db_free(&ops);
+	db_free(&resp);
+}
+
+/* a PSMO list in one package; *res its results */
+static bool run_ops(rig *r, dbuf *ops, dbuf *resp, der_tlv *res)
+{
+	bool ok = rig_run(r, ops, resp, res);
+
+	ops->len = 0;
+	return ok;
+}
+
+/* "is the Fallback Profile enabled" is the card's answer, in every PSMO that
+ * asks it (3.4.3 step 2c, 3.4.6 step 6a, 3.4.7 step 1b) */
+static void test_fallback_card_state(void)
+{
+	static const char *A = "98001032547698103214", *B = "98001032547698103224",
+	                  *C = "98001032547698103234";
+	rig r;
+	dbuf ops, resp;
+	der_tlv res;
+
+	db_init(&ops);
+	db_init(&resp);
+
+	/* in fallback (A to B), then the eIM enables C: B is no longer enabled,
+	 * so the attribute may move to C (3.4.6 step 6b), and the way back from
+	 * fallback is gone (3.4.1 step 3) */
+	OK(rig_open(&r, 2) == 0, "fb state: rig");
+	r.f.p[1].fallback_allowed = r.f.p[2].fallback_allowed = 1;
+	OK(set_fallback(&r, B) == 0 && fallback_code(&r, true) == 0 && fake22_enabled(&r.f) == 1,
+	   "fb state: B the fallback, enabled by ExecuteFallbackMechanism");
+	eimpkg_op(&ops, 0xA3, C, false);
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x83) == 0 && fake22_enabled(&r.f) == 2,
+	   "fb state: the eIM enables C");
+	OK(set_fallback(&r, C) == 0, "fb state: B disabled by the eIM's enable, the attribute moves to C (6b)");
+	OK(fallback_code(&r, false) == 6, "fb state: no return from fallback after the eIM's enable");
+	rig_close(&r);
+
+	/* the Fallback Profile enabled by an eIM enable, not by the mechanism:
+	 * it is enabled all the same (6a, 3.4.7 1bii) */
+	OK(rig_open(&r, 2) == 0, "fb state: rig 2");
+	r.f.p[1].fallback_allowed = r.f.p[2].fallback_allowed = 1;
+	OK(set_fallback(&r, B) == 0, "fb state: B the fallback");
+	eimpkg_op(&ops, 0xA3, B, false);
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x83) == 0 && fake22_enabled(&r.f) == 1,
+	   "fb state: the eIM enables B");
+	OK(set_fallback(&r, C) == 3, "fb state: set on C while B is enabled is fallbackProfileEnabled(3)");
+	der_put(&ops, 0xA9, NULL, 0);   /* unsetFallbackAttribute */
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x8E) == 3,
+	   "fb state: unset while B is enabled is fallbackProfileEnabled(3)");
+	eimpkg_op(&ops, 0xA3, A, false);
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x83) == 0, "fb state: the eIM enables A");
+	der_put(&ops, 0xA9, NULL, 0);
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x8E) == 0, "fb state: unset with B disabled: ok");
+
+	/* a deleted Fallback Profile takes its attribute with it (3.4.3 NOTE:
+	 * deleting the Fallback Profile is allowed) */
+	OK(set_fallback(&r, C) == 0, "fb state: C the fallback");
+	eimpkg_op(&ops, 0xA5, C, false);
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x85) == 0, "fb state: C deleted");
+	der_put(&ops, 0xA9, NULL, 0);
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x8E) == 2,
+	   "fb state: unset after the delete is noFallbackAttribute(2)");
+	rig_close(&r);
+
+	/* delete of the profile to return to (3.4.3 step 2c): refused only
+	 * while the Fallback Profile is enabled on the card */
+	OK(rig_open(&r, 2) == 0, "fb state: rig 3");
+	r.f.p[1].fallback_allowed = 1;
+	OK(set_fallback(&r, B) == 0 && fallback_code(&r, true) == 0, "fb state: A to B by the mechanism");
+	eimpkg_op(&ops, 0xA5, A, false);
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x85) == 21 && r.f.p[0].present,
+	   "fb state: deleting A (the way back) while B is enabled is returnFallbackProfile(21)");
+	r.f.p[1].enabled = 0;   /* switched on the card without ipad */
+	r.f.p[2].enabled = 1;
+	eimpkg_op(&ops, 0xA5, A, false);
+	OK(run_ops(&r, &ops, &resp, &res) && int_in(&res, 0x85) == 0 && !r.f.p[0].present,
+	   "fb state: with B no longer enabled, A may be deleted");
+	rig_close(&r);
+
+	db_free(&ops);
+	db_free(&resp);
+}
+
+/* the listProfileInfo result of one package; its BF2D in *lst */
+static bool list_psmo(rig *r, const uint8_t *req, size_t len, dbuf *resp, der_tlv *lst)
+{
+	dbuf ops;
+	der_tlv res;
+	bool ok;
+
+	db_init(&ops);
+	db_put(&ops, req, len);
+	ok = rig_run(r, &ops, resp, &res) && der_find(res.val, res.len, 0xBF2D, lst) == 0 &&
+	     der_find(lst->val, lst->len, 0xA0, lst) == 0;
+	db_free(&ops);
+	return ok;
+}
+
+/* the i-th ProfileInfo's member tags, in order, as hex ("5A 9F70 ...") */
+static void members(const der_tlv *list, int i, char *out, size_t cap)
+{
+	const uint8_t *p = list->val, *end = list->val + list->len;
+	der_tlv it, c;
+
+	out[0] = 0;
+	while (p < end && der_next(&p, end, &it) == 0)
+		if (i-- == 0) {
+			const uint8_t *q = it.val, *qe = it.val + it.len;
+
+			while (q < qe && der_next(&q, qe, &c) == 0) {
+				size_t l = strlen(out);
+
+				snprintf(out + l, cap - l, "%s%X", l ? " " : "", (unsigned)c.tag);
+			}
+			return;
+		}
+}
+
+/* PSMO listProfileInfo (2.11.1.1.3): SGP.32's default tag list, and the
+ * fallbackAttribute the SGP.22 card cannot have, from the emulation */
+static void test_list_profile_info(void)
+{
+	static const uint8_t none[] = { 0xBF, 0x2D, 0x00 };
+	static const uint8_t no_iccid[] = { 0xBF, 0x2D, 0x05, 0x5C, 0x03, 0x9F, 0x26, 0x91 };
+	static const uint8_t no_fb[] = { 0xBF, 0x2D, 0x05, 0x5C, 0x03, 0x5A, 0x9F, 0x70 };
+	static const uint8_t dflt[] = { 0x5A, 0x4F, 0x9F, 0x70, 0x91, 0x92, 0x95, 0x9F, 0x7B, 0x9F, 0x67 };
+	static const uint8_t dflt22[] = { 0x5A, 0x4F, 0x9F, 0x70, 0x91, 0x92, 0x95 };
+	rig r;
+	dbuf resp;
+	der_tlv lst;
+	char m[128];
+
+	db_init(&resp);
+	OK(rig_open(&r, 2) == 0, "listProfileInfo: rig");
+	r.f.p[1].fallback_allowed = 1;
+	OK(set_fallback(&r, "98001032547698103224") == 0, "listProfileInfo: B the fallback");
+
+	/* no tag list: the card is sent SGP.32's default, less 9F26 */
+	OK(list_psmo(&r, none, sizeof(none), &resp, &lst), "listProfileInfo: default, answered");
+	EQ_HEX(r.f.last_taglist, r.f.last_taglist_len, dflt, sizeof(dflt),
+	       "listProfileInfo: the card got SGP.32's default tag list, without 9F26");
+	members(&lst, 1, m, sizeof(m));
+	OK(!strcmp(m, "5A 9F70 91 9F26 9F67"), "listProfileInfo: B has 9F26 TRUE, before 9F67 (declaration order)");
+	members(&lst, 0, m, sizeof(m));
+	OK(!strcmp(m, "5A 9F70 91"), "listProfileInfo: A has no 9F26 (DEFAULT FALSE)");
+	{
+		der_tlv b, x;
+		const uint8_t *p = lst.val;
+
+		der_next(&p, lst.val + lst.len, &b);
+		der_next(&p, lst.val + lst.len, &b);
+		OK(der_find(b.val, b.len, 0x9F26, &x) == 0 && x.len == 1 && x.val[0] == 0xFF,
+		   "listProfileInfo: 9F26 is DER TRUE (FF)");
+	}
+
+	/* a tag list without the ICCID: asked of the card, dropped again */
+	OK(list_psmo(&r, no_iccid, sizeof(no_iccid), &resp, &lst), "listProfileInfo: 9F26 91, answered");
+	members(&lst, 1, m, sizeof(m));
+	OK(!strcmp(m, "91 9F26"), "listProfileInfo: only what was asked (91 9F26), no ICCID");
+	members(&lst, 0, m, sizeof(m));
+	OK(!strcmp(m, "91"), "listProfileInfo: A: 91 alone");
+
+	/* a tag list without 9F26: none added */
+	OK(list_psmo(&r, no_fb, sizeof(no_fb), &resp, &lst), "listProfileInfo: 5A 9F70, answered");
+	members(&lst, 1, m, sizeof(m));
+	OK(!strcmp(m, "5A 9F70"), "listProfileInfo: no 9F26 when not asked for");
+
+	/* a card that refuses 9F7B / 9F67 is asked again without them */
+	r.f.refuse_taglist = 1;
+	OK(list_psmo(&r, none, sizeof(none), &resp, &lst), "listProfileInfo, tags refused: answered");
+	EQ_HEX(r.f.last_taglist, r.f.last_taglist_len, dflt22, sizeof(dflt22),
+	       "listProfileInfo, tags refused: asked again without 9F7B 9F67");
+	members(&lst, 1, m, sizeof(m));
+	OK(!strcmp(m, "5A 9F70 91 9F26"), "listProfileInfo, tags refused: 9F26 still on B");
+	rig_close(&r);
 	db_free(&resp);
 }
 
@@ -583,6 +870,9 @@ int main(void)
 
 	unlink(state);
 	test_card_outcomes();
+	test_fallback();
+	test_fallback_card_state();
+	test_list_profile_info();
 	db_free(&req);
 	db_free(&resp);
 	db_free(&ops);

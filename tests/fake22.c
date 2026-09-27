@@ -223,25 +223,59 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 		der_end(r, m);
 		return 0x9000;
 
-	case 0xBF2D:
+	case 0xBF2D: {
+		/* the tags asked for: a tag list (5C) or the default (*) tags
+		 * (SGP.22 5.7.15), written in ProfileInfo's declaration order */
+		bool want5a = true, want9f70 = true, want91 = true, want9f67 = false;
+
+		f->last_had_taglist = der_find(t.val, t.len, 0x5C, &x) == 0;
+		f->last_taglist_len = 0;
+		if (f->last_had_taglist) {
+			const uint8_t *q = x.val, *qe = x.val + x.len;
+			bool sgp32 = false;
+
+			if (x.len <= sizeof(f->last_taglist)) {
+				memcpy(f->last_taglist, x.val, x.len);
+				f->last_taglist_len = x.len;
+			}
+			want5a = want9f70 = want91 = false;
+			while (q < qe) {
+				uint32_t tg = *q++;
+
+				if ((tg & 0x1F) == 0x1F && q < qe)
+					tg = tg << 8 | *q++;
+				want5a |= tg == 0x5A;
+				want9f70 |= tg == 0x9F70;
+				want91 |= tg == 0x91;
+				want9f67 |= tg == 0x9F67;
+				sgp32 |= tg == 0x9F26 || tg == 0x9F67 || tg == 0x9F7B;
+			}
+			if (sgp32 && f->refuse_taglist)
+				return 0x6A80;
+		}
 		m = der_begin(r, 0xBF2D);
 		l = der_begin(r, 0xA0);
 		for (i = 0; i < f->np; i++) {
 			if (!f->p[i].present)
 				continue;
 			e = der_begin(r, 0xE3);
-			der_put(r, 0x5A, f->p[i].iccid, 10);
-			{
+			if (want5a)
+				der_put(r, 0x5A, f->p[i].iccid, 10);
+			if (want9f70) {
 				uint8_t st = (uint8_t)f->p[i].enabled;
 
 				der_put(r, 0x9F70, &st, 1);
 			}
-			der_put_str(r, 0x91, "Test Operator");
+			if (want91)
+				der_put_str(r, 0x91, "Test Operator");
+			if (want9f67 && f->p[i].fallback_allowed)
+				der_put_bool(r, 0x9F67, f->p[i].fallback_allowed == 1);
 			der_end(r, e);
 		}
 		der_end(r, l);
 		der_end(r, m);
 		return 0x9000;
+	}
 
 	case 0xBF31:
 	case 0xBF32:

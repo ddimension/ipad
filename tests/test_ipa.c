@@ -622,6 +622,38 @@ int main(void)
 		db_free(&q);
 	}
 
+	/* --- setFallbackAttribute and listProfileInfo (3.4.6, 2.11.1.1.3): the
+	 * result carries the emulation's fallbackAttribute inside the card's
+	 * ProfileInfo, so esipa-check sees it decode and re-encode --- */
+	{
+		static const uint8_t lpi[] = { 0xBF, 0x2D, 0x00 };
+		dbuf ops, p;
+		bool fb;
+
+		fc.p[1].fallback_allowed = 1;
+		db_init(&ops);
+		db_init(&p);
+		eimpkg_op(&ops, 0xA8, "98001032547698103224", false);
+		db_put(&ops, lpi, sizeof(lpi));
+		eimpkg_package(&p, EIM, fc.eid, 8, 0xA0, &ops, eim_key, 0, false);
+		queue(&eim, &p);
+		mark = eim.ngot;
+		ipa_poll(a, &sum);
+		m = last_got(&eim, 0xBF50);
+		{
+			size_t i;
+
+			fb = false;
+			if (m && inner(m, 0xBF51, &y) == 0)
+				for (i = 0; i + 4 <= y.len && !fb; i++)
+					fb = !memcmp(y.val + i, "\x9F\x26\x01\xFF", 4);
+		}
+		OK(m && inner(m, 0xBF51, &y) == 0 && epr_has(&y, 0x8D) && epr_has(&y, 0xBF2D) && fb,
+		   "fallback: setFallbackAttribute and a listProfileInfo with 9F26 reach the eIM");
+		db_free(&ops);
+		db_free(&p);
+	}
+
 	/* --- Notifications (3.7) --- */
 	fake22_add_other(&fc);
 	mark = eim.ngot;

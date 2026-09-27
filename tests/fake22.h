@@ -9,7 +9,10 @@
 
 typedef struct {
 	uint8_t eid[16];
-	struct { uint8_t iccid[10]; int enabled; int present; } p[16];
+	/* fallback_allowed: the profile's fallbackAllowed ('9F67', SGP.32 4.4),
+	 * 0 absent, 1 TRUE, 2 FALSE; GetProfilesInfo reports it only when a tag
+	 * list asks for it, as SGP.22 5.7.15 has no (*) on it */
+	struct { uint8_t iccid[10]; int enabled; int present; int fallback_allowed; } p[16];
 	int np;
 	int enables, disables, deletes;   /* observed calls */
 	/* a card that refuses: nonzero answers EnableProfile / DisableProfile /
@@ -18,6 +21,14 @@ typedef struct {
 	/* called before the card carries out an enable, disable or delete */
 	void (*before_change)(void *arg);
 	void *before_arg;
+	/* a card that answers a GetProfilesInfo tag list naming an SGP.32 tag
+	 * (9F26, 9F67, 9F7B) with an error status word, as one that does not
+	 * know them may; other unknown tags are just not returned */
+	int refuse_taglist;
+	/* the tag list of the last GetProfilesInfo, and whether it had one */
+	uint8_t last_taglist[32];
+	size_t last_taglist_len;
+	int last_had_taglist;
 	int last_refresh;                 /* refreshFlag of the last enable/disable */
 	char dp[64];
 

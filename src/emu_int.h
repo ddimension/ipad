@@ -51,7 +51,9 @@ struct emu {
 	/* Fallback (sections 3.4.6, 3.4.7, 5.9.20, 5.9.21) */
 	bool fb_set;
 	uint8_t fb_iccid[10];
-	bool fb_active;
+	/* the profile ExecuteFallbackMechanism disabled, to return to; an eIM
+	 * enable clears it (3.4.1 step 3). Whether the Fallback Profile is
+	 * enabled is not kept: the card says (emu.c fallback_prof) */
 	bool fb_prev_set;
 	uint8_t fb_prev[10];
 

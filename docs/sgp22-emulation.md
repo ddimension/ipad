@@ -97,7 +97,7 @@ under wwand `option ipa_backend 'iot'|'emu'` does the same.
 | Signed eUICC Package Result / Error (2.11.2.1) | signed with SK.EUICC.ECDSA | Signed with the **device key**, over the same bytes. |
 | Stored eUICC Package Results until acknowledged (2.11.2) | on the card | Up to 16 kept in the state file, each with a sequence number starting at `0x40000000` (`EMU_SEQ_BASE`), well above the card's own notification numbers. When the store is full the oldest is dropped. `RemoveNotificationFromList` with a number at or above that base removes the stored result, and a lower number goes to the card. |
 | Profile Rollback (3.3.2, 5.9.16) | on the card | An `enable` with `rollbackFlag` records the previously enabled profile. The next package clears the record. `ProfileRollback` enables the old profile again, signs a new result (`rollbackResult ok`) and discards the result of the package that granted the rollback. |
-| Fallback attribute and mechanism (3.4.6, 3.4.7, 5.9.20, 5.9.21) | on the card | The attribute and the "fallback active / previous profile" record are kept in the state. `GetProfilesInfo` adds `fallbackAttribute` (`9F26`) to that profile. See the note below on `fallbackAllowed`. |
+| Fallback attribute and mechanism (3.4.6, 3.4.7, 5.9.20, 5.9.21) | on the card | The attribute and the previous profile to return to are kept in the state; whether the Fallback Profile is enabled is always read from the card. `GetProfilesInfo` and the `listProfileInfo` PSMO add `fallbackAttribute` (`9F26`) to that profile. See the note below on `fallbackAllowed`. |
 | Immediate Profile Enabling (3.4.4, 3.4.5, 5.9.15, 5.9.17) | on the card | The flag, the SM-DP+ OID and the address are kept in the state. A completed download is noticed in the Profile Installation Result that passes through, and `ImmediateEnable` enables that ICCID. |
 | eUICCMemoryReset, SGP.32 bits (5.9.5) | on the card | The SGP.22 reset options go to the card (`ES10c.eUICCMemoryReset`). `resetEimConfigData` and `resetImmediateEnableConfig` clear ipad's state. |
 | GetCerts (5.9.10) | on the card | Answered with an error: an SGP.22 card has no such function. |
@@ -109,10 +109,44 @@ cannot provide, and never fakes it.
 
 **`fallbackAllowed`.** SGP.32 3.4.6 allows the fallback attribute only on a
 profile whose metadata carries `fallbackAllowed` (`9F67`). SGP.22 v2.7 only
-reserves that tag for SGP.32, so an SGP.22 card normally does not report it.
-`setFallbackAttribute` then answers `fallbackNotAllowed` (2), unless ipad runs
-with `-F` ("every profile may be the fallback", explicitly *not* SGP.32).
-wwand-ipa never passes `-F`.
+reserves that tag for SGP.32, and its default tag list (5.7.15, the tags
+marked (*)) does not contain it, so a card that does store the flag reports
+it only when asked for it by name. The emulation therefore reads the card's
+profiles with the tag list `5C { 5A 9F70 9F67 }`. A card that answers that
+tag list with an error gets the default list (`BF2D 00`) instead, and the
+flag counts as absent there. Without `9F67 = TRUE`, `setFallbackAttribute`
+answers `fallbackNotAllowed` (2), unless ipad runs with `-F` ("every
+profile may be the fallback", explicitly *not* SGP.32). wwand-ipa never
+passes `-F`.
+
+**Whether the Fallback Profile is enabled** is read from the card's profile
+list every time: by `ExecuteFallbackMechanism`, `ReturnFromFallback`, and
+the PSMOs `setFallbackAttribute` (3.4.6 step 6a), `unsetFallbackAttribute`
+(3.4.7 step 1b) and `delete` (3.4.3 step 2c). Inside a package the list
+includes what the package has already done. The state keeps no "fallback
+active" flag, because the card's profiles also change outside the emulation
+(lpac, an `eUICCMemoryReset`, an eIM `enable`), and a stored copy would go
+stale. An eIM `enable` clears the recorded previous profile (3.4.1 step 3).
+After that there is no return from fallback, and the profile that was
+recorded may be deleted. A fallback attribute whose profile was deleted
+(3.4.3 allows that) counts as not set: `unsetFallbackAttribute` answers
+`noFallbackAttribute` (2).
+
+The checks of the two ES10b functions run in the order 5.9.20 and 5.9.21
+list them:
+
+- `ExecuteFallbackMechanism`: no enabled profile is `commandError` (7); no
+  fallback attribute, or its profile no longer on the card, is
+  `fallbackNotAvailable` (6); the fallback profile already enabled is
+  `profileNotInDisabledState` (2). An SGP.22 card has no Emergency Profile,
+  so `ecallActive` never occurs. On success the previously enabled profile
+  is recorded.
+- `ReturnFromFallback`: the enabled profile not being the fallback profile,
+  no recorded previous profile, or that profile no longer installed are all
+  `fallbackNotAvailable` (6).
+- Both reset a granted Profile Rollback: `ExecuteFallbackMechanism` with
+  the switch, `ReturnFromFallback` once its checks pass, where each section
+  lists it.
 
 **Nobody triggers the fallback mechanism.** ipad's own procedures never call
 `ExecuteFallbackMechanism` or `ReturnFromFallback`. The emulation answers them
@@ -149,7 +183,7 @@ State ::= SEQUENCE {
   eprs       [4]  SEQUENCE OF SEQUENCE { seq [0] INTEGER, epr EuiccPackageResult },
   rollback   [5]  SEQUENCE { iccid 5A, eimId [0], counter [1],
                              txid [2] OPTIONAL, eprSeq [3] } OPTIONAL,
-  fallback   [6]  SEQUENCE { iccid 5A, active [1] BOOLEAN,
+  fallback   [6]  SEQUENCE { iccid 5A,             -- a [1] BOOLEAN here is ignored
                              prev [2] OCTET STRING OPTIONAL } OPTIONAL,
   immediate  [7]  SEQUENCE { flag [0] BOOLEAN, oid [1] OPTIONAL,
                              addr [2] OPTIONAL } OPTIONAL,
@@ -401,25 +435,25 @@ sit under ES10b).
 
 | SGP.32 operation | SGP.22 calls on the card | ipad state involved |
 |---|---|---|
-| **ES10b.LoadEuiccPackage** (5.9.1): check signature, EID, counter; persist the counter; run the list; sign; persist | `ES10c.GetProfilesInfo` (`BF2D`, SGP.22 5.7.15) once, to check the PSMOs against the card's profile states; then each enable, disable and delete below as its PSMO is reached, **after** the counter is saved and **before** the result is signed, so that the result carries the card's answer | eIM record (key, counter, token), result store, rollback record |
+| **ES10b.LoadEuiccPackage** (5.9.1): check signature, EID, counter; persist the counter; run the list; sign; persist | `ES10c.GetProfilesInfo` (`BF2D`, SGP.22 5.7.15, tag list `5A 9F70 9F67`) once, to check the PSMOs against the card's profile states; then each enable, disable and delete below as its PSMO is reached, **after** the counter is saved and **before** the result is signed, so that the result carries the card's answer | eIM record (key, counter, token), result store, rollback record |
 | PSMO `enable` (3.4.1) | `ES10c.EnableProfile` (`BF31`, SGP.22 5.7.16), `refreshFlag` FALSE. SGP.22 disables the enabled profile itself | if the card enabled it: clears the fallback reference, and with `rollbackFlag` records the previous profile, the enabled one or the one a `disable` earlier in the package switched off (`rollbackNotAvailable` if there is neither) |
 | PSMO `disable` (3.4.2) | `ES10c.DisableProfile` (`BF32`, SGP.22 5.7.17), `refreshFlag` FALSE; a `disable` after an `enable` in the same package is refused | none |
-| PSMO `delete` (3.4.3) | `ES10c.DeleteProfile` (`BF33`, SGP.22 5.7.18), each as it is reached, with no limit per package | refused for the rollback target (`rollbackNotAvailable`) and for the profile to return to from fallback (`returnFallbackProfile`) |
-| PSMO `listProfileInfo` | `ES10c.GetProfilesInfo` passed through, the card's `BF2D` as the result | none |
+| PSMO `delete` (3.4.3) | `ES10c.DeleteProfile` (`BF33`, SGP.22 5.7.18), each as it is reached, with no limit per package | refused for the rollback target (`rollbackNotAvailable`) and, while the Fallback Profile is enabled on the card, for the profile to return to from fallback (`returnFallbackProfile`) |
+| PSMO `listProfileInfo` (2.11.1.1.3) | `ES10c.GetProfilesInfo` with an explicit tag list: the eIM's, or without one SGP.32's default (`5A 4F 9F70 91 92 95 9F7B 9F26 9F67`, which differs from SGP.22's), always without `9F26` and always with `5A`. If the card refuses the list, it is sent again without `9F7B 9F67`. `searchCriteria` and `iotSpecificTagList` are passed on as sent | if the list asks for `9F26`, it is added as TRUE to the Fallback Profile, before `9F67`/`BF64` (DER order of ProfileInfo). A `5A` the eIM did not ask for is dropped again |
 | PSMO `getRAT` | `ES10b.GetRAT` (`BF43`, SGP.22 5.7.22) | none |
 | PSMO `configureImmediateEnable` (3.4.4) | none | immediate-enable flag, OID, address |
-| PSMO `setFallbackAttribute` / `unsetFallbackAttribute` (3.4.6, 3.4.7) | `GetProfilesInfo` (for the check) | fallback record |
+| PSMO `setFallbackAttribute` / `unsetFallbackAttribute` (3.4.6, 3.4.7) | `GetProfilesInfo` with the tag list `5A 9F70 9F67` (for the checks, including whether the Fallback Profile is enabled; the default list if the card refuses it) | fallback record |
 | PSMO `setDefaultDpAddress` (5.9.25) | `ES10a.SetDefaultDpAddress` (`BF3F`, SGP.22 5.7.4) | none |
 | eCO `addEim`, `updateEim`, `deleteEim`, `listEim` (3.5.1) | none | eIM records (a deleted eIM is removed after the result is signed, because it may be the requester) |
 | **ES10b.AddInitialEim** (5.9.4, 3.5.2.1) | none | eIM records; refused once any eIM is stored |
 | **ES10b.GetEimConfigurationData** (5.9.18) | none | eIM records, rendered without `counterValue` and with the generated associationToken |
 | **ES10b.ProfileRollback** (5.9.16) | `ES10c.EnableProfile` of the recorded profile | rollback record; a new signed result replaces the granting one |
-| **ES10b.ExecuteFallbackMechanism** (5.9.20) / **ReturnFromFallback** (5.9.21) | `ES10c.EnableProfile` of the fallback / previous profile | fallback record (active, previous profile) |
+| **ES10b.ExecuteFallbackMechanism** (5.9.20) / **ReturnFromFallback** (5.9.21) | `ES10c.GetProfilesInfo` for the enabled profile, then `ES10c.EnableProfile` of the fallback / previous profile | fallback record (previous profile); resets the rollback record |
 | **ES10b.ImmediateEnable** (5.9.15) | `ES10c.EnableProfile` of the profile just installed | flag in the state; the "download just completed" context exists only in memory, for this run |
 | **ES10b.ConfigureImmediateProfileEnabling** (5.9.17) | none | immediate-enable settings; refused while an eIM is configured |
 | **ES10b.RetrieveNotificationsList** (5.9.11) | passed to the card (`BF2B`, SGP.22 5.7.10), except a request for eUICC Package Results or for a sequence number from `0x40000000` up | result store |
 | **ES10b.RemoveNotificationFromList** (5.9.12) | passed to the card (SGP.22 5.7.11) below `0x40000000` | result store at or above it |
-| **ES10b.GetProfilesInfo** (5.9.14) | passed to the card | adds `fallbackAttribute` to the fallback profile |
+| **ES10b.GetProfilesInfo** (5.9.14) | passed to the card | adds `fallbackAttribute` to the fallback profile, in DER order |
 | **ES10b.eUICCMemoryReset** (5.9.5) | `ES10c.eUICCMemoryReset` (`BF34`, SGP.22 5.7.19) for the SGP.22 options | eIM records and immediate-enable settings for the SGP.32 bits |
 | GetCerts (5.9.10), GetConnectivityParameters (5.9.24), emergency profile (5.9.22/23) | none | none: answered as not available |
 | **Indirect download** (3.2.3.2): GetEUICCInfo, GetEUICCChallenge, AuthenticateServer, PrepareDownload, LoadBoundProfilePackage, CancelSession | passed to the card unchanged (SGP.22 5.7.5–5.7.14). BPP segments go to the card as they are | a successful PIR opens the immediate-enable context |
