@@ -292,5 +292,5 @@ cards every card loses its state and needs the same re-keying.
 | "not binding: the emulation's counter … is not the bundle's …" | the emulation's counter moved away from the bundle's start counter (another configuration was provisioned). `reset <EID>` and provision the bundle again, or ask for a new one |
 | exit 4, "the eIM refused the binding (403)" | the issuance is unknown, used or expired, or the proof or counter is wrong. Ask the eIM operator, then provision a new bundle (or `reset all`: the refusal belongs to the binding, which is the directory's) |
 | "binding deferred … (Retry-After)" | the eIM rate-limited the binding. ipad waits as asked, at most a day |
-| results never acknowledged | the eIM cannot verify them: the device key is not imported or was replaced. Compare `info`'s `key_fingerprint` with `eimctl euicc show <EID>` |
+| operations stay open although `poll` reports results acknowledged | the eIM cannot verify them — the device key is not imported or was replaced — and discards them; SGP.32 5.14.6 has it acknowledge discarded results too, so ipad removes them and they are gone. Compare `info`'s `key_fingerprint` with `eimctl euicc show <EID>`, and re-key before the next poll |
 | "AddInitialEim refused: 2" | the card already has an eIM. Only the eIM can change that (`addEim`, `updateEim`, `deleteEim`) |

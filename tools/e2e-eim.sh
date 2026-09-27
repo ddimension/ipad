@@ -16,7 +16,8 @@
 # the import file is accepted (proof, key, DER objects); listProfileInfo and
 # enable run, are signed with the device key, verified and acknowledged; an
 # enable whose connection does not come back is rolled back and reported as
-# such; results signed with another key are never acknowledged.
+# such; results signed with another key complete no operation (the eIM
+# discards them, and may acknowledge them — SGP.32 5.14.6).
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 eim=$(cd "${1:-$root/../../eim}" && pwd)
@@ -47,7 +48,9 @@ fail() {
 B=$eim/target/debug
 docker exec eim-postgres psql -qU eim -d eim -c "CREATE DATABASE $db" >/dev/null
 
-printf geheim >"$w/pass"
+# a random passphrase per run: the eIM refuses one shorter than 16 bytes
+openssl rand -base64 32 | tr -d '\n' >"$w/pass"
+chmod 0400 "$w/pass"   # the eIM warns about a secret others can read
 "$B/eim-server" keygen "$w/key.pem" "$w/pass" >/dev/null
 "$B/eim-server" keygen "$w/data.pem" "$w/pass" >/dev/null
 export DATABASE_URL="postgres://eim:eim@localhost/$db?host=/tmp/eimpg"
@@ -151,7 +154,14 @@ echo "e2e: offline after enable -> rolled back, reported"
 
 mv "$st/device.key" "$st/device.key.good"
 "$B/eimctl" op add $eid list_profile_info >/dev/null
-"$hs" -- $ipad -s "$st" $url_opt poll | grep -q 'acknowledged=0' || fail "foreign key acknowledged"
-grep -q 'signature or certificate invalid' "$w/server.log" || fail "eIM did not reject the signature"
-echo "e2e: results under another key rejected, never acknowledged"
+# A result under a key the eIM does not know must never complete an
+# operation. It MAY be acknowledged: SGP.32 v1.3 5.14.6 has the eIM discard
+# a result with an invalid signature and return the sequence numbers of the
+# processed results "including discarded results" (eIM decision D-66) — so
+# acknowledged=0 is not the property, and checking for it failed against a
+# conforming eIM.
+"$hs" -- $ipad -s "$st" $url_opt poll >/dev/null
+[ "$("$B/eimctl" op list $eid | grep -c ' done ')" = 2 ] || fail "a result under another key completed an operation"
+grep -q 'result discarded: eUICC signature' "$w/server.log" || fail "eIM did not discard the signature"
+echo "e2e: results under another key discarded, no operation completed"
 echo "e2e: all passed"
