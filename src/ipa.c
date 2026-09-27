@@ -175,6 +175,9 @@ static int esipa_call(ipa *a, const dbuf *msg, uint32_t tag, dbuf *resp, der_tlv
 }
 
 /* HandleNotification has no response message (5.14.7): 204, or 200 */
+/* 0 delivered; -1 the eIM was not reached; -2 it answered and did not
+ * take this one (an error status: the eIM keeps it for later, e.g. a PIR it
+ * cannot attribute yet, eIM decision D-85) */
 static int esipa_notify(ipa *a, const dbuf *msg)
 {
 	dbuf resp;
@@ -185,7 +188,7 @@ static int esipa_notify(ipa *a, const dbuf *msg)
 	db_free(&resp);
 	if (rc < 0)
 		return -1;
-	return (status == 204 || status == 200) ? 0 : -1;
+	return (status == 204 || status == 200) ? 0 : -2;
 }
 
 /* ---- notifications ---- */
@@ -357,7 +360,7 @@ int ipa_deliver_notifications(ipa *a)
 	const uint8_t *p, *end;
 	int sent = 0;
 	int64_t seen[ES9_MAX];
-	int nseen = 0, i;
+	int nseen = 0, i, rc;
 	bool listed = false;
 
 	db_init(&r);
@@ -389,7 +392,17 @@ int ipa_deliver_notifications(ipa *a)
 			db_put(&msg, n.raw, n.raw_len);
 			der_end(&msg, k);
 			der_end(&msg, m);
-			if (esipa_notify(a, &msg) < 0) {
+			rc = esipa_notify(a, &msg);
+			/* One the eIM answers but does not take stays on the card and
+			 * the next one goes out: stopping here let a single
+			 * notification the eIM keeps refusing (a PIR it cannot
+			 * attribute) hold back every later one of the card. */
+			if (rc == -2) {
+				say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept for a later run",
+				    (long long)seq);
+				continue;
+			}
+			if (rc < 0) {
 				say(a, LOG_WARNING, "notification %lld not delivered, kept", (long long)seq);
 				listed = false;   /* not all seen: no record is dropped */
 				break;   /* the eIM is unreachable; the rest waits too */

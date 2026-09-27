@@ -42,6 +42,7 @@ typedef struct {
 	dbuf got[160];              /* every request, in order */
 	int ngot;
 	bool offline;
+	int refuse_notify;          /* > 0: the next notifications are answered 500 */
 	int64_t auth_client_error;  /* > 0: AuthenticateClient answers this error */
 	bool invalid;               /* a deliberately malformed exchange: not dumped */
 } fake_eim;
@@ -125,6 +126,10 @@ static int eim_transport(void *ud, const uint8_t *req, size_t len, int *status, 
 		break;
 	case 0xBF3D:
 		*status = 204;
+		if (f->refuse_notify > 0) {
+			f->refuse_notify--;
+			*status = 500;
+		}
 		return 0;
 	case 0xBF39:   /* InitiateAuthenticationOkEsipa */
 		m = der_begin(resp, 0xBF39);
@@ -667,6 +672,15 @@ int main(void)
 	OK(ipa_deliver_notifications(a) == 0 && fc.nnotes == 1, "notify: eIM unreachable, kept");
 	eim.offline = false;
 	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0, "notify: sent on the next chance");
+
+	/* one the eIM answers but refuses (500: a PIR it cannot attribute yet,
+	 * eIM D-85) stays on the card and does not hold back the next */
+	fake22_add_other(&fc);
+	fake22_add_other(&fc);
+	eim.refuse_notify = 1;
+	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 1,
+	   "notify: a refused one is kept, the next still goes out");
+	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0, "notify: the refused one goes on a later run");
 
 	/* --- direct download through the host (3.2.3.1) --- */
 	{

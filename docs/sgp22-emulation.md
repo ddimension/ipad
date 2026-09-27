@@ -681,6 +681,11 @@ So, with direct download offered (`-D`):
 - Without `-D` there is no ES9+ route, and the record is not consulted: every
   pending notification goes to the eIM as before. Nothing in ipad holds a
   notification back.
+- A notification the eIM answers but does not take (an error status — e.g. a
+  PIR the eIM cannot attribute yet, which it refuses so that it is not lost,
+  eIM decision D-85) stays on the card and the next one goes out; only an eIM
+  that cannot be reached at all stops the round. Stopping at the first refusal
+  let one such PIR hold back every later notification of the card.
 - The record holds at most 16 seqNumbers. It is not part of the emulation
   state: `ipad reset` leaves it, because it describes notifications on the
   card, not the eIM association.
