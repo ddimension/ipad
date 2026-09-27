@@ -16,6 +16,19 @@ C99, mbedTLS built in statically, no other dependencies. Written for
 embedded Linux (OpenWrt), where [wwand](https://github.com/ddimension/wwand)
 runs it as a plugin.
 
+**Documentation:**
+
+- [docs/sgp22-emulation.md](docs/sgp22-emulation.md): how an SGP.22 consumer
+  eUICC is used for SGP.32. What ipad emulates, the state per EID, the
+  device key and how the eIM learns it, the SGP.32 → SGP.22 mapping,
+  downloads, notifications, and what the card guarantees versus ipad's
+  state;
+- [docs/howto.md](docs/howto.md): ipad on its own. Build, try it against the
+  simulated card, provision, export, poll, recover a lost key,
+  troubleshooting;
+- on a router: wwand-ipa's [how-to](https://github.com/ddimension/wwand-ipa/blob/main/docs/howto.md)
+  and [operation guide](https://github.com/ddimension/wwand-ipa/blob/main/docs/operation.md).
+
 ## What it implements
 
 Section numbers are SGP.32 v1.3.
@@ -80,17 +93,24 @@ See `ipad -h` for the options.
 
 The eIM refuses a second import of a card unless it is told to replace the key
 (`eimctl euicc import --replace-key`), and even then only when the file's
-`counter` is not below the counter the eIM holds for the card: a replayed old
-file must not win. `export` writes the counter the emulation holds for the eIM.
+`counter` is **above** the counter the eIM holds for the card
+(`replace_ipa_key` refuses `counter <= stored`): a replayed old file, or old
+packages, must not be accepted again. `export` writes the counter the
+emulation holds, so the emulation has to be started above the eIM's counter
+before exporting:
 
-- **Key lost, state kept** (`device.key` gone, `<EID>.state` still there): the
-  counter is current. Run `export` (a new key is created) and import with
-  `--replace-key`.
-- **Key and state lost**: the emulation starts from the counter in the eIM
-  configuration it is provisioned with. Read the eIM's counter
-  (`eimctl euicc show <EID>`), write a configuration that starts there
-  (`eimctl eim-config <file> --fqdn … --counter <that counter>`), `provision`
-  it, then `export` and import with `--replace-key`.
+```sh
+eimctl euicc show <EID>                        # eIM: its counter N
+ipad -s DIR reset                              # device: key, state, binding gone
+eimctl eim-config cfg.der --fqdn … --counter <N+1>
+ipad -s DIR provision cfg.der
+ipad -s DIR export device.json
+eimctl euicc import device.json --replace-key  # eIM
+```
+
+`reset` clears the whole state directory — every card on the device. The
+cases (key unreadable, key gone, state gone) are in
+[docs/howto.md](docs/howto.md#recover-from-a-lost-device-key).
 
 ## Build and test
 
