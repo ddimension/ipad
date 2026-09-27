@@ -46,7 +46,7 @@ the steps only the host can take (`src/host.h`):
 | Event (ipad → host) | Host answers | Purpose |
 |---|---|---|
 | `profile_changed` `{iccid}` | `{"online":true\|false}` | make the modem use the new profile, and say whether the connection came back |
-| `download` `{activation_code}` | `{"ok":true}` or `{"ok":false,"error":…}` | direct download through the host's ES9+ client, with the PIR left on the card |
+| `download` `{activation_code, confirmation_code}` (the code only when the eIM sent one) | `{"ok":true}` or `{"ok":false,"error":…}` | direct download through the host's ES9+ client, with the PIR left on the card |
 | `connectivity` `{iccid, emulated, source, apn, username, password, pdp_type}` | `{}` | the enabled profile's connectivity parameters (5.9.24) |
 | `info` `{eid, backend, key_fingerprint, bind, counter}` | `{}` | at the start of a run and for `info` |
 | `summary` `{command, code, packages, acknowledged, downloads, notifications, changed, rolled_back, bind, error}` | `{}` | at the end of `poll` and `provision` |
@@ -138,8 +138,8 @@ Exit status:
 | Code | Meaning |
 |---|---|
 | 0 | done |
-| 1 | failed: eIM, network, card or file. The summary and the syslog say why. Also a binding still to be retried |
-| 2 | usage error, or `provision` could not read a configuration or bundle from the file |
+| 1 | failed: eIM, network, card or file. The summary and the syslog say why. Also a binding still to be retried, and a bundle that is invalid or expired |
+| 2 | usage error, or `provision` found no readable configuration or bundle in the file (a file that is a bundle but not a valid one is 1) |
 | 3 | no eIM configured on the card or in the emulation: provision first |
 | 4 | the eIM refused to bind this card (403). Polling stops until an operator acts |
 
@@ -226,9 +226,14 @@ Each command ends with one result line on stdout:
 {"type":"info","payload":{"eid":"89049032…","backend":"emulated","key_fingerprint":"3F2A…","iccid":"8949…","bind":"done","counter":7,"eims":[{"id":"eim.example.com","fqdn":"eim.example.com","tls":"certificate"}]}}
 ```
 
-- `tls` says where the eIM's TLS trust comes from: `key` (a pinned key),
-  `certificate` (the eIM's certificate or its CA), `system` (the CA bundle),
-  or `configuration` (present but unusable, which ipad logs).
+- `tls` says what the stored configuration carries as the eIM's TLS trust
+  (`trustedPublicKeyDataTls`): `key` (a pinned key), `certificate` (the
+  eIM's certificate or its CA), `system` (none: the CA bundle decides), or
+  `configuration` (present, but neither a key nor a certificate). It is read
+  from the configuration's structure only: a `key` or `certificate` that
+  turns out unusable when connecting (a key too large, a certificate that
+  does not parse) is logged then ("trustedPublicKeyDataTls unusable"), and
+  the CA bundle decides instead.
 - `key_fingerprint` is the SHA-256 of the device key's SubjectPublicKeyInfo,
   the same fingerprint the eIM audits.
 
@@ -250,11 +255,17 @@ step, for example:
 |---|---|
 | `device.key` exists but cannot be read | ipad refuses to replace it ("device key … unreadable; not replacing it"). Fix the file (permissions, file system). Deleting it means re-keying on the eIM. |
 | `device.key` is gone | The next run creates a new key. The eIM rejects results signed with it until it is re-keyed (below). |
-| `<EID>.state` is gone | The card has no eIM (`poll` exits 3). Provision a configuration whose counter starts **above** the eIM's current counter for the card (`eimctl euicc show <EID>`). Starting lower would let old packages be accepted again. |
+| `<EID>.state` is gone, the key is not | The card has no eIM (`poll` exits 3). Provision a configuration whose counter is the eIM's current counter **N** for the card (`eimctl euicc show <EID>`), not N+1: the eIM gives the next package N+1, and the emulation refuses every counter `<=` its own. Started at N+1, the first package after it fails as a replay; below N, packages the device already ran would be accepted again. |
 
-**Re-keying** needs a file whose counter is **strictly above** the eIM's
-(eIM decision D-68, enforced in `replace_ipa_key`). `export` writes the
-counter the emulation holds, so start the emulation above the eIM's counter:
+**Re-keying** (the key is gone, or both are) needs an import file whose
+counter is **strictly above** the eIM's (eIM decision D-68: `replace_ipa_key`
+refuses `counter <= stored`). `export` writes the counter the emulation
+holds, so start the emulation at N+1 — and import **before the first poll**.
+The import sets the eIM's counter to N+1, and its next package gets N+2,
+which the emulation accepts. A poll in between that fetches a queued
+package would get N+1 from the eIM, which the emulation refuses
+(`N+1 <= N+1`) — and the eIM's counter would then be N+1, so the import
+would be refused as well:
 
 ```sh
 eimctl euicc show <EID>                                   # eIM: note its counter N
@@ -262,7 +273,8 @@ ipad -s /etc/wwand/ipa reset                              # device: key, state, 
 eimctl eim-config cfg.der --fqdn eim.example.com --counter <N+1>   # eIM
 ipad -s /etc/wwand/ipa provision cfg.der                  # device
 ipad -s /etc/wwand/ipa export device.json                 # device
-eimctl euicc import device.json --replace-key             # eIM
+eimctl euicc import device.json --replace-key             # eIM — before any poll
+ipad -s /etc/wwand/ipa poll                               # device: first package N+2
 ```
 
 `reset` clears the whole state directory, so on a router with several cards

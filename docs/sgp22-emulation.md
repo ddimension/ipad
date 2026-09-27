@@ -174,9 +174,9 @@ the whole function atomic.
 
 | Lost | Effect | Way back |
 |---|---|---|
-| `device.key` only | If the file is **gone**, the next run creates a new key, and the eIM rejects results signed with it until it is imported. If the file **exists but cannot be read**, it is never replaced: the run fails with "device key … unreadable; not replacing it". | Export a new import file and re-key on the eIM. See "A lost device key" in the [README](../README.md#a-lost-device-key) and the counter rule [below](#re-keying). |
-| `<EID>.state` only | Without state the card has no eIM: `poll` exits 3 ("no eIM configured"). If a configuration file is at hand, it is provisioned again, and the counter restarts from **that file's** `counterValue`. Stored results, the rollback record, the fallback and immediate-enable settings and the associationToken counter are gone. | Provision a configuration whose counter starts at the eIM's current counter (or above it). Packages the device already ran would otherwise be accepted again: they are signed, and a counter below them no longer stops them. |
-| Both | As above, plus a new key. | `ipad reset`, a fresh bundle or configuration, re-key on the eIM. |
+| `device.key` only | If the file is **gone**, the next run creates a new key, and the eIM rejects results signed with it until it is imported. If the file **exists but cannot be read**, it is never replaced: the run fails with "device key … unreadable; not replacing it". | Not an export with the state kept: that file carries the emulation's counter, which is at most the eIM's, and `--replace-key` refuses it. `ipad reset`, a configuration at the eIM's counter + 1, `export`, `eimctl euicc import --replace-key` before the first poll — see [Re-keying](#re-keying) and "A lost device key" in the [README](../README.md#a-lost-device-key). |
+| `<EID>.state` only | Without state the card has no eIM: `poll` exits 3 ("no eIM configured"). If a configuration file is at hand, it is provisioned again, and the counter restarts from **that file's** `counterValue`. Stored results, the rollback record, the fallback and immediate-enable settings and the associationToken counter are gone. | Provision a configuration at the eIM's current counter N (`eimctl euicc show <EID>`) — not above it: the eIM gives its next package N+1, and the emulation refuses every counter `<=` its own, so a start at N+1 makes that package fail as a replay. Not below it either: packages the device already ran would be accepted again — they are signed, and a counter below them no longer stops them. |
+| Both | As above, plus a new key. | As for `device.key`: `ipad reset`, a configuration at the eIM's counter + 1, `export`, re-key on the eIM before the first poll ([Re-keying](#re-keying)). |
 
 `ipad reset` (and `wwandctl ipa reset`) deletes `device.key`, **every**
 `*.state` in the directory and the `bind.*` markers. No card is needed for it.
@@ -334,17 +334,21 @@ again.
 eIM's. A re-key therefore needs an emulation whose counter was started
 **above** the eIM's:
 
-1. read the eIM's counter: `eimctl euicc show <EID>`;
+1. read the eIM's counter N: `eimctl euicc show <EID>`;
 2. `ipad reset`, which removes the key, the state and the binding, and with
    them the stored results and the rollback record;
 3. write a configuration that starts above it:
-   `eimctl eim-config cfg.der --fqdn … --counter <eIM counter + 1>`;
+   `eimctl eim-config cfg.der --fqdn … --counter <N+1>`;
 4. `ipad provision cfg.der`, then `ipad export device.json`;
-5. `eimctl euicc import device.json --replace-key`.
+5. `eimctl euicc import device.json --replace-key`, **before the first
+   poll**: the eIM's counter becomes N+1 and its next package carries N+2.
+   A poll that fetches a package before the import gets N+1, which the
+   emulation refuses (its counter is N+1 already), and leaves the eIM at
+   N+1 — the import is then refused as well.
 
-The README's "A lost device key" section says "not below" and describes a
-re-key with the state kept. Measured against the eIM's current code, that
-path is refused. See [Notes on the sources](#notes-on-the-sources).
+Without a re-key (the key kept, only the state lost) the configuration
+starts at the eIM's counter itself, not above it; see
+*What is lost with what* under [The state ipad keeps](#the-state-ipad-keeps).
 
 ## SGP.32 → SGP.22 mapping
 
@@ -638,10 +642,10 @@ is the stronger choice where the device itself is not trusted.
     5.9.11);
   - eUICCMemoryReset is 5.9.5 (`emu.c` says 5.9.11);
   - ESipa.ProvideEimPackageResult is 5.14.6 (`ipa.c` says 5.14.3).
-- **Re-key counter.** The README's "A lost device key" says the file's counter
-  must be "not below" the eIM's. The eIM requires strictly above (D-68,
-  `eim-store` `replace_ipa_key`). The procedure under
-  [Re-keying](#re-keying) follows the eIM's code.
+- **Re-key counter.** `eimctl euicc import --help` says the file's counter
+  "must not be below" the eIM's. The eIM's code requires strictly above
+  (D-68, `eim-store` `replace_ipa_key`). The procedure under
+  [Re-keying](#re-keying) follows the code.
 - **`ipad -h`** lists neither `reset` nor the bundle form of `provision`. Both
   exist (`main.c`).
 - **Not verified on hardware:** the eIM docs and the wwand-ipa README both

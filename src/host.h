@@ -15,7 +15,8 @@
  * answer line (esim_bridge session_run on_event):
  *   {"type":"event","payload":{"event":"profile_changed","iccid":"..."}}
  *       -> {"online":true|false}
- *   {"type":"event","payload":{"event":"download","activation_code":"..."}}
+ *   {"type":"event","payload":{"event":"download","activation_code":"...",
+ *       "confirmation_code":"..."}}   (the code only when the eIM sent one)
  *       -> {"ok":true} | {"ok":false,"error":"..."}
  *   {"type":"event","payload":{"event":"connectivity","iccid":"...",
  *       "emulated":bool,"source":"card"|"none","apn":"...","username":"...",

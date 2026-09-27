@@ -97,7 +97,9 @@ The eIM refuses a second import of a card unless it is told to replace the key
 (`replace_ipa_key` refuses `counter <= stored`): a replayed old file, or old
 packages, must not be accepted again. `export` writes the counter the
 emulation holds, so the emulation has to be started above the eIM's counter
-before exporting:
+before exporting — and the import has to come before the first poll: the
+eIM's next package would carry N+1, which the emulation refuses, and would
+leave the eIM's counter at N+1, above the file's:
 
 ```sh
 eimctl euicc show <EID>                        # eIM: its counter N
@@ -105,9 +107,12 @@ ipad -s DIR reset                              # device: key, state, binding gon
 eimctl eim-config cfg.der --fqdn … --counter <N+1>
 ipad -s DIR provision cfg.der
 ipad -s DIR export device.json
-eimctl euicc import device.json --replace-key  # eIM
+eimctl euicc import device.json --replace-key  # eIM, before any poll
+ipad -s DIR poll                               # the eIM's next package is N+2
 ```
 
+A lost `<EID>.state` with the key intact needs no re-key: provision a
+configuration at the eIM's counter N itself (the next package is N+1).
 `reset` clears the whole state directory — every card on the device. The
 cases (key unreadable, key gone, state gone) are in
 [docs/howto.md](docs/howto.md#recover-from-a-lost-device-key).
