@@ -268,6 +268,16 @@ static int ev_download(void *ud, const char *ac, const char *cc)
 	return (a && json_true(a, "ok")) ? 0 : -1;
 }
 
+static int ev_notify(void *ud, int64_t seq)
+{
+	host_link *h = ud;
+	const char *a;
+
+	fprintf(h->out, "{\"type\":\"event\",\"payload\":{\"event\":\"notify\",\"seq\":%lld", (long long)seq);
+	a = event_answer(h);
+	return (a && json_true(a, "ok")) ? 0 : -1;
+}
+
 static void ev_connectivity(void *ud, const char *iccid, const conn_params *p, bool emulated)
 {
 	host_link *h = ud;
@@ -353,6 +363,7 @@ void host_ipa_hooks(host_link *h, ipa_host *hooks, int verbose)
 	verbose_log = verbose;
 	hooks->profile_changed = ev_profile_changed;
 	hooks->download = ev_download;
+	hooks->notify = ev_notify;
 	hooks->connectivity = ev_connectivity;
 	hooks->log = ev_log;
 	hooks->ud = h;

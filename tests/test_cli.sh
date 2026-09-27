@@ -145,13 +145,30 @@ ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"poll\"" && [ "$(binds)" = 2 
 out=$(run -s "$w/b" info)
 ok 'echo "$out" | grep -q "\"bind\":\"done\""' 'info: bound'
 
-# reset: configuration, state, key and binding gone; a second bundle starts over
+# reset of one card: its state goes; the device key, the binding and another
+# card's state in the same directory stay (they are the directory's, shared)
+eid=89049032123451234512345678901235
+other=89049032000000000000000000000001
+cp "$w/b/$eid.state" "$w/b/$other.state"
 out=$(run -s "$w/b" reset)
-ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"reset\""' 'reset: done'
-ok '[ ! -e "$w/b/device.key" ] && [ ! -e "$w/b/bind.done" ] && ! ls "$w/b"/*.state >/dev/null 2>&1' \
-	'reset: key, binding and state removed'
+ok 'echo "$out" | grep -q "\"code\":2,\"message\":\"reset\"" && [ -e "$w/b/$eid.state" ] && [ -e "$w/b/device.key" ]' \
+	'reset: without an EID or "all", refused and nothing removed'
+out=$(run -s "$w/b" reset 8904903212345123451234567890123)
+ok 'echo "$out" | grep -q "\"code\":2" && [ -e "$w/b/$eid.state" ]' 'reset: a malformed EID is refused'
+out=$(run -s "$w/b" reset "$eid")
+ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"reset\"" && [ ! -e "$w/b/$eid.state" ]' 'reset <EID>: the state of that card removed'
+ok '[ -e "$w/b/$other.state" ] && [ -e "$w/b/device.key" ] && [ -e "$w/b/bind.done" ]' \
+	'reset <EID>: the other card, the device key and the binding stay'
 out=$(run -s "$w/b" -u "$url" poll)
-ok 'echo "$out" | grep -q "\"code\":3"' 'reset: poll says no eIM configured'
+ok 'echo "$out" | grep -q "\"code\":3"' 'reset <EID>: poll says no eIM configured'
+
+# reset all: configuration, state, key and binding gone; a second bundle starts over
+out=$(run -s "$w/b" reset all)
+ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"reset\""' 'reset all: done'
+ok '[ ! -e "$w/b/device.key" ] && [ ! -e "$w/b/bind.done" ] && ! ls "$w/b"/*.state >/dev/null 2>&1' \
+	'reset all: key, binding and every state removed'
+out=$(run -s "$w/b" -u "$url" poll)
+ok 'echo "$out" | grep -q "\"code\":3"' 'reset all: poll says no eIM configured'
 
 # 409: the EID is registered already — counts as bound (D-69)
 rm -f "$w/bkey.der"
@@ -190,6 +207,15 @@ printf '{"format":"eim-ipad-provision/1","issuance_id":"x","device_key":"%s"}' "
 out=$(run -s "$w/g" provision "$w/b6.json")
 ok 'echo "$out" | grep -q "\"code\":1,\"message\":\"provision\""' 'malformed bundle: refused'
 ok '! echo "$out" | grep -qF "$key64"' 'malformed bundle: the key is not printed'
+
+# -h names every command the binary takes, with its argument forms
+out=$("$b/ipad" -h)
+ok 'echo "$out" | grep -q "^  reset <EID>|all "' 'help: reset and its argument'
+ok 'echo "$out" | grep -q "provisioning bundle (eim-ipad-provision/1"' 'help: provision takes a bundle too'
+for c in poll provision export connectivity notify info reset; do
+	grep -q "strcmp(cmd, \"$c\")" "$(dirname "$0")/../src/main.c" || continue
+	ok 'echo "$out" | grep -q "^  $c "' "help: $c listed"
+done
 
 echo "test_cli: $checks checks, $failures failures"
 [ "$failures" = 0 ]

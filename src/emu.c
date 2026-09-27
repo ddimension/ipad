@@ -86,6 +86,7 @@ typedef struct {
 	uint8_t iccid[10];
 	bool enabled;
 	bool fallback_allowed;
+	bool gone;                       /* deleted by the package being run */
 } prof;
 
 #define MAX_PROF 32
@@ -112,6 +113,7 @@ static int profiles(emu *e, prof *out, int cap, dbuf *raw)
 		if (der_find(it.val, it.len, 0x5A, &x) < 0 || x.len != 10)
 			continue;
 		memcpy(out[n].iccid, x.val, 10);
+		out[n].gone = false;
 		out[n].enabled = der_find(it.val, it.len, 0x9F70, &x) == 0 && x.len == 1 && x.val[0] == 1;
 		out[n].fallback_allowed = e->cfg.fallback_allowed ||
 			(der_find(it.val, it.len, 0x9F67, &x) == 0 && x.len == 1 && x.val[0]);
@@ -129,7 +131,7 @@ static prof *find_prof(prof *ps, int n, const uint8_t *iccid)
 	int i;
 
 	for (i = 0; i < n; i++)
-		if (!memcmp(ps[i].iccid, iccid, 10))
+		if (!ps[i].gone && !memcmp(ps[i].iccid, iccid, 10))
 			return &ps[i];
 	return NULL;
 }
@@ -139,7 +141,7 @@ static prof *enabled_prof(prof *ps, int n)
 	int i;
 
 	for (i = 0; i < n; i++)
-		if (ps[i].enabled)
+		if (!ps[i].gone && ps[i].enabled)
 			return &ps[i];
 	return NULL;
 }
@@ -260,34 +262,55 @@ static void unsigned_error(const char *eim_id, const emu_eim *m, const uint8_t *
 
 /* --- ES10b.LoadEuiccPackage (5.9.1) ----------------------------------------- */
 
+/* What one package run has done so far. An IoT eUICC marks profiles in step 5
+ * of 3.3.1 and switches them in step 8b, after the result is signed, and can
+ * do so because 5.9.1 makes the whole function atomic. An SGP.22 card is not
+ * atomic and its answer is the only evidence of what it did, so here every
+ * enable, disable and delete is run on the card as its PSMO is reached, and
+ * the PSMO's result is the card's answer (see load_euicc_package). */
 typedef struct {
-	/* the marks of section 3.4, applied after the result is signed (3.3.1 step 8b) */
-	bool enable_done, disable_done;
-	bool to_enable, to_disable;
-	uint8_t enable_iccid[10], disable_iccid[10];
-	uint8_t del[8][10];
-	int ndel;
-	bool grant_rb;
+	bool enable_done, disable_done;  /* one of each per package (3.4.1, 3.4.2) */
+	/* the profile an earlier PSMO of this package disabled: 3.4.1 step 2
+	 * counts a profile "marked to be disabled" as the one to roll back to */
+	bool off_set;
+	uint8_t off_iccid[10];
+	bool grant_rb;                   /* an enable with rollbackFlag the card carried out */
 	uint8_t rb_iccid[10];
 	int del_eim;          /* index of an eIM deleted by deleteEim, applied after signing */
-} marks;
+} pkgrun;
 
-static bool marked_delete(const marks *k, const uint8_t *iccid)
+/* The SGP.22 card's result code (SGP.22 5.7.16-5.7.18, RSPDefinitions.asn
+ * EnableProfileResponse / DisableProfileResponse / DeleteProfileResponse) as
+ * the SGP.32 PSMO result (SGP32Definitions.asn EnableProfileResult /
+ * DisableProfileResult / DeleteProfileResult). The values both define carry
+ * the same meaning under the same number; what SGP.32 does not define for
+ * that PSMO (SGP.22's wrongProfileReenabling(4), catBusy(5) on a delete, a
+ * value outside either list, or no parsable answer) becomes undefinedError,
+ * because the eIM decodes the value against SGP.32's list and an unknown
+ * number there says nothing true. */
+static int64_t psmo_code(uint32_t es10_tag, int64_t v)
 {
-	int i;
-
-	for (i = 0; i < k->ndel; i++)
-		if (!memcmp(k->del[i], iccid, 10))
-			return true;
-	return false;
+	switch (v) {
+	case 0:     /* ok */
+	case 1:     /* iccidOrAidNotFound */
+	case 2:     /* profileNotInDisabledState / profileNotInEnabledState */
+	case 3:     /* disallowedByPolicy */
+		return v;
+	case 5:     /* catBusy: in EnableProfileResult and DisableProfileResult only */
+		return es10_tag == 0xBF33 ? 127 : 5;
+	}
+	return 127;
 }
 
-/* one PSMO; returns its result code (0 ok), writes its EuiccResultData */
-static int64_t psmo(emu *e, marks *k, prof *ps, int np, const der_tlv *op, dbuf *res)
+/* one PSMO; returns its result code (0 ok), writes its EuiccResultData.
+ * ps is the card's profile list, kept up to date with what this package
+ * has done to the card */
+static int64_t psmo(emu *e, pkgrun *k, prof *ps, int np, const der_tlv *op, dbuf *res)
 {
 	der_tlv x;
 	prof *p, *en;
 	int64_t v = 0;
+	int i;
 
 	switch (op->tag) {
 	case 0xA3:   /* enable (3.4.1) */
@@ -297,23 +320,23 @@ static int64_t psmo(emu *e, marks *k, prof *ps, int np, const der_tlv *op, dbuf 
 			v = 1;   /* iccidOrAidNotFound */
 		} else {
 			bool rb = der_find(op->val, op->len, 0x05, &x) == 0;   /* rollbackFlag NULL */
+			const uint8_t *back;
 
 			en = enabled_prof(ps, np);
+			back = en ? en->iccid : (k->off_set ? k->off_iccid : NULL);
+			k->enable_done = true;
 			if (p->enabled)
 				v = 2;    /* profileNotInDisabledState */
-			else if (rb && !en)
+			else if (rb && !back)
 				v = 20;   /* rollbackNotAvailable */
-			else {
-				k->enable_done = true;
-				k->to_enable = true;
-				memcpy(k->enable_iccid, p->iccid, 10);
-				if (en) {
-					k->to_disable = true;
-					memcpy(k->disable_iccid, en->iccid, 10);
-				}
+			else if ((v = psmo_code(0xBF31, card_switch(e, 0xBF31, p->iccid))) == 0) {
+				/* SGP.22 disables the enabled profile itself */
+				for (i = 0; i < np; i++)
+					ps[i].enabled = false;
+				p->enabled = true;
 				if (rb) {
 					k->grant_rb = true;
-					memcpy(k->rb_iccid, en->iccid, 10);
+					memcpy(k->rb_iccid, back, 10);
 				}
 				/* enabling clears the fallback reference (3.4.1 step 3) */
 				e->fb_prev_set = false;
@@ -331,36 +354,31 @@ static int64_t psmo(emu *e, marks *k, prof *ps, int np, const der_tlv *op, dbuf 
 			v = 2;    /* profileNotInEnabledState */
 		else {
 			k->disable_done = true;
-			k->to_disable = true;
-			memcpy(k->disable_iccid, p->iccid, 10);
+			if ((v = psmo_code(0xBF32, card_switch(e, 0xBF32, p->iccid))) == 0) {
+				p->enabled = false;
+				k->off_set = true;
+				memcpy(k->off_iccid, p->iccid, 10);
+			}
 		}
 		der_put_int(res, 0x84, v);
 		return v;
 
-	case 0xA5: { /* delete (3.4.3) */
-		bool marked_off, marked_on;
-
-		if (der_find(op->val, op->len, 0x5A, &x) < 0 || x.len != 10) {
+	case 0xA5:   /* delete (3.4.3) */
+		if (der_find(op->val, op->len, 0x5A, &x) < 0 || x.len != 10)
 			v = 127;
-		} else if (!(p = find_prof(ps, np, x.val))) {
+		else if (!(p = find_prof(ps, np, x.val)))
 			v = 1;
-		} else {
-			marked_off = k->to_disable && !memcmp(k->disable_iccid, p->iccid, 10);
-			marked_on = k->to_enable && !memcmp(k->enable_iccid, p->iccid, 10);
-
-			if ((p->enabled && !marked_off) || (!p->enabled && marked_on))
-				v = 2;    /* profileNotInDisabledState */
-			else if ((k->grant_rb && !memcmp(k->rb_iccid, p->iccid, 10)) ||
-			         (e->rb_granted && !memcmp(e->rb_iccid, p->iccid, 10)))
-				v = 20;   /* rollbackNotAvailable */
-			else if (e->fb_active && e->fb_prev_set && !memcmp(e->fb_prev, p->iccid, 10))
-				v = 21;   /* returnFallbackProfile */
-			else if (k->ndel < 8 && !marked_delete(k, p->iccid))
-				memcpy(k->del[k->ndel++], p->iccid, 10);
-		}
+		else if (p->enabled)
+			v = 2;    /* profileNotInDisabledState */
+		else if ((k->grant_rb && !memcmp(k->rb_iccid, p->iccid, 10)) ||
+		         (e->rb_granted && !memcmp(e->rb_iccid, p->iccid, 10)))
+			v = 20;   /* rollbackNotAvailable */
+		else if (e->fb_active && e->fb_prev_set && !memcmp(e->fb_prev, p->iccid, 10))
+			v = 21;   /* returnFallbackProfile */
+		else if ((v = psmo_code(0xBF33, card_delete(e, p->iccid))) == 0)
+			p->gone = true;
 		der_put_int(res, 0x85, v);
 		return v;
-	}
 
 	case 0xBF2D: { /* listProfileInfo: the card's own answer, [45] replacing [45] */
 		dbuf req, resp;
@@ -488,7 +506,7 @@ static int merge_cfg(const dbuf *old, const uint8_t *upd, size_t ulen, dbuf *out
 }
 
 /* one eCO (3.5.1); returns its result code, writes its EuiccResultData */
-static int64_t eco(emu *e, marks *k, const emu_eim *requester, const der_tlv *op, dbuf *res)
+static int64_t eco(emu *e, pkgrun *k, const emu_eim *requester, const der_tlv *op, dbuf *res)
 {
 	der_tlv x;
 	dbuf cfg;
@@ -655,21 +673,6 @@ static int64_t eco(emu *e, marks *k, const emu_eim *requester, const der_tlv *op
 	return 2;
 }
 
-static void apply_marks(emu *e, const marks *k)
-{
-	int i;
-
-	/* 3.3.1 step 8b. SGP.22 enabling switches away from the enabled profile
-	 * by itself; a disable is only needed when nothing is to be enabled */
-	if (k->to_enable)
-		card_switch(e, 0xBF31, k->enable_iccid);
-	else if (k->to_disable)
-		card_switch(e, 0xBF32, k->disable_iccid);
-
-	for (i = 0; i < k->ndel; i++)
-		card_delete(e, k->del[i]);
-}
-
 static int load_euicc_package(emu *e, const uint8_t *req, size_t len, dbuf *out)
 {
 	der_tlv top, signed_, sig, x, pkg, op;
@@ -681,8 +684,9 @@ static int load_euicc_package(emu *e, const uint8_t *req, size_t len, dbuf *out)
 	dbuf input, results;
 	prof ps[MAX_PROF];
 	int np;
-	marks k;
+	pkgrun k;
 	const uint8_t *p, *end;
+	bool psmos;
 
 	if (der_parse(req, len, &top) < 0 || top.tag != 0xBF51 ||
 	    der_find(top.val, top.len, 0x30, &signed_) < 0 ||
@@ -727,14 +731,59 @@ static int load_euicc_package(emu *e, const uint8_t *req, size_t len, dbuf *out)
 	if (counter <= m->counter)
 		return sign_epe(e, m, counter, txid, txid_len, 4, out);   /* replayError */
 
-	/* a new package resets any rollback authorisation (5.9.1) */
-	e->rb_granted = false;
+	/* Three phases, because an SGP.22 card is not atomic and ES10b.
+	 * LoadEuiccPackage is (5.9.1).
+	 *
+	 * (a) Before the card is touched, the new counter is made durable,
+	 *     together with the reset of the rollback authorisation that every
+	 *     accepted package brings (5.9.1). Were the counter saved only after
+	 *     the card had changed, a crash in between would leave it behind,
+	 *     and the eIM's signed package, delivered again, would run a second
+	 *     time: a delete or an enable repeated with no eIM asking for it.
+	 * (b) The PSMOs run in order, and each enable, disable and delete is
+	 *     carried out on the card right there; its result is the card's own
+	 *     answer (psmo_code), and a refusal stops the list like any other
+	 *     failure (3.3.1 step 5).
+	 * (c) The result is built from those answers, signed, and saved with the
+	 *     rest of the state; a rollback authorisation is recorded only for an
+	 *     enable the card carried out.
+	 *
+	 * The crash window this leaves, after (a) and before (c): the package is
+	 * counted, the card may have changed, and no result exists. The eIM gets
+	 * no result for that counter, and the same package, if it comes again,
+	 * is a replayError. That is chosen over the alternative, a signed "ok"
+	 * made before the card acts: a missing result is what the eIM already
+	 * meets whenever a result is lost in transit and it has to find the
+	 * card's state by asking (listProfileInfo); a signed "ok" is a false
+	 * statement it has no reason to question. An IoT eUICC has no such
+	 * window, since it reverts the whole function on a power loss (5.9.1).
+	 *
+	 * An eCO list does not touch the card: its state changes, the counter
+	 * and the result are saved together in (c), in one atomic write, and
+	 * the counter is set after the eCOs, as 5.9.1 orders it, so that an
+	 * updateEim is checked against the counter stored before this package. */
+	psmos = der_find(signed_.val, signed_.len, 0xA0, &pkg) == 0;
+	{
+		int64_t old_counter = m->counter;
+		bool old_rb = e->rb_granted;
+
+		e->rb_granted = false;
+		if (psmos) {
+			m->counter = counter;
+			if (emu_state_save(e) < 0) {
+				/* nothing has run: leave the package unseen */
+				m->counter = old_counter;
+				e->rb_granted = old_rb;
+				return -1;
+			}
+		}
+	}
 
 	memset(&k, 0, sizeof(k));
 	k.del_eim = -1;
 	db_init(&results);
 
-	if (der_find(signed_.val, signed_.len, 0xA0, &pkg) == 0) {   /* psmoList */
+	if (psmos) {   /* psmoList */
 		np = profiles(e, ps, MAX_PROF, NULL);
 		if (np < 0) {
 			der_put_int(&results, 0x02, 127);
@@ -761,10 +810,9 @@ static int load_euicc_package(emu *e, const uint8_t *req, size_t len, dbuf *out)
 		der_put_int(&results, 0x02, 2);
 	}
 
-	/* the counter moves with the package (5.9.1), before the eIM record can
-	 * be replaced by an update or deleted */
+	/* the counter moves with the package (5.9.1); an eIM deleted by this
+	 * package is removed only after the result is signed */
 	m->counter = counter;
-
 	if (sign_epr(e, m, eim_id, counter, txid, txid_len, &results, out) < 0) {
 		db_free(&results);
 		return -1;
@@ -788,18 +836,7 @@ static int load_euicc_package(emu *e, const uint8_t *req, size_t len, dbuf *out)
 		e->neims--;
 	}
 
-	/* The counter and the result are persisted BEFORE the card is switched.
-	 * The other order would let a crash between the two leave the counter
-	 * behind, and the same package would then execute a second time. Known
-	 * limit of emulating an atomic function over a card that is not: a
-	 * crash after this save and before the switch leaves a signed "ok" for
-	 * a change the card never made. The eIM sees it in the profile list;
-	 * an IoT eUICC cannot get into this state (5.9.1). */
-	if (emu_state_save(e) < 0)
-		return -1;
-
-	apply_marks(e, &k);
-	return 0;
+	return emu_state_save(e);
 }
 
 /* --- the other SGP.32 functions -------------------------------------------- */
@@ -863,7 +900,7 @@ static int get_eim_config(emu *e, const uint8_t *req, size_t len, dbuf *out)
 	return 0;
 }
 
-/* ES10b.AddInitialEim (5.9.17, 3.5.2) */
+/* ES10b.AddInitialEim (5.9.4, 3.5.2) */
 static int add_initial_eim(emu *e, const uint8_t *req, size_t len, dbuf *out)
 {
 	der_tlv top, list, c, x;
@@ -977,7 +1014,7 @@ static int profile_rollback(emu *e, dbuf *out)
 	return emu_state_save(e);
 }
 
-/* ES10b.ExecuteFallbackMechanism (5.9.21) / ReturnFromFallback (5.9.22) */
+/* ES10b.ExecuteFallbackMechanism (5.9.20) / ReturnFromFallback (5.9.21) */
 static int fallback(emu *e, bool execute, dbuf *out)
 {
 	uint32_t tag = execute ? 0xBF5D : 0xBF5E;
@@ -1042,7 +1079,7 @@ static int immediate_enable(emu *e, dbuf *out)
 	return 0;
 }
 
-/* ES10b.ConfigureImmediateProfileEnabling (5.9.19, 3.4.5) */
+/* ES10b.ConfigureImmediateProfileEnabling (5.9.17, 3.4.5) */
 static int configure_immediate(emu *e, const uint8_t *req, size_t len, dbuf *out)
 {
 	der_tlv top, x;
@@ -1068,7 +1105,7 @@ static int configure_immediate(emu *e, const uint8_t *req, size_t len, dbuf *out
 	return emu_state_save(e);
 }
 
-/* ES10b.RetrieveNotificationsList (5.9.10): the stored EPRs are answered
+/* ES10b.RetrieveNotificationsList (5.9.11): the stored EPRs are answered
  * here, notifications by the card */
 static int retrieve_notifications(emu *e, const uint8_t *req, size_t len, dbuf *out)
 {
@@ -1127,7 +1164,7 @@ static int remove_notification(emu *e, const uint8_t *req, size_t len, dbuf *out
 	return 0;
 }
 
-/* ES10b.eUICCMemoryReset (5.9.11): the SGP.22 options go to the card, the
+/* ES10b.eUICCMemoryReset (5.9.5): the SGP.22 options go to the card, the
  * two SGP.32 ones are this state */
 static int memory_reset(emu *e, const uint8_t *req, size_t len, dbuf *out)
 {

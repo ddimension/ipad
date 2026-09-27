@@ -9,6 +9,7 @@ static int sc_open(void *ctx, const uint8_t *aid, size_t len)
 	if (len != sizeof(ISDR_AID) || memcmp(aid, ISDR_AID, len))
 		return -1;
 	s->opens++;
+	s->dead = 0;
 	return s->channel;
 }
 
@@ -52,6 +53,12 @@ static int sc_transmit(void *ctx, const uint8_t *a, size_t len, dbuf *r)
 
 	if (len < 4)
 		return -1;
+
+	if (s->dead) {
+		s->stale++;
+		sw_out(r, 0x6881);
+		return 0;
+	}
 
 	if (a[1] == 0xC0) {   /* GET RESPONSE */
 		if (a[0] != card_cla(0x80, s->channel))
@@ -103,6 +110,14 @@ static int sc_transmit(void *ctx, const uint8_t *a, size_t len, dbuf *r)
 }
 
 const card_ops SIMCARD_OPS = { sc_open, sc_transmit, sc_close };
+
+void simcard_reset(simcard *s)
+{
+	s->dead = 1;
+	s->req.len = 0;
+	s->pending.len = 0;
+	s->expect_block = 0;
+}
 
 void simcard_init(simcard *s, int channel, sim_handler h, void *user)
 {

@@ -6,6 +6,7 @@
  * esim_bridge on any modem wwand can send APDUs to.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <stdio.h>
@@ -51,11 +52,17 @@ static void usage(FILE *f)
 	        "  poll               run the eIM's packages, deliver notifications,\n"
 	        "                     report the connectivity parameters\n"
 	        "  provision <file>   AddInitialEim: EimConfigurationData or the whole request\n"
-	        "                     (DER or hex; eimctl eim-config writes the request)\n"
+	        "                     (DER or hex; eimctl eim-config writes the request),\n"
+	        "                     or a provisioning bundle (" BUNDLE_FORMAT " JSON, D-69):\n"
+	        "                     eIM configuration and device key, bound at the next poll;\n"
+	        "                     the file is deleted once stored\n"
 	        "  export <file>      the eIM import file for an emulated card (" IMPORT_FORMAT ")\n"
 	        "  connectivity       report the enabled profile's connectivity parameters\n"
 	        "  notify             deliver pending notifications only\n"
 	        "  info               EID, backend, eIMs, device key (JSON on stdout)\n"
+	        "  reset <EID>|all    emulation: forget that card's state (<EID>.state), or with\n"
+	        "                     'all' every card's, the device key and the binding; no card\n"
+	        "                     needed\n"
 	        "options:\n"
 	        "  -b auto|iot|emu    card backend (default auto: probe for SGP.32)\n"
 	        "  -s <dir>           emulation state and device key (default /etc/wwand/ipa)\n"
@@ -66,7 +73,8 @@ static void usage(FILE *f)
 	        "  -i <imei>          device IMEI (DeviceInfo; its first 8 digits are the TAC)\n"
 	        "  -r <hex6>          rPLMN, TS 24.008 coding\n"
 	        "  -C <n>             notify a state change with this cause on the next poll\n"
-	        "  -D                 offer direct download (the host runs ES9+)\n"
+	        "  -D                 offer direct download (the host runs ES9+, and delivers\n"
+	        "                     the download's PIR to the SM-DP+ over ES9+)\n"
 	        "  -F                 emulation: every profile may be the fallback (not SGP.32)\n"
 	        "  -v                 log to stderr too\n");
 }
@@ -436,7 +444,7 @@ static int bind_card(ipa *a, euicc *eu, crypto_key *key, const char *dir, const 
 	snprintf(mpath, sizeof(mpath), "%s/" BIND_PENDING, dir);
 	snprintf(rpath, sizeof(rpath), "%s/" BIND_REFUSED_FILE, dir);
 	if (access(rpath, F_OK) == 0) {
-		logf(lud, LOG_ERR, "the eIM refused to bind this card: not polling until an operator acts (a new bundle, or ipad reset)");
+		logf(lud, LOG_ERR, "the eIM refused to bind this card: not polling until an operator acts (a new bundle, or ipad reset all)");
 		return EXIT_BIND_REFUSED;
 	}
 	if (eu->kind != EUICC_EMU || access(mpath, F_OK) != 0)
@@ -548,11 +556,17 @@ static int bind_card(ipa *a, euicc *eu, crypto_key *key, const char *dir, const 
 	return rc;
 }
 
-/* `reset`: the emulation forgets its eIM configuration and state (one .state
- * file per EID), the device key and the binding, so a fresh bundle starts
- * from nothing. Needs no card. An IoT eUICC keeps its configuration on the
- * card itself; removing that is an eIM's eCO (deleteEim), not ours. */
-static int cmd_reset(const char *dir)
+/* `reset <EID>`: the emulation forgets that card's eIM configuration and
+ * state (its <EID>.state), and nothing else: the device key and the binding
+ * belong to the state directory, which every card on the router shares, and
+ * removing them would leave the other cards' results unverifiable at the eIM.
+ * `reset all`: every .state, the device key and the binding, so that a fresh
+ * bundle or a re-key starts from nothing; that is spelt out, not the default,
+ * because it re-keys every card in the directory at once.
+ * Needs no card. An IoT eUICC keeps its configuration on the card itself;
+ * removing that is an eIM's eCO (deleteEim), not ours.
+ * 0 done (nothing to remove is done too), 2 an argument that is neither. */
+static int cmd_reset(const char *dir, const char *which)
 {
 	static const char *const fixed[] = { "device.key", BIND_PENDING, BIND_REFUSED_FILE, BIND_DONE_FILE,
 	                                     BIND_AFTER_FILE };
@@ -561,6 +575,29 @@ static int cmd_reset(const char *dir)
 	struct dirent *e;
 	size_t i, l;
 	int n = 0;
+
+	if (!which) {
+		fprintf(stderr, "ipad: reset wants the card's EID (32 hex digits), or 'all' for every card, "
+		                "the device key and the binding\n");
+		return 2;
+	}
+	if (strcmp(which, "all")) {
+		char eidhex[33];
+
+		if (strlen(which) != 32 || strspn(which, "0123456789abcdefABCDEF") != 32) {
+			fprintf(stderr, "ipad: reset: '%s' is neither an EID (32 hex digits) nor 'all'\n", which);
+			return 2;
+		}
+		/* named as emu_open names it: hex_encode's upper case */
+		for (i = 0; i < 32; i++)
+			eidhex[i] = (char)toupper((unsigned char)which[i]);
+		eidhex[32] = 0;
+		snprintf(p, sizeof(p), "%s/%s.state", dir, eidhex);
+		if (unlink(p) == 0)
+			n++;
+		syslog(LOG_NOTICE, "reset: card %s: %d file(s) removed from %s", eidhex, n, dir);
+		return 0;
+	}
 
 	for (i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
 		snprintf(p, sizeof(p), "%s/%s", dir, fixed[i]);
@@ -578,7 +615,7 @@ static int cmd_reset(const char *dir)
 		}
 		closedir(d);
 	}
-	syslog(LOG_NOTICE, "reset: %d file(s) removed from %s", n, dir);
+	syslog(LOG_NOTICE, "reset: all cards: %d file(s) removed from %s", n, dir);
 	return 0;
 }
 
@@ -735,6 +772,7 @@ int main(int argc, char **argv)
 	crypto_key *key = NULL;
 	uint8_t eid[16];
 	char state[600];   /* function scope: the emulation opened below uses it until the end */
+	char es9[600];     /* the same for ipa_config.es9_path */
 	int opt, verbose = 0, rc = 1, fallback_all = 0;
 	bool direct = false;
 
@@ -795,7 +833,7 @@ int main(int argc, char **argv)
 	openlog("ipad", LOG_PID, LOG_DAEMON);
 
 	if (!strcmp(cmd, "reset")) {
-		rc = cmd_reset(dir);
+		rc = cmd_reset(dir, optind + 1 < argc ? argv[optind + 1] : NULL);
 		result_line(stdout, rc, "reset", NULL);
 		closelog();
 		return rc;
@@ -805,13 +843,23 @@ int main(int argc, char **argv)
 	memset(&eu, 0, sizeof(eu));
 	eu.card = &c;
 	host_ipa_hooks(&hl, &cfg.host, verbose);
-	if (!direct)
+	if (!direct) {
 		cfg.host.download = NULL;
+		cfg.host.notify = NULL;
+	}
 	cfg.eu = &eu;
 
 	if (read_eid(&c, eid) < 0) {
 		cfg.host.log(&hl, LOG_ERR, "no EID: the card does not answer the ISD-R");
 		goto out;
+	}
+	if (direct) {
+		char eidhex[33];
+
+		hex_encode(eid, 16, eidhex);
+		mkdir_p(dir);
+		snprintf(es9, sizeof(es9), "%s/%s.es9", dir, eidhex);
+		cfg.es9_path = es9;
 	}
 
 	if (!strcmp(backend, "iot"))

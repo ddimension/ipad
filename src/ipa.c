@@ -18,6 +18,8 @@
 #include "crypto.h"
 #include "hex.h"
 
+#define ES9_MAX 16
+
 struct ipa {
 	ipa_config c;
 	uint8_t eid[16];
@@ -26,6 +28,8 @@ struct ipa {
 	uint8_t pin[512];
 	dbuf ca;
 	int cause;               /* state change cause for the next poll, -1 none */
+	int64_t es9[ES9_MAX];    /* PIRs owed to their SM-DP+ over ES9+ (es9_path) */
+	int nes9;
 };
 
 #define DAP_URL_PATH "/gsma/rsp2/asn1"
@@ -244,16 +248,122 @@ static int retrieve(ipa *a, const uint8_t *crit, size_t clen, dbuf *resp, der_tl
 	return rc;
 }
 
+/* ---- a direct download's PIR: ES9+ through the host ----
+ *
+ * SGP.32 3.2.3.1 has the IPA send the PIR to the SM-DP+ (Figure 9 step [14]:
+ * IPA -> SM-DP+ ES9+.HandleNotification; 3.7 [2a] when a direct ES9+
+ * interface is used). The eIM gets it only inside the
+ * ProfileDownloadTriggerResult (step 13), and it forwards a PIR only when it
+ * belongs to an Indirect Profile Download session it runs (5.7.4), so a PIR
+ * of a direct download handed to it alone reaches no SM-DP+. The record
+ * below is what keeps such a PIR on the ES9+ route across runs: written
+ * before the delivery is tried, cleared once the host confirmed it. */
+
+static void es9_save(const ipa *a)
+{
+	char tmp[600];
+	FILE *f;
+	int i;
+
+	if (!a->c.es9_path)
+		return;
+	if (!a->nes9) {
+		remove(a->c.es9_path);
+		return;
+	}
+	snprintf(tmp, sizeof(tmp), "%s.tmp", a->c.es9_path);
+	if (!(f = fopen(tmp, "w"))) {
+		say(a, LOG_WARNING, "%s: cannot write the ES9+ record", tmp);
+		return;
+	}
+	for (i = 0; i < a->nes9; i++)
+		fprintf(f, "%lld\n", (long long)a->es9[i]);
+	if (fclose(f) != 0 || rename(tmp, a->c.es9_path) != 0) {
+		remove(tmp);
+		say(a, LOG_WARNING, "%s: cannot write the ES9+ record", a->c.es9_path);
+	}
+}
+
+static void es9_load(ipa *a)
+{
+	FILE *f;
+	long long v;
+
+	a->nes9 = 0;
+	if (!a->c.es9_path || !(f = fopen(a->c.es9_path, "r")))
+		return;
+	while (a->nes9 < ES9_MAX && fscanf(f, "%lld", &v) == 1)
+		a->es9[a->nes9++] = v;
+	fclose(f);
+}
+
+static bool es9_owed(const ipa *a, int64_t seq)
+{
+	int i;
+
+	for (i = 0; i < a->nes9; i++)
+		if (a->es9[i] == seq)
+			return true;
+	return false;
+}
+
+static void es9_set(ipa *a, int64_t seq, bool owed)
+{
+	int i;
+
+	if (owed == es9_owed(a, seq))
+		return;
+	if (owed) {
+		/* full: the oldest goes, and with it only the ES9+ preference;
+		 * the PIR itself stays on the card and goes to the eIM */
+		if (a->nes9 == ES9_MAX) {
+			memmove(a->es9, a->es9 + 1, (ES9_MAX - 1) * sizeof(a->es9[0]));
+			a->nes9--;
+		}
+		a->es9[a->nes9++] = seq;
+	} else {
+		for (i = 0; i < a->nes9 && a->es9[i] != seq; i++)
+			;
+		memmove(a->es9 + i, a->es9 + i + 1, (size_t)(a->nes9 - i - 1) * sizeof(a->es9[0]));
+		a->nes9--;
+	}
+	es9_save(a);
+}
+
+/* 0 once the host delivered it (and removed it from the card) */
+static int es9_deliver(ipa *a, int64_t seq)
+{
+	int rc;
+
+	/* the host's ES9+ client (lpac) reads and removes the notification on
+	 * the ISD-R itself, over the one channel the bridge relays: give ours
+	 * back; card_es10 reopens it afterwards */
+	card_close(a->c.eu->card);
+	rc = a->c.host.notify(a->c.host.ud, seq);
+	if (rc == 0) {
+		es9_set(a, seq, false);
+		say(a, LOG_NOTICE, "PIR %lld delivered to the SM-DP+ over ES9+", (long long)seq);
+	} else {
+		say(a, LOG_WARNING, "PIR %lld not delivered to the SM-DP+ over ES9+, kept for the next run",
+		    (long long)seq);
+	}
+	return rc;
+}
+
 int ipa_deliver_notifications(ipa *a)
 {
 	dbuf r, msg;
 	der_tlv t, list, n;
 	const uint8_t *p, *end;
 	int sent = 0;
+	int64_t seen[ES9_MAX];
+	int nseen = 0, i;
+	bool listed = false;
 
 	db_init(&r);
 	db_init(&msg);
 	if (retrieve(a, NULL, 0, &r, &t) == 0 && der_find(t.val, t.len, 0xA0, &list) == 0) {
+		listed = true;
 		for (p = list.val, end = list.val + list.len; p < end; ) {
 			int64_t seq;
 			size_t m, k;
@@ -262,6 +372,13 @@ int ipa_deliver_notifications(ipa *a)
 				break;
 			if (notif_seq(&n, &seq) < 0) {
 				say(a, LOG_WARNING, "notification without a sequence number, skipped");
+				continue;
+			}
+			if (a->c.host.notify && es9_owed(a, seq)) {
+				if (es9_deliver(a, seq) == 0)
+					sent++;
+				else if (nseen < ES9_MAX)
+					seen[nseen++] = seq;
 				continue;
 			}
 			/* HandleNotificationEsipa { pendingNotification [0] } (5.14.7);
@@ -274,10 +391,23 @@ int ipa_deliver_notifications(ipa *a)
 			der_end(&msg, m);
 			if (esipa_notify(a, &msg) < 0) {
 				say(a, LOG_WARNING, "notification %lld not delivered, kept", (long long)seq);
+				listed = false;   /* not all seen: no record is dropped */
 				break;   /* the eIM is unreachable; the rest waits too */
 			}
 			remove_seq(a, seq);
 			sent++;
+		}
+	}
+	/* a record whose PIR is no longer on the card (removed by other means)
+	 * is dropped; a list the card did not give leaves the record alone */
+	if (listed && a->c.host.notify) {
+		for (i = a->nes9 - 1; i >= 0; i--) {
+			int j;
+
+			for (j = 0; j < nseen && seen[j] != a->es9[i]; j++)
+				;
+			if (j == nseen)
+				es9_set(a, a->es9[i], false);
 		}
 	}
 	db_free(&r);
@@ -285,7 +415,7 @@ int ipa_deliver_notifications(ipa *a)
 	return sent;
 }
 
-/* ---- ProvideEimPackageResult (5.14.3) ---- */
+/* ---- ProvideEimPackageResult (5.14.6) ---- */
 
 /* result: one EimPackageResult alternative as encoded (BF51 / BF52 / BF54 /
  * A0 error / 30 ePRAndNotifications). Removes what the eIM acknowledged;
@@ -364,6 +494,12 @@ static int handle_package(ipa *a, const der_tlv *pkg, ipa_summary *sum)
 		sum->profile_changed = true;
 		say(a, LOG_NOTICE, "enabled profile %s -> %s", before[0] ? before : "none",
 		    after[0] ? after : "none");
+		/* The host applies the switch with a SIM reset, which closes every
+		 * logical channel on the card. Kept, ours would carry the
+		 * ProfileRollback below — the one call that must work when the new
+		 * profile does not — to a channel that no longer exists. Closed
+		 * while the card still answers; card_es10 opens a fresh one. */
+		card_close(a->c.eu->card);
 		if (a->c.host.profile_changed)
 			online = a->c.host.profile_changed(a->c.host.ud, after);
 	}
@@ -379,6 +515,7 @@ static int handle_package(ipa *a, const der_tlv *pkg, ipa_summary *sum)
 		if (v == 0 && der_find(t.val, t.len, 0xBF51, &x) == 0) {
 			say(a, LOG_NOTICE, "profile rolled back to %s", before[0] ? before : "none");
 			sum->rolled_back = true;
+			card_close(a->c.eu->card);   /* the host resets the SIM again */
 			if (a->c.host.profile_changed)
 				a->c.host.profile_changed(a->c.host.ud, before);
 			/* the rollback's result replaces the package's (NOTE1) */
@@ -899,6 +1036,10 @@ static int handle_download(ipa *a, const der_tlv *req, ipa_summary *sum)
 			der_put(&res, 0x82, txid.val, txid.len);
 		if (newest_pir(a, mark, &pir, &seq) == 0) {
 			db_put(&res, pir.d, pir.len);
+			/* owed to the SM-DP+ from here on, recorded before anything
+			 * else can fail (step 14 below) */
+			if (a->c.host.notify)
+				es9_set(a, seq, true);
 		} else {
 			k = der_begin(&res, 0x30);   /* profileDownloadError */
 			der_put_int(&res, 0x80, 127);
@@ -909,6 +1050,11 @@ static int handle_download(ipa *a, const der_tlv *req, ipa_summary *sum)
 		der_end(&res, m);
 		say(a, rc == 0 ? LOG_NOTICE : LOG_ERR, "direct download %s", rc == 0 ? "done" : "failed");
 		provide(a, res.d, res.len, true);
+		/* step 14: the PIR to the SM-DP+ over ES9+ (SGP.22 3.1.3.3 step 7).
+		 * A PIR of a failed install goes too: it tells the SM-DP+ the
+		 * order ended in 'Error' (SGP.22 3.1.3.3 step 8). */
+		if (pir.len && a->c.host.notify)
+			es9_deliver(a, seq);
 		db_free(&pir);
 		db_free(&res);
 		return rc;
@@ -1166,6 +1312,7 @@ ipa *ipa_open(const ipa_config *cfg)
 		return NULL;
 	a->c = *cfg;
 	a->cause = cfg->state_change_cause;
+	es9_load(a);
 	db_init(&a->ca);
 	db_init(&r);
 	if (es10(a->c.eu, geteid, sizeof(geteid), &r, &t) < 0 || der_find(t.val, t.len, 0x5A, &x) < 0 ||

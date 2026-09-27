@@ -18,6 +18,13 @@
  *   {"type":"event","payload":{"event":"download","activation_code":"...",
  *       "confirmation_code":"..."}}   (the code only when the eIM sent one)
  *       -> {"ok":true} | {"ok":false,"error":"..."}
+ *   {"type":"event","payload":{"event":"notify","seq":n}}
+ *       -> {"ok":true} | {"ok":false,"error":"..."}
+ *       ES9+.HandleNotification of the card's pending Notification n (the
+ *       PIR of a direct download, SGP.32 3.2.3.1 step 14) through the
+ *       host's ES9+ client, which removes it from the card once the SM-DP+
+ *       acknowledged it (lpac `notification process -r n`); offered with
+ *       -D only, like download
  *   {"type":"event","payload":{"event":"connectivity","iccid":"...",
  *       "emulated":bool,"source":"card"|"none","apn":"...","username":"...",
  *       "password":"...","pdp_type":"ipv4"|...}}   -> {}

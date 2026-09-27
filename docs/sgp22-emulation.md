@@ -18,8 +18,8 @@ card:
 This page describes what the emulation does, where it keeps its state, how
 the eIM comes to trust it, and what it cannot guarantee. Section numbers
 refer to SGP.32 v1.3 unless SGP.22 (v2.7) is named. They were checked
-against `spec/v13.txt` and `spec/v22-27.txt`. Where a code comment gives a
-different number, the difference is listed under [Notes on the sources](#notes-on-the-sources).
+against `spec/v13.txt` and `spec/v22-27.txt`, and the code comments use the
+same numbers.
 
 - [Components](#components)
 - [Which card ipad is talking to](#which-card-ipad-is-talking-to)
@@ -135,6 +135,7 @@ last component. The wwand-ipa package keeps it across a sysupgrade
 | `device.key` | The device key: P-256, SEC1 `ECPrivateKey` DER. **One key per state directory**, i.e. one per router under wwand, shared by all its cards. | Created the first time an emulated card is opened (`device_key()`), or replaced by a bundle (`provision`). Written under a unique temporary name with mode 0600, then renamed. It is created under a `flock` of the directory, so two first runs cannot end up with two keys. |
 | `<EID>.state` | The emulation's state for one card (32-digit EID in the name). | After every function that changes it: written to `<file>.tmp` with `fsync`, then renamed, so a crash leaves either the old state or the new one. |
 | `bind.pending`, `bind.done`, `bind.refused`, `bind.after` | Where the self-binding of a bundle stands (see [below](#b-a-provisioning-bundle-eim-decision-d-69)). | By `provision` and `poll`. |
+| `<EID>.es9` | The seqNumbers of direct-download PIRs not yet delivered to their SM-DP+ over ES9+ (see [The PIR of a direct download](#the-pir-of-a-direct-download)). Only with `-D`, for an IoT eUICC as well. | Before the trigger result goes out; removed once nothing is owed. |
 
 The state file is DER (`emu_state.c`):
 
@@ -161,27 +162,68 @@ The state is bound to the card. `emu_open()` reads the EID from the card
 match. The run then fails with "emulation state unusable (written for another
 card?)" rather than reusing the file.
 
-**Order matters for the replay counter.** In `LoadEuiccPackage` the counter
-and the signed result are saved *before* the card is switched. The other
-order would let a crash between the two leave the counter behind, and the
-same package would then run a second time. This comes at a cost, and the code
-names it: a crash after the save and before the switch leaves a signed "ok"
-for a change the card never made. The eIM sees the real state in the next
-profile list. An IoT eUICC cannot get into this state, because 5.9.1 makes
-the whole function atomic.
+**Order matters for the replay counter.** An IoT eUICC runs
+`LoadEuiccPackage` atomically (5.9.1); an SGP.22 card cannot, so the
+emulation runs a package of PSMOs in three phases (`load_euicc_package()`):
+
+1. **Persist.** After the signature, EID and counter checks, the new counter
+   is saved, together with the reset of any earlier rollback authorisation,
+   *before* the card is touched. Saved only after the card had changed, a
+   crash in between would leave the counter behind, and the same signed
+   package, delivered again, would run a second time.
+2. **Execute.** The PSMOs run in order, and each enable, disable and delete
+   is carried out on the card when its PSMO is reached. Its result is the
+   card's own answer (see the table below); a refusal stops the list like
+   any other failure (3.3.1 step 5).
+3. **Sign and save.** The result is built from those answers, signed, stored
+   and saved with the rest of the state. A rollback authorisation is
+   recorded only for an enable the card carried out.
+
+This leaves one crash window, between 1 and 3: the package is counted, the
+card may have changed, and there is no result. The eIM gets no result for
+that counter, and the same package, if it comes again, answers
+`replayError`. The eIM finds the card's state with its next
+`listProfileInfo`. That is preferred over a signed "ok" made before the card
+acts: a missing result is what the
+eIM meets anyway whenever one is lost in transit, while a signed "ok" for a
+change the card refused is a false statement the eIM has no reason to
+question. An eCO package does not touch the card; its counter, eIM records
+and result are saved in one atomic write.
+
+| SGP.22 answer (SGP.22 5.7.16–5.7.18) | `enableResult` | `disableResult` | `deleteResult` |
+|---|---|---|---|
+| ok(0) | ok(0) | ok(0) | ok(0) |
+| iccidOrAidNotFound(1) | iccidOrAidNotFound(1) | iccidOrAidNotFound(1) | iccidOrAidNotFound(1) |
+| profileNotInDisabledState(2) / profileNotInEnabledState(2) | profileNotInDisabledState(2) | profileNotInEnabledState(2) | profileNotInDisabledState(2) |
+| disallowedByPolicy(3) | disallowedByPolicy(3) | disallowedByPolicy(3) | disallowedByPolicy(3) |
+| wrongProfileReenabling(4), enable only | undefinedError(127) | — | — |
+| catBusy(5), enable and disable only | catBusy(5) | catBusy(5) | undefinedError(127) |
+| undefinedError(127), any other value, no answer | undefinedError(127) | undefinedError(127) | undefinedError(127) |
+
+The right-hand columns are SGP.32's `EnableProfileResult`,
+`DisableProfileResult` and `DeleteProfileResult`
+(`spec/SGP32Definitions.asn`); a value SGP.32 does not define for that PSMO
+becomes `undefinedError`, because the eIM reads the number against SGP.32's
+list. The checks the emulation makes itself, before the card is asked, give
+`profileNotInDisabledState` / `profileNotInEnabledState` against the card's
+profile list, `rollbackNotAvailable(20)` and `returnFallbackProfile(21)`.
 
 **What is lost with what.**
 
 | Lost | Effect | Way back |
 |---|---|---|
-| `device.key` only | If the file is **gone**, the next run creates a new key, and the eIM rejects results signed with it until it is imported. If the file **exists but cannot be read**, it is never replaced: the run fails with "device key … unreadable; not replacing it". | Not an export with the state kept: that file carries the emulation's counter, which is at most the eIM's, and `--replace-key` refuses it. `ipad reset`, a configuration at the eIM's counter + 1, `export`, `eimctl euicc import --replace-key` before the first poll — see [Re-keying](#re-keying) and "A lost device key" in the [README](../README.md#a-lost-device-key). |
+| `device.key` only | If the file is **gone**, the next run creates a new key, and the eIM rejects results signed with it until it is imported. If the file **exists but cannot be read**, it is never replaced: the run fails with "device key … unreadable; not replacing it". | Not an export with the state kept: that file carries the emulation's counter, which is at most the eIM's, and `--replace-key` refuses it. `ipad reset all`, a configuration at the eIM's counter + 1, `export`, `eimctl euicc import --replace-key` before the first poll — see [Re-keying](#re-keying) and "A lost device key" in the [README](../README.md#a-lost-device-key). |
 | `<EID>.state` only | Without state the card has no eIM: `poll` exits 3 ("no eIM configured"). If a configuration file is at hand, it is provisioned again, and the counter restarts from **that file's** `counterValue`. Stored results, the rollback record, the fallback and immediate-enable settings and the associationToken counter are gone. | Provision a configuration at the eIM's current counter N (`eimctl euicc show <EID>`) — not above it: the eIM gives its next package N+1, and the emulation refuses every counter `<=` its own, so a start at N+1 makes that package fail as a replay. Not below it either: packages the device already ran would be accepted again — they are signed, and a counter below them no longer stops them. |
-| Both | As above, plus a new key. | As for `device.key`: `ipad reset`, a configuration at the eIM's counter + 1, `export`, re-key on the eIM before the first poll ([Re-keying](#re-keying)). |
+| Both | As above, plus a new key. | As for `device.key`: `ipad reset all`, a configuration at the eIM's counter + 1, `export`, re-key on the eIM before the first poll ([Re-keying](#re-keying)). |
 
-`ipad reset` (and `wwandctl ipa reset`) deletes `device.key`, **every**
-`*.state` in the directory and the `bind.*` markers. No card is needed for it.
-Under wwand the directory is shared by all modems, so the reset applies to
-every card on the router.
+`ipad reset <EID>` (and `wwandctl ipa reset`) deletes that card's
+`<EID>.state` and nothing else. The device key and the `bind.*` markers stay:
+under wwand the directory is shared by all modems, and a new key would leave
+every other card's results unverifiable at the eIM. `ipad reset all` (and
+`wwandctl ipa reset --all`) deletes `device.key`, **every** `*.state` and the
+`bind.*` markers, for every card on the router; a re-key and a refused
+binding need that. A bare `ipad reset` is refused. No card is needed for
+either.
 
 ## Signing with the device key
 
@@ -281,7 +323,7 @@ binding pending.
 | eIM answer | ipad (`bind_outcome_of`) |
 |---|---|
 | 204, or 409 (EID already registered) | bound: `bind.done`, and the poll continues |
-| 403 | refused: `bind.refused`. `poll` exits 4 and stops polling this card until an operator acts (a new bundle, or `ipad reset`) |
+| 403 | refused: `bind.refused`. `poll` exits 4 and stops polling this card until an operator acts (a new bundle, or `ipad reset all`) |
 | 429 | retry on the next poll. A `Retry-After` in seconds, at most a day, is honoured: until then `poll` does not contact the eIM and ends as a retry (`binding deferred`) |
 | 5xx, no answer | retry on the next poll |
 | 400, 413, anything else | reported as an error. The binding stays pending |
@@ -335,8 +377,9 @@ eIM's. A re-key therefore needs an emulation whose counter was started
 **above** the eIM's:
 
 1. read the eIM's counter N: `eimctl euicc show <EID>`;
-2. `ipad reset`, which removes the key, the state and the binding, and with
-   them the stored results and the rollback record;
+2. `ipad reset all`, which removes the key, the state and the binding, and
+   with them the stored results and the rollback record. It does so for every
+   card in the directory, and each of them needs the same re-keying;
 3. write a configuration that starts above it:
    `eimctl eim-config cfg.der --fqdn … --counter <N+1>`;
 4. `ipad provision cfg.der`, then `ipad export device.json`;
@@ -358,10 +401,10 @@ sit under ES10b).
 
 | SGP.32 operation | SGP.22 calls on the card | ipad state involved |
 |---|---|---|
-| **ES10b.LoadEuiccPackage** (5.9.1): check signature, EID, counter; run the list; sign; persist; apply | `ES10c.GetProfilesInfo` (`BF2D`, SGP.22 5.7.15) once, to check the PSMOs against the card's profile states; then the marks below, **after** signing and saving (3.3.1 step 8b) | eIM record (key, counter, token), result store, rollback record |
-| PSMO `enable` (3.4.1) | `ES10c.EnableProfile` (`BF31`, SGP.22 5.7.16), `refreshFlag` FALSE. SGP.22 disables the enabled profile itself | clears the fallback reference; with `rollbackFlag`, records the previous profile (`rollbackNotAvailable` if none is enabled) |
-| PSMO `disable` (3.4.2) | `ES10c.DisableProfile` (`BF32`, SGP.22 5.7.17), `refreshFlag` FALSE, only when nothing is enabled in the same package | none |
-| PSMO `delete` (3.4.3) | `ES10c.DeleteProfile` (`BF33`, SGP.22 5.7.18), up to 8 per package | refused for the rollback target (`rollbackNotAvailable`) and for the profile to return to from fallback (`returnFallbackProfile`) |
+| **ES10b.LoadEuiccPackage** (5.9.1): check signature, EID, counter; persist the counter; run the list; sign; persist | `ES10c.GetProfilesInfo` (`BF2D`, SGP.22 5.7.15) once, to check the PSMOs against the card's profile states; then each enable, disable and delete below as its PSMO is reached, **after** the counter is saved and **before** the result is signed, so that the result carries the card's answer | eIM record (key, counter, token), result store, rollback record |
+| PSMO `enable` (3.4.1) | `ES10c.EnableProfile` (`BF31`, SGP.22 5.7.16), `refreshFlag` FALSE. SGP.22 disables the enabled profile itself | if the card enabled it: clears the fallback reference, and with `rollbackFlag` records the previous profile, the enabled one or the one a `disable` earlier in the package switched off (`rollbackNotAvailable` if there is neither) |
+| PSMO `disable` (3.4.2) | `ES10c.DisableProfile` (`BF32`, SGP.22 5.7.17), `refreshFlag` FALSE; a `disable` after an `enable` in the same package is refused | none |
+| PSMO `delete` (3.4.3) | `ES10c.DeleteProfile` (`BF33`, SGP.22 5.7.18), each as it is reached, with no limit per package | refused for the rollback target (`rollbackNotAvailable`) and for the profile to return to from fallback (`returnFallbackProfile`) |
 | PSMO `listProfileInfo` | `ES10c.GetProfilesInfo` passed through, the card's `BF2D` as the result | none |
 | PSMO `getRAT` | `ES10b.GetRAT` (`BF43`, SGP.22 5.7.22) | none |
 | PSMO `configureImmediateEnable` (3.4.4) | none | immediate-enable flag, OID, address |
@@ -380,7 +423,7 @@ sit under ES10b).
 | **ES10b.eUICCMemoryReset** (5.9.5) | `ES10c.eUICCMemoryReset` (`BF34`, SGP.22 5.7.19) for the SGP.22 options | eIM records and immediate-enable settings for the SGP.32 bits |
 | GetCerts (5.9.10), GetConnectivityParameters (5.9.24), emergency profile (5.9.22/23) | none | none: answered as not available |
 | **Indirect download** (3.2.3.2): GetEUICCInfo, GetEUICCChallenge, AuthenticateServer, PrepareDownload, LoadBoundProfilePackage, CancelSession | passed to the card unchanged (SGP.22 5.7.5–5.7.14). BPP segments go to the card as they are | a successful PIR opens the immediate-enable context |
-| **Direct download** (3.2.3.1) | lpac runs SGP.22 ES9+ and ES10b against the card itself | none |
+| **Direct download** (3.2.3.1) | lpac runs SGP.22 ES9+ and ES10b against the card itself, then sends the PIR to the SM-DP+ (`notification process -r`) | `<EID>.es9`: the PIR's seqNumber until the SM-DP+ has it |
 
 ## An eIM package run, step by step
 
@@ -389,10 +432,15 @@ run, until the eIM answers `noEimPackageAvailable`. Then it delivers the
 pending notifications. For each eUICC Package (`handle_package()` in `ipa.c`):
 
 1. read the enabled ICCID;
-2. `LoadEuiccPackage` (emulated: verify, run, sign, persist, switch);
+2. `LoadEuiccPackage` (emulated: verify, persist the counter, run the list
+   on the card, sign the card's answers, persist);
 3. read the enabled ICCID again. If it changed, send the host the event
    `profile_changed` and wait for its answer. Under wwand, that means a SIM
-   reset and a wait of up to 5 minutes for a *new* data session;
+   reset and a wait of up to 5 minutes for a *new* data session. ipad
+   closes its ISD-R channel **before** the event: the reset closes every
+   logical channel on the card, and the next ES10 call — the
+   `ProfileRollback` of step 5 above all — opens a fresh one instead of
+   going to a channel that no longer exists;
 4. if the host says online, send `ESipa.ProvideEimPackageResult` (5.14.6), and
    remove the results the eIM acknowledges (`eimAcknowledgements`);
 5. if the profile changed and the result **could not be delivered** (the host
@@ -416,9 +464,11 @@ sequenceDiagram
     I->>U: GetProfilesInfo (enabled = A)
     I->>V: LoadEuiccPackage
     V->>V: verify eimSignature, EID, counter > stored
+    V->>V: counter := n, save state
     V->>U: GetProfilesInfo (check PSMOs)
-    V->>V: sign EPR with device key, store it (seq >= 0x40000000),<br/>rollback record := A, counter := n, save state
     V->>U: EnableProfile B (refreshFlag FALSE)
+    U-->>V: enableResult (the PSMO's result)
+    V->>V: sign EPR with device key, store it (seq >= 0x40000000),<br/>rollback record := A if B was enabled, save state
     V-->>I: EuiccPackageResult (signed)
     I->>U: GetProfilesInfo (enabled = B)
     I->>H: event profile_changed (B)
@@ -442,11 +492,10 @@ sequenceDiagram
     I->>H: event connectivity (enabled profile, none on SGP.22)
 ```
 
-The signed result is built from checks against the card's profile list taken
-*before* any switch. `apply_marks()` does not look at the card's own answer
-to the later `EnableProfile`, `DisableProfile` or `DeleteProfile`. A switch
-the card refuses at that point still shows as ok in the signed result. The
-next `listProfileInfo` gives the eIM the real state.
+The signed result carries the card's own answer to each `EnableProfile`,
+`DisableProfile` and `DeleteProfile` (mapped as in the table under
+[The state ipad keeps](#the-state-ipad-keeps)). A switch the card refuses
+shows as that refusal, and a rollback is not granted for it.
 
 ## Profile downloads
 
@@ -523,15 +572,24 @@ sequenceDiagram
     U-->>L: PIR (kept on the card)
     H-->>I: ok / failed
     I->>U: RetrieveNotificationsList (a PIR newer than the mark?)
+    I->>I: record the PIR's seqNumber in <EID>.es9
     I->>E: ESipa.HandleNotification (ProfileDownloadTriggerResult: PIR, or profileDownloadError)
-    I->>E: ESipa.HandleNotification (pending notifications, the PIR among them)
-    I->>U: RemoveNotificationFromList
+    I->>I: close its ISD-R channel
+    I->>H: event notify (the PIR's seqNumber)
+    H->>L: lpac notification process -r <seq>
+    L->>D: ES9+ HandleNotification (PIR)
+    D-->>L: acknowledged
+    L->>U: RemoveNotificationFromList
+    H-->>I: ok / failed
+    I->>I: ok: drop the record
 ```
 
 The download runs under ipad's own claim on the card (`esim_bridge
 session_download`), so no other lpac operation can get in between. wwand
-runs lpac **without** its notification step. That leaves the PIR on the card
-for ipad to report.
+runs lpac **without** its notification step, so the PIR stays on the card
+for ipad to read into the trigger result (step 13). ipad then has the host
+send that one PIR to the SM-DP+ (`esim_bridge session_notify`, step 14): see
+[below](#the-pir-of-a-direct-download).
 
 ## Notifications and Profile Installation Results
 
@@ -544,9 +602,11 @@ What the code does:
   [2b]). A notification is removed from the card (`RemoveNotificationFromList`)
   only after the eIM answers 204 or 200. At the first failure the rest are kept
   for the next run.
-- ipad **never** sends a notification to an SM-DP+ over ES9+ itself. Delivery to
-  the Notification Receiver is the eIM's job (3.7 [2b]: the eIM forwards over
-  ES9+').
+- ipad sends no notification to an SM-DP+ itself: it has no ES9+ client. The
+  one exception to the eIM route is the PIR of a direct download, which the
+  host's ES9+ client (lpac) delivers (next section). Everything else reaches
+  its Notification Receiver through the eIM (3.7 [2b]: the eIM forwards over
+  ES9+', 5.7.4).
 - eUICC Package Results do not go through this path. They are delivered with
   `ProvideEimPackageResult` right after the package ran, and removed when the
   eIM acknowledges their sequence number.
@@ -554,22 +614,42 @@ What the code does:
   3.3.2 NOTE2 allows that as an optimisation, but does not require it. The
   enable notifications of both switches are delivered.
 
-**Direct downloads and the SM-DP+.** In a direct download the PIR reaches the
-eIM twice: inside the `ProfileDownloadTriggerResult`, and later as a pending
-notification. It never reaches the SM-DP+ from the device. The eIM
-documentation (`docs/architecture/flows/direct-download.md` and
-`notification-forwarding.md`, as of 2026-09-26) describes how the eIM handles
-each of the two:
+### The PIR of a direct download
 
-- the trigger result completes the operation;
-- a PIR that arrives alone via `HandleNotification`, without an RSP session
-  and without an EID in the call, is not forwarded ("the IPA must use ES9+
-  itself").
+SGP.32 puts the delivery of a direct download's PIR to the SM-DP+ on the
+device. Figure 9 in 3.2.3.1 draws step [14] as `IPA -> SM-DP+:
+ES9+.HandleNotification`, the SM-DP+ then continues with SGP.22 3.1.3.3 steps
+8 to 10 (order 'Installed' or 'Error', ES2+ progress to the operator), and
+3.7 [2a] says that where a direct ES9+ interface is used the IPA SHALL send
+the notifications with ES9+.HandleNotification. The eIM receives the PIR only
+inside the `ProfileDownloadTriggerResult` (step 13), which completes its
+operation. It forwards a PIR only when it belongs to an Indirect Profile
+Download session it runs (5.7.4); the eIM's documentation says the same of a
+PIR that arrives alone ("the IPA must use ES9+ itself",
+`docs/architecture/flows/direct-download.md`, 2026-09-26).
 
-Read together, the SM-DP+ may not learn of a direct download's installation
-through this combination. This is recorded as an open point. Indirect
-downloads, the default on the eIM (D-50), are not affected: their PIR belongs
-to a session the eIM knows and is forwarded.
+So, with direct download offered (`-D`):
+
+- As soon as ipad has found the new PIR, it records its seqNumber in
+  `<EID>.es9` in the state directory, before the trigger result goes out.
+- After the trigger result it closes its channel and sends the host the event
+  `notify` with that seqNumber. wwand runs `lpac notification process -r
+  <seq>`: ES9+.HandleNotification to the address in the PIR's
+  `notificationMetadata`, and `RemoveNotificationFromList` only once the SM-DP+
+  acknowledged it (lpac 2.3.0 `src/applet/notification/process.c`; SGP.22
+  3.1.3.3 steps 7 and 11). A PIR of a failed installation goes too: it is what
+  moves the SM-DP+'s order to 'Error'.
+- On `ok` the record is dropped. On a failure the PIR stays on the card and in
+  the record. `ipa_deliver_notifications()` (every poll, and `ipad notify`)
+  sends a recorded PIR over the host again, never to the eIM, which would
+  acknowledge it and drop it, and the card would have lost it. A record whose
+  PIR is no longer on the card is dropped.
+- Without `-D` there is no ES9+ route, and the record is not consulted: every
+  pending notification goes to the eIM as before. Nothing in ipad holds a
+  notification back.
+- The record holds at most 16 seqNumbers. It is not part of the emulation
+  state: `ipad reset` leaves it, because it describes notifications on the
+  card, not the eIM association.
 
 **No-confirm test downloads.** The eIM has a lab-only deviation, decision
 D-72. For SM-DP+s the eIM operator has put on an explicit allowlist
@@ -631,23 +711,10 @@ is the stronger choice where the device itself is not trusted.
 
 ## Notes on the sources
 
-- **Section numbers in code comments.** Several comments give a number that
-  differs from the SGP.32 v1.3 text in `spec/v13.txt` (identical in v1.2).
-  This page uses the specification's numbers:
-  - AddInitialEim is 5.9.4 (the comments in `emu.c` and `ipa.h` say 5.9.17);
-  - ConfigureImmediateProfileEnabling is 5.9.17 (`emu.c` says 5.9.19);
-  - ExecuteFallbackMechanism and ReturnFromFallback are 5.9.20 and 5.9.21
-    (`emu.c` and `emu_int.h` say 5.9.21 and 5.9.22);
-  - RetrieveNotificationsList is 5.9.11 (`emu.c` says 5.9.10; `ipa.c` has
-    5.9.11);
-  - eUICCMemoryReset is 5.9.5 (`emu.c` says 5.9.11);
-  - ESipa.ProvideEimPackageResult is 5.14.6 (`ipa.c` says 5.14.3).
 - **Re-key counter.** `eimctl euicc import --help` says the file's counter
   "must not be below" the eIM's. The eIM's code requires strictly above
   (D-68, `eim-store` `replace_ipa_key`). The procedure under
   [Re-keying](#re-keying) follows the code.
-- **`ipad -h`** lists neither `reset` nor the bundle form of `provision`. Both
-  exist (`main.c`).
 - **Not verified on hardware:** the eIM docs and the wwand-ipa README both
   record that no run on router hardware with an eUICC has been made yet. Every
   flow here is verified against the code and the host-side tests

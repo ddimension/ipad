@@ -9,9 +9,15 @@
 
 typedef struct {
 	uint8_t eid[16];
-	struct { uint8_t iccid[10]; int enabled; int present; } p[8];
+	struct { uint8_t iccid[10]; int enabled; int present; } p[16];
 	int np;
 	int enables, disables, deletes;   /* observed calls */
+	/* a card that refuses: nonzero answers EnableProfile / DisableProfile /
+	 * DeleteProfile with that result code and changes nothing */
+	int refuse_enable, refuse_disable, refuse_delete;
+	/* called before the card carries out an enable, disable or delete */
+	void (*before_change)(void *arg);
+	void *before_arg;
 	int last_refresh;                 /* refreshFlag of the last enable/disable */
 	char dp[64];
 

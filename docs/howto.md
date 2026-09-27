@@ -116,7 +116,7 @@ ipad [options] poll | provision <file> | export <file> | connectivity | notify |
 | `connectivity` | Reports the enabled profile's connectivity parameters only. |
 | `notify` | Delivers pending notifications only. |
 | `info` | EID, backend, device-key fingerprint, enabled ICCID, binding, counter and the configured eIMs, as one JSON line. |
-| `reset` | Deletes `device.key`, every `*.state` and the `bind.*` markers in the state directory. No card is needed. `ipad -h` does not list it. |
+| `reset <EID>` / `reset all` | `<EID>` (32 hex digits) deletes that card's `<EID>.state` only; the device key and the `bind.*` markers stay, since every card in the directory shares them. `all` deletes `device.key`, every `*.state` and the `bind.*` markers. Without either it is refused (exit 2). No card is needed. `ipad -h` does not list it. |
 
 | Option | Meaning |
 |---|---|
@@ -191,7 +191,7 @@ flowchart TD
     A -->|bundle| D["next ipad poll binds itself:<br/>POST /ipad/v1/bind"]
     D --> E{"eIM answer"}
     E -->|"204 / 409"| F["bound, polling continues"]
-    E -->|"403"| G["refused: exit 4,<br/>no polling until a new bundle<br/>or ipad reset"]
+    E -->|"403"| G["refused: exit 4,<br/>no polling until a new bundle<br/>or ipad reset all"]
     E -->|"429 / 5xx / none"| H["retried on the next poll<br/>(Retry-After honoured)"]
     E -->|"400 / 413"| I["error, binding stays pending"]
 ```
@@ -269,7 +269,7 @@ would be refused as well:
 
 ```sh
 eimctl euicc show <EID>                                   # eIM: note its counter N
-ipad -s /etc/wwand/ipa reset                              # device: key, state, binding gone
+ipad -s /etc/wwand/ipa reset all                          # device: key, every state, binding gone
 eimctl eim-config cfg.der --fqdn eim.example.com --counter <N+1>   # eIM
 ipad -s /etc/wwand/ipa provision cfg.der                  # device
 ipad -s /etc/wwand/ipa export device.json                 # device
@@ -277,8 +277,8 @@ eimctl euicc import device.json --replace-key             # eIM — before any p
 ipad -s /etc/wwand/ipa poll                               # device: first package N+2
 ```
 
-`reset` clears the whole state directory, so on a router with several cards
-every card loses its state.
+`reset all` clears the whole state directory, so on a router with several
+cards every card loses its state and needs the same re-keying.
 
 ## Troubleshooting
 
@@ -289,8 +289,8 @@ every card loses its state.
 | "no EID: the card does not answer the ISD-R" | the host could not open the ISD-R channel: no eUICC in the slot, or the wrong slot |
 | "eIM answered HTTP … without the expected …" | wrong URL (`-u`), a proxy, or an eIM that does not speak the ASN.1 binding |
 | TLS failure | the eIM's certificate does not chain to the configured anchor or the CA bundle. `info` shows the `tls` source |
-| "not binding: the emulation's counter … is not the bundle's …" | the emulation's counter moved away from the bundle's start counter (another configuration was provisioned). `reset` and provision the bundle again, or ask for a new one |
-| exit 4, "the eIM refused the binding (403)" | the issuance is unknown, used or expired, or the proof or counter is wrong. Ask the eIM operator, then provision a new bundle (or `reset`) |
+| "not binding: the emulation's counter … is not the bundle's …" | the emulation's counter moved away from the bundle's start counter (another configuration was provisioned). `reset <EID>` and provision the bundle again, or ask for a new one |
+| exit 4, "the eIM refused the binding (403)" | the issuance is unknown, used or expired, or the proof or counter is wrong. Ask the eIM operator, then provision a new bundle (or `reset all`: the refusal belongs to the binding, which is the directory's) |
 | "binding deferred … (Retry-After)" | the eIM rate-limited the binding. ipad waits as asked, at most a day |
 | results never acknowledged | the eIM cannot verify them: the device key is not imported or was replaced. Compare `info`'s `key_fingerprint` with `eimctl euicc show <EID>` |
 | "AddInitialEim refused: 2" | the card already has an eIM. Only the eIM can change that (`addEim`, `updateEim`, `deleteEim`) |

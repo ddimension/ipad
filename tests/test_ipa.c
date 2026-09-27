@@ -250,8 +250,11 @@ typedef struct {
 	int nchanged;
 	bool online;
 	fake22 *card;
+	simcard *sc;   /* reset on every profile change, as the host does */
 	int download_rc, downloads;
 	char ac[128];
+	int notify_rc, notifies;   /* ES9+ HandleNotification through the host */
+	int64_t notify_seq;
 	int nconn;
 	char conn_iccid[21];
 	bool conn_params, conn_emulated;
@@ -264,6 +267,10 @@ static bool on_changed(void *ud, const char *iccid)
 
 	if (h->nchanged < 4)
 		snprintf(h->changed[h->nchanged++], 21, "%s", iccid);
+	/* wwand applies a switch with a SIM reset (sim.power_cycle), which
+	 * closes the ISD-R channel the assistant had open */
+	if (h->sc)
+		simcard_reset(h->sc);
 	return h->online;
 }
 
@@ -279,6 +286,34 @@ static int on_download(void *ud, const char *ac, const char *cc)
 		fake22_add_pir(h->card, "98001032547698103254");
 	}
 	return h->download_rc;
+}
+
+/* lpac `notification process -r <seq>`: to the SM-DP+, and off the card
+ * once it acknowledged */
+static int on_notify(void *ud, int64_t seq)
+{
+	host *h = ud;
+	fake22 *f = h->card;
+	int i;
+
+	h->notifies++;
+	h->notify_seq = seq;
+	if (h->notify_rc != 0)
+		return h->notify_rc;
+	for (i = 0; i < f->nnotes && f->note_seq[i] != seq; i++)
+		;
+	if (i == f->nnotes)
+		return -1;   /* lpac: seqNumber not found */
+	db_free(&f->notes[i]);
+	memmove(&f->notes[i], &f->notes[i + 1], (size_t)(f->nnotes - i - 1) * sizeof(f->notes[0]));
+	memmove(&f->note_seq[i], &f->note_seq[i + 1], (size_t)(f->nnotes - i - 1) * sizeof(f->note_seq[0]));
+	f->nnotes--;
+	return 0;
+}
+
+static bool file_exists(const char *p)
+{
+	return access(p, F_OK) == 0;
 }
 
 static void on_conn(void *ud, const char *iccid, const conn_params *p, bool emulated)
@@ -400,6 +435,7 @@ int main(void)
 	memset(&h, 0, sizeof(h));
 	h.online = true;
 	h.card = &fc;
+	h.sc = &s;
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.eu = &eu;
 	cfg.state_change_cause = -1;
@@ -430,7 +466,7 @@ int main(void)
 	/* --- no eIM yet: nothing to poll --- */
 	OK(ipa_open(&cfg) == NULL, "open: refused without an eIM configured");
 
-	/* --- provisioning (AddInitialEim 5.9.17) --- */
+	/* --- provisioning (AddInitialEim 5.9.4) --- */
 	db_init(&b);
 	eimpkg_cfg_ex(&b, EIM, "eim.test.example:8443", 4, eim_key, false, tls_key);
 	OK(ipa_add_initial_eim(&eu, b.d, b.len, err, sizeof(err)) == 0, "provision: accepted");
@@ -501,6 +537,7 @@ int main(void)
 	OK(h.nchanged == 2 && !strcmp(h.changed[0], "89000123456789012343") &&
 	   !strcmp(h.changed[1], "89000123456789012342"), "rollback: host sees C, then B again");
 	OK(fake22_enabled(&fc) == 1, "rollback: B is enabled again");
+	OK(s.stale == 0, "rollback: nothing sent on the channel the SIM reset closed");
 	OK(sum.rolled_back, "rollback: reported");
 	OK(count_got(&eim, mark, 0xBF50) == 1, "rollback: exactly one result goes out");
 	m = last_got(&eim, 0xBF50);
@@ -696,6 +733,98 @@ int main(void)
 	OK(ipa_connectivity(a) == 0 && h.nconn == 1, "connectivity: host called");
 	OK(!strcmp(h.conn_iccid, "89000123456789012343") && !h.conn_params && h.conn_emulated,
 	   "connectivity: enabled ICCID, no parameters, emulated");
+
+	/* --- a direct download's PIR goes to the SM-DP+ over ES9+ through the
+	 * host (3.2.3.1 step 14, 3.7 [2a]); only the trigger result goes to
+	 * the eIM (step 13). A second IPA on the same card, with the hook. --- */
+	{
+		char es9[] = "/tmp/ipad-test-es9-XXXXXX";
+		ipa_config c2 = cfg;
+		ipa *b2;
+		dbuf q;
+		size_t k, l;
+		uint8_t tx[16];
+		int64_t owed;
+		FILE *f;
+
+		close(mkstemp(es9));
+		unlink(es9);
+		c2.host.notify = on_notify;
+		c2.es9_path = es9;
+		b2 = ipa_open(&c2);
+		OK(b2 != NULL, "es9: second IPA open");
+		while (fc.nnotes)   /* start from an empty notification list */
+			OK(on_notify(&h, fc.note_seq[0]) == 0, "es9: list cleared");
+		h.notifies = 0;
+
+		memset(tx, 0x66, sizeof(tx));
+		db_init(&q);
+		k = der_begin(&q, 0xBF54);
+		l = der_begin(&q, 0xA0);
+		der_put_str(&q, 0x80, "1$smdp.test.example$MATCH");
+		der_end(&q, l);
+		der_put(&q, 0x82, tx, 16);
+		der_end(&q, k);
+
+		/* the host delivers it */
+		queue(&eim, &q);
+		mark = eim.ngot;
+		ipa_poll(b2, &sum);
+		OK(h.notifies == 1 && fc.nnotes == 0, "es9: the PIR delivered through the host and off the card");
+		OK(count_got(&eim, mark, 0xBF3D) == 1 && last_result_notification(&eim, mark, &x) &&
+		   der_find(x.val, x.len, 0xBF54, &y) == 0 && der_find(y.val, y.len, 0xBF37, &x) == 0,
+		   "es9: the eIM gets the trigger result with the PIR, and the PIR no second time");
+		OK(!file_exists(es9), "es9: nothing owed afterwards");
+
+		/* the host fails: the PIR stays owed to ES9+ and is NOT handed to
+		 * the eIM alone, which would drop it */
+		h.notify_rc = -1;
+		queue(&eim, &q);
+		mark = eim.ngot;
+		ipa_poll(b2, &sum);
+		owed = h.notify_seq;
+		OK(h.notifies == 3 && fc.nnotes == 1 && fc.note_seq[0] == owed,
+		   "es9: failed at the download and at the poll's end, the PIR kept on the card");
+		OK(count_got(&eim, mark, 0xBF3D) == 1, "es9: still only the trigger result went to the eIM");
+		f = fopen(es9, "r");
+		OK(f && fscanf(f, "%lld", (long long *)&owed) == 1 && owed == h.notify_seq, "es9: recorded in the file");
+		if (f)
+			fclose(f);
+
+		/* the next run (a fresh IPA reads the record) delivers it */
+		ipa_close(b2);
+		b2 = ipa_open(&c2);
+		h.notify_rc = 0;
+		mark = eim.ngot;
+		OK(ipa_deliver_notifications(b2) == 1 && h.notifies == 4 && h.notify_seq == owed && fc.nnotes == 0,
+		   "es9: the next run delivers it over ES9+");
+		OK(count_got(&eim, mark, 0xBF3D) == 0 && !file_exists(es9), "es9: not to the eIM, record cleared");
+
+		/* a record whose PIR is gone from the card is dropped */
+		f = fopen(es9, "w");
+		fprintf(f, "999\n");
+		fclose(f);
+		ipa_close(b2);
+		b2 = ipa_open(&c2);
+		ipa_deliver_notifications(b2);
+		OK(!file_exists(es9) && h.notifies == 4, "es9: a stale record dropped, nothing sent for it");
+
+		/* no ES9+ route (host without -D): nothing is held back, the PIR
+		 * goes to the eIM as before */
+		ipa_close(b2);
+		owed = fake22_add_pir(&fc, "98001032547698103284");
+		f = fopen(es9, "w");
+		fprintf(f, "%lld\n", (long long)owed);
+		fclose(f);
+		c2.host.notify = NULL;
+		b2 = ipa_open(&c2);
+		mark = eim.ngot;
+		OK(ipa_deliver_notifications(b2) == 1 && count_got(&eim, mark, 0xBF3D) == 1 && fc.nnotes == 0,
+		   "es9: without the hook the PIR goes to the eIM, never held");
+		ipa_close(b2);
+		unlink(es9);
+		db_free(&q);
+	}
 
 	/* --- the eIM unreachable: the poll says so --- */
 	eim.offline = true;

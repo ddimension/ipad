@@ -19,6 +19,10 @@ struct simcard {
 	size_t chunk;         /* GET RESPONSE portion size (<= 256) */
 	/* observed */
 	int opens, closes, blocks, bad_cla, bad_seq;
+	/* a SIM reset (what the host does to apply a profile switch) closes
+	 * every logical channel: until the next open, an APDU is answered
+	 * 6881, logical channel not supported (ISO/IEC 7816-4 5.4.1) */
+	int dead, stale;      /* channel gone; APDUs sent on it anyway */
 	dbuf req, pending;
 	int expect_block;
 };
@@ -26,4 +30,5 @@ struct simcard {
 extern const card_ops SIMCARD_OPS;
 void simcard_init(simcard *s, int channel, sim_handler h, void *user);
 void simcard_free(simcard *s);
+void simcard_reset(simcard *s);
 #endif

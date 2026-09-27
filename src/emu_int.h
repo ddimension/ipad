@@ -38,7 +38,8 @@ struct emu {
 	int neprs;
 
 	/* Profile Rollback (sections 3.3.2, 5.9.16): granted by an enable with
-	 * rollbackFlag, reset by the next eUICC Package */
+	 * rollbackFlag that the card carried out, reset by the next eUICC
+	 * Package */
 	bool rb_granted;
 	uint8_t rb_iccid[10];            /* the profile to go back to */
 	char rb_eim[129];
@@ -47,7 +48,7 @@ struct emu {
 	size_t rb_txid_len;
 	int64_t rb_epr_seq;              /* the EPR a successful rollback discards (3.3.2 NOTE1) */
 
-	/* Fallback (sections 3.4.6, 3.4.7, 5.9.21, 5.9.22) */
+	/* Fallback (sections 3.4.6, 3.4.7, 5.9.20, 5.9.21) */
 	bool fb_set;
 	uint8_t fb_iccid[10];
 	bool fb_active;

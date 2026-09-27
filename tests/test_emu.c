@@ -58,6 +58,242 @@ static der_tlv results_of(const der_tlv *data)
 	return r;
 }
 
+/* --- the card's real answers (two-phase LoadEuiccPackage) ------------------- */
+
+typedef struct {
+	fake22 f;
+	simcard s;
+	card c;
+	emu_config cfg;
+	emu *e;
+	char state[64];
+	char snap[80];      /* the state file as it was when the card was about to change */
+	int snaps;
+	int64_t counter;
+} rig;
+
+static void snapshot(void *arg)
+{
+	rig *r = arg;
+	char cmd[200];
+
+	snprintf(cmd, sizeof(cmd), "cp '%s' '%s' 2>/dev/null", r->state, r->snap);
+	r->snaps += system(cmd) == 0;
+}
+
+/* a card with profiles A (enabled) and nmore disabled ones, an emulation with
+ * the test eIM configured at counter 4 */
+static int rig_open(rig *r, int nmore)
+{
+	int fd, i;
+	dbuf req, resp;
+	size_t m, l;
+
+	memset(r, 0, sizeof(*r));
+	snprintf(r->state, sizeof(r->state), "/tmp/ipad-test-emu2-XXXXXX");
+	fd = mkstemp(r->state);
+	close(fd);
+	unlink(r->state);
+	snprintf(r->snap, sizeof(r->snap), "%s.snap", r->state);
+
+	fake22_init(&r->f);
+	fake22_add(&r->f, "98001032547698103214", 1);
+	for (i = 0; i < nmore; i++) {
+		char ic[32];
+
+		/* B = ...3224, C = ...3234, as in main() */
+		snprintf(ic, sizeof(ic), "98001032547698103%d%d4", 2 + (i + 2) / 10, (i + 2) % 10);
+		fake22_add(&r->f, ic, 0);
+	}
+	simcard_init(&r->s, 2, fake22_handler, &r->f);
+	card_init(&r->c, &SIMCARD_OPS, &r->s);
+	r->cfg.state_path = r->state;
+	r->cfg.key = dev_key;
+	if (!(r->e = emu_open(&r->c, &r->cfg)))
+		return -1;
+
+	db_init(&req);
+	db_init(&resp);
+	m = der_begin(&req, 0xBF57);
+	l = der_begin(&req, 0xA0);
+	eimpkg_cfg(&req, EIM, 4, eim_key, false);
+	der_end(&req, l);
+	der_end(&req, m);
+	i = emu_es10(r->e, req.d, req.len, &resp);
+	db_free(&req);
+	db_free(&resp);
+	r->counter = 4;
+	return i;
+}
+
+static void rig_close(rig *r)
+{
+	emu_close(r->e);
+	simcard_free(&r->s);
+	fake22_free(&r->f);
+	unlink(r->state);
+	unlink(r->snap);
+}
+
+/* run a psmoList at the next counter; the results SEQUENCE of the signed
+ * EPR in *res (its bytes in resp), false when the answer is no signed EPR */
+static bool rig_run(rig *r, const dbuf *ops, dbuf *resp, der_tlv *res)
+{
+	dbuf req;
+	der_tlv data;
+	bool ok = false;
+
+	db_init(&req);
+	resp->len = 0;
+	eimpkg_package(&req, EIM, EID, ++r->counter, 0xA0, ops, eim_key, 0, false);
+	if (emu_es10(r->e, req.d, req.len, resp) == 0 && epr_kind(resp, &ok, &data) == 0xA0 && ok)
+		*res = results_of(&data);
+	else
+		ok = false;
+	db_free(&req);
+	return ok;
+}
+
+static int64_t rollback_code(rig *r)
+{
+	uint8_t rb[] = { 0xBF, 0x58, 0x03, 0x80, 0x01, 0x00 };
+	dbuf resp;
+	der_tlv t;
+	int64_t v = -999;
+
+	db_init(&resp);
+	if (emu_es10(r->e, rb, sizeof(rb), &resp) == 0 && der_parse(resp.d, resp.len, &t) == 0)
+		v = int_in(&t, 0x02);
+	db_free(&resp);
+	return v;
+}
+
+static void test_card_outcomes(void)
+{
+	rig r;
+	dbuf ops, resp;
+	der_tlv res;
+	int i;
+
+	db_init(&ops);
+	db_init(&resp);
+
+	/* a refused enable: the card's disallowedByPolicy(3) is the result, not
+	 * ok; nothing changed, and no rollback is granted for it */
+	OK(rig_open(&r, 2) == 0, "outcome: rig");
+	r.f.refuse_enable = 3;
+	eimpkg_op(&ops, 0xA3, "98001032547698103224", true);
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x83) == 3,
+	   "outcome: a refused enable is the card's disallowedByPolicy(3), signed");
+	OK(fake22_enabled(&r.f) == 0, "outcome: A still enabled on the card");
+	OK(rollback_code(&r) == 1, "outcome: no rollback granted for a refused enable (rollbackNotAllowed)");
+
+	/* the refusal stops the list (3.3.1 step 5): the delete after it is not run */
+	ops.len = 0;
+	eimpkg_op(&ops, 0xA3, "98001032547698103224", false);
+	eimpkg_op(&ops, 0xA5, "98001032547698103234", false);
+	r.f.deletes = 0;
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x83) == 3 && int_in(&res, 0x85) == -999 &&
+	   r.f.deletes == 0, "outcome: a refused enable stops the list");
+
+	/* SGP.22's wrongProfileReenabling(4) has no number in SGP.32's
+	 * EnableProfileResult: undefinedError */
+	r.f.refuse_enable = 4;
+	ops.len = 0;
+	eimpkg_op(&ops, 0xA3, "98001032547698103224", false);
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x83) == 127,
+	   "outcome: wrongProfileReenabling(4) becomes undefinedError(127)");
+	r.f.refuse_enable = 0;
+
+	/* a refused disable: catBusy(5) exists in DisableProfileResult */
+	r.f.refuse_disable = 5;
+	ops.len = 0;
+	eimpkg_op(&ops, 0xA4, "98001032547698103214", false);
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x84) == 5 && fake22_enabled(&r.f) == 0,
+	   "outcome: a refused disable is the card's catBusy(5), A stays enabled");
+	r.f.refuse_disable = 0;
+
+	/* a refused delete: disallowedByPolicy(3) passes, catBusy(5) is not a
+	 * DeleteProfileResult and becomes undefinedError */
+	r.f.refuse_delete = 3;
+	ops.len = 0;
+	eimpkg_op(&ops, 0xA5, "98001032547698103234", false);
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x85) == 3 && r.f.p[2].present,
+	   "outcome: a refused delete is the card's disallowedByPolicy(3), the profile stays");
+	r.f.refuse_delete = 5;
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x85) == 127,
+	   "outcome: catBusy(5) on a delete becomes undefinedError(127)");
+	r.f.refuse_delete = 0;
+
+	/* disable A, then enable B with rollbackFlag: A is the profile "marked
+	 * to be disabled" (3.4.1 step 2), so the rollback goes back to A */
+	ops.len = 0;
+	eimpkg_op(&ops, 0xA4, "98001032547698103214", false);
+	eimpkg_op(&ops, 0xA3, "98001032547698103224", true);
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x84) == 0 && int_in(&res, 0x83) == 0 &&
+	   fake22_enabled(&r.f) == 1, "outcome: disable A, enable B with rollback: both ok, B enabled");
+	OK(rollback_code(&r) == 0 && fake22_enabled(&r.f) == 0,
+	   "outcome: the rollback returns to A, disabled earlier in the same package");
+
+	/* the counter is durable BEFORE the card changes: the state file as it
+	 * stands when the card is about to act already has the package's
+	 * counter, so a crash there cannot let the package run again */
+	r.f.before_change = snapshot;
+	r.f.before_arg = &r;
+	ops.len = 0;
+	eimpkg_op(&ops, 0xA3, "98001032547698103224", false);
+	OK(rig_run(&r, &ops, &resp, &res) && int_in(&res, 0x83) == 0 && r.snaps == 1,
+	   "crash window: the card was switched once");
+	r.f.before_change = NULL;
+	{
+		emu_config sc = r.cfg;
+		emu *e2;
+		int64_t cnt = -1, tok;
+		bool has;
+
+		sc.state_path = r.snap;
+		e2 = emu_open(&r.c, &sc);
+		OK(e2 && emu_eim_state(e2, EIM, &cnt, &has, &tok) == 0 && cnt == r.counter,
+		   "crash window: the package's counter was saved before the card was switched");
+		emu_close(e2);
+	}
+	rig_close(&r);
+
+	/* more deletes than the old fixed capacity of 8: every one is carried
+	 * out and answered with the card's result, none is an ok for nothing */
+	OK(rig_open(&r, 10) == 0, "deletes: rig with 10 disabled profiles");
+	ops.len = 0;
+	for (i = 1; i <= 10; i++) {
+		char ic[21];
+
+		hex_encode(r.f.p[i].iccid, 10, ic);
+		eimpkg_op(&ops, 0xA5, ic, false);
+	}
+	OK(rig_run(&r, &ops, &resp, &res), "deletes: answered");
+	{
+		const uint8_t *p = res.val, *end = res.val + res.len;
+		der_tlv x;
+		int n = 0, oks = 0;
+
+		while (p < end && der_next(&p, end, &x) == 0) {
+			int64_t v = -1;
+
+			n++;
+			if (x.tag == 0x85 && der_get_int(&x, &v) == 0 && v == 0)
+				oks++;
+		}
+		OK(n == 10 && oks == 10, "deletes: ten deleteResult ok");
+	}
+	for (i = 1; i <= 10; i++)
+		if (r.f.p[i].present)
+			break;
+	OK(i == 11 && r.f.deletes == 10, "deletes: all ten gone from the card");
+	rig_close(&r);
+
+	db_free(&ops);
+	db_free(&resp);
+}
+
 int main(void)
 {
 	char state[] = "/tmp/ipad-test-emu-XXXXXX";
@@ -346,6 +582,7 @@ int main(void)
 	OK(euicc_probe(&c) == EUICC_EMU, "probe: an SGP.22 card is driven through the emulation");
 
 	unlink(state);
+	test_card_outcomes();
 	db_free(&req);
 	db_free(&resp);
 	db_free(&ops);

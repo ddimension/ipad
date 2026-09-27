@@ -31,6 +31,14 @@ typedef struct {
 	 * reports it. cc may be NULL. 0 on success. NULL: direct download is
 	 * not offered in the IPA capabilities. */
 	int (*download)(void *ud, const char *activation_code, const char *cc);
+	/* ES9+.HandleNotification (SGP.22 5.6.4) of the pending Notification
+	 * `seq` through the same ES9+ client, which removes it from the card
+	 * once the SM-DP+ acknowledged it (SGP.22 3.1.3.3 steps 7 and 11). Used
+	 * for the PIR of a direct download: SGP.32 3.2.3.1 step 14 and 3.7 [2a]
+	 * put its delivery to the SM-DP+ on the IPA, and the eIM forwards only
+	 * PIRs of indirect sessions (5.7.4). 0 once delivered. NULL: every
+	 * Notification goes to the eIM (3.7 [2b]), as without direct download. */
+	int (*notify)(void *ud, int64_t seq);
 	/* GetConnectivityParameters of the enabled profile (5.9.24): p NULL when
 	 * the card has none; emulated says why (an SGP.22 card never has any). */
 	void (*connectivity)(void *ud, const char *iccid, const conn_params *p, bool emulated);
@@ -54,6 +62,11 @@ typedef struct {
 	uint8_t rplmn[3];
 	bool has_rplmn;
 	ipa_host host;
+	/* seqNumbers of direct-download PIRs still owed to their SM-DP+, one
+	 * decimal per line, so a failed ES9+ delivery is retried over ES9+ and
+	 * not handed to the eIM, which would drop it. NULL: kept for this run
+	 * only. */
+	const char *es9_path;
 	ipa_transport transport;   /* NULL: HTTPS */
 	void *transport_ud;
 } ipa_config;
@@ -76,13 +89,14 @@ typedef struct {
 int ipa_poll(ipa *a, ipa_summary *sum);
 
 /* 3.7 on its own: every pending Notification over ESipa.HandleNotification,
- * removed from the card once the eIM took it. Returns how many went out. */
+ * removed from the card once the eIM took it; a direct download's PIR (see
+ * es9_path) over ES9+ through the host instead. Returns how many went out. */
 int ipa_deliver_notifications(ipa *a);
 
 /* Hands the enabled profile's connectivity parameters to the host. */
 int ipa_connectivity(ipa *a);
 
-/* AddInitialEim (5.9.17) from an EimConfigurationData (30 ...), a whole
+/* AddInitialEim (5.9.4) from an EimConfigurationData (30 ...), a whole
  * AddInitialEimRequest (BF57 ...) or a GetEimConfigurationDataResponse
  * (BF55 ..., another IPA's export) */
 int ipa_add_initial_eim(euicc *eu, const uint8_t *cfg, size_t len, char *err, size_t errlen);

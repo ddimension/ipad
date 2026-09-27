@@ -249,8 +249,11 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 			return 0x6A80;
 		f->last_refresh = der_find(t.val, t.len, 0x81, &x) == 0 && x.len == 1 && x.val[0];
 		k = find(f, y.val);
+		if (f->before_change)
+			f->before_change(f->before_arg);
 		if (t.tag == 0xBF31) {
 			f->enables++;
+			if (f->refuse_enable) { result(r, 0xBF31, f->refuse_enable); return 0x9000; }
 			if (k < 0) { result(r, 0xBF31, 1); return 0x9000; }
 			if (f->p[k].enabled) { result(r, 0xBF31, 2); return 0x9000; }
 			for (i = 0; i < f->np; i++)
@@ -259,6 +262,7 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 			result(r, 0xBF31, 0);
 		} else {
 			f->disables++;
+			if (f->refuse_disable) { result(r, 0xBF32, f->refuse_disable); return 0x9000; }
 			if (k < 0) { result(r, 0xBF32, 1); return 0x9000; }
 			if (!f->p[k].enabled) { result(r, 0xBF32, 2); return 0x9000; }
 			f->p[k].enabled = 0;
@@ -271,6 +275,9 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 		if (der_find(t.val, t.len, 0x5A, &y) < 0 || y.len != 10)
 			return 0x6A80;
 		k = find(f, y.val);
+		if (f->before_change)
+			f->before_change(f->before_arg);
+		if (f->refuse_delete) { result(r, 0xBF33, f->refuse_delete); return 0x9000; }
 		if (k < 0) { result(r, 0xBF33, 1); return 0x9000; }
 		if (f->p[k].enabled) { result(r, 0xBF33, 2); return 0x9000; }
 		f->p[k].present = 0;

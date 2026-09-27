@@ -40,8 +40,8 @@ Section numbers are SGP.32 v1.3.
 | Profile Rollback (3.3.2) | when the connection does not come back after a profile change, the rollback's result replaces the package's |
 | IPA/eUICC data (2.11.1.2) | every tag in the tag list, search criteria, `incorrectTagList` |
 | Indirect download (3.2.3.2) | through the eIM, BPP loaded in the SGP.22 segments, CancelSession (3.2.3.3) |
-| Direct download (3.2.3.1) | the host's ES9+ client (lpac) downloads; ipad reports the PIR as `ProfileDownloadTriggerResult` |
-| Notifications (3.7) | delivered through `ESipa.HandleNotification`, removed once the eIM has them |
+| Direct download (3.2.3.1) | the host's ES9+ client (lpac) downloads; ipad reports the PIR as `ProfileDownloadTriggerResult` (step 13), then has the host send it to the SM-DP+ over ES9+ (step 14), retried on later runs until the SM-DP+ has it |
+| Notifications (3.7) | delivered through `ESipa.HandleNotification`, removed once the eIM has them; a direct download's PIR over ES9+ through the host (3.7 [2a]) |
 | Connectivity parameters (5.9.24) | APN, PDP type and credentials of the enabled profile, handed to the host. An emulated SGP.22 card has none. |
 | Transport (6.1.1) | HTTPS with the ASN.1 binding. The trust anchor comes from the eIM configuration (`trustedPublicKeyDataTls`: a pinned key, the eIM's certificate or its CA), otherwise the system CAs; an anchor that cannot be used is logged. SNI carries host names only (no IP literals, no trailing dot, RFC 6066 3). The response reader is strict about framing (RFC 9112: chunked as the final coding, no Content-Length beside it) and stops where the framing ends, even when a load balancer keeps the connection open. An IP-literal URL (`https://[::1]/…`) needs an iPAddress SAN; hosts like `127.1` or `0x7f.1` are refused. |
 
@@ -51,15 +51,15 @@ eIM's own ASN.1 types and re-encoded byte-identically (`tools/esipa-check.sh`).
 ## Usage
 
 The card is reached through the host over stdin/stdout (`src/host.h`):
-APDUs in lpac's stdio protocol, plus three events that only the host can
-handle (`profile_changed`, `download`, `connectivity`) and two that tell it
+APDUs in lpac's stdio protocol, plus four events that only the host can
+handle (`profile_changed`, `download`, `notify`, `connectivity`) and two that tell it
 what ipad did: `info` at the start of a run and for `info` (EID, backend,
 device key, and for an emulated card the binding and the counter), and
 `summary` at the end of `poll` and `provision` (exit code, packages,
 acknowledged results, binding, and the last error when the run failed).
 
 ```
-ipad [options] poll | provision <file> | export <file> | connectivity | notify | info | reset
+ipad [options] poll | provision <file> | export <file> | connectivity | notify | info | reset <EID>|all
 ```
 
 - `provision` stores the eIM configuration. It takes the file `eimctl
@@ -81,8 +81,11 @@ ipad [options] poll | provision <file> | export <file> | connectivity | notify |
   - The binding is sent only while the emulation's counter is the bundle's
     start counter, which the eIM requires; the file is the one `export`
     writes, for the eIM the IPA polls.
-- `reset` forgets the emulation's eIM configuration, state, device key and
-  binding (no card needed); a new bundle starts from nothing.
+- `reset <EID>` forgets that card's eIM configuration and state; the device
+  key and the binding stay, because every card in the state directory shares
+  them. `reset all` forgets every card's, the device key and the binding, so
+  a new bundle or a re-key starts from nothing. A bare `reset` is refused.
+  No card is needed.
 - `export` writes the `eim-euicc-import/1` file for the eIM
   (`eimctl euicc import`).
 - `poll` runs everything the eIM has queued.
@@ -103,7 +106,7 @@ leave the eIM's counter at N+1, above the file's:
 
 ```sh
 eimctl euicc show <EID>                        # eIM: its counter N
-ipad -s DIR reset                              # device: key, state, binding gone
+ipad -s DIR reset all                          # device: key, every state, binding gone
 eimctl eim-config cfg.der --fqdn … --counter <N+1>
 ipad -s DIR provision cfg.der
 ipad -s DIR export device.json
@@ -113,7 +116,7 @@ ipad -s DIR poll                               # the eIM's next package is N+2
 
 A lost `<EID>.state` with the key intact needs no re-key: provision a
 configuration at the eIM's counter N itself (the next package is N+1).
-`reset` clears the whole state directory — every card on the device. The
+`reset all` clears the whole state directory — every card on the device. The
 cases (key unreadable, key gone, state gone) are in
 [docs/howto.md](docs/howto.md#recover-from-a-lost-device-key).
 
