@@ -101,11 +101,18 @@ typedef struct {
  * cost a card that knows 9F67 its fallbackAllowed for good. */
 static bool taglist_refused(const card *c, int rc, const dbuf *resp)
 {
-	der_tlv t, x;
+	der_tlv t, x, ok;
+	int64_t v;
 
 	if (rc < 0)
 		return c->sw == 0x6A80;
-	return der_parse(resp->d, resp->len, &t) == 0 && t.tag == 0xBF2D && der_find(t.val, t.len, 0x81, &x) == 0;
+	/* The CHOICE holds one alternative: an answer carrying the list as
+	 * well is garbage, not a refusal, and so is an error value the ASN.1
+	 * does not name (ProfileInfoListError ::= INTEGER {
+	 * incorrectInputValues(1), undefinedError(127)}); garbage must not
+	 * set a quirk that lasts for good. */
+	return der_parse(resp->d, resp->len, &t) == 0 && t.tag == 0xBF2D && der_find(t.val, t.len, 0xA0, &ok) < 0 &&
+	       der_find(t.val, t.len, 0x81, &x) == 0 && der_get_int(&x, &v) == 0 && (v == 1 || v == 127);
 }
 
 /* GetProfilesInfo (SGP.22 5.7.15) as a parsed answer: 0 with *list set;

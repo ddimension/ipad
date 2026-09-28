@@ -174,7 +174,7 @@ last component. The wwand-ipa package keeps it across a sysupgrade
 | `<EID>.state` | The emulation's state for one card (32-digit EID in the name). | After every function that changes it: written to `<file>.tmp` with `fsync`, then renamed, so a crash leaves either the old state or the new one. |
 | `bind.pending`, `bind.done`, `bind.refused`, `bind.after` | Where the self-binding of a bundle stands (see [below](#b-a-provisioning-bundle-eim-decision-d-69)). | By `provision` and `poll`. |
 | `<EID>.es9` | The seqNumbers of direct-download PIRs not yet delivered to their SM-DP+ over ES9+ (see [The PIR of a direct download](#the-pir-of-a-direct-download)). Only with `-D`, for an IoT eUICC as well. | Before the trigger result goes out; removed once nothing is owed. |
-| `<EID>.nbo` | The notification backoff (see [Notifications](#notifications-and-profile-installation-results)), for an IoT eUICC as well. Text: a line `ipad-nbo/1 <eIM configurations fingerprint>`, then one line per refused notification, `<seqNumber> <due> <delay> <metadata fingerprint>` (seconds, 16 hex digits). A damaged file or line is no record, never an error. | After each refusal and each change; removed when no record is left. |
+| `<EID>.nbo` | The notification backoff (see [Notifications](#notifications-and-profile-installation-results)), for an IoT eUICC as well. Text: a line `ipad-nbo/1 <eIM configurations fingerprint>`, then one line per refused notification, `<seqNumber> <due> <delay> <metadata fingerprint>` (seconds, 16 hex digits). A damaged file or line is no record, never an error. | After each refusal and each change, mode 0600 whatever the umask, through `<file>.tmp` (a link there is not followed) with `fsync` and a rename; removed when no record is left. |
 
 The state file is DER (`emu_state.c`):
 
@@ -201,9 +201,10 @@ State ::= SEQUENCE {
 every run: bit 1, the `9F67` tag list of the profile check (see
 [`fallbackAllowed`](#what-an-sgp22-card-lacks-and-what-ipad-does-instead));
 bit 2, `9F7B`/`9F67` in a `listProfileInfo` tag list. Only a refusal of the
-tag list counts: a `profileInfoListError` (`BF2D 81 01 xx`) or the status
-word `6A80` (incorrect data), followed by an answer to the list without
-them. Any other failure (no answer, `6F00`, `6581`, `6985`, an answer that
+tag list counts: a `profileInfoListError` (`BF2D 81 01 xx`, with a value
+SGP.22 names, `incorrectInputValues(1)` or `undefinedError(127)`, and no
+list next to it) or the status word `6A80` (incorrect data), followed by an
+answer to the list without them. Any other failure (no answer, `6F00`, `6581`, `6985`, an answer that
 does not parse) can be a one-off: the list without them serves that call
 only, and the next asks with them again. Remembering a one-off would cost a
 card that knows `9F67` its `fallbackAllowed` for good.
@@ -679,7 +680,9 @@ What the code does:
   is held back (below) reads none of them: on router 245 the full list was
   about 28 KB of GET RESPONSE on every poll, for eleven notifications the
   eIM does not take. A notification gone between the listing and the read
-  is skipped; one the card does not give is kept for the next run. A card
+  (an empty list, or `notificationsListResultError`) is not sent and not
+  counted as refused: the next poll's listing decides; one the card does
+  not give otherwise (a status word) is kept for the next run. A card
   that does not answer `ListNotification` is read in full, as an IoT eUICC
   is.
 - An IoT eUICC has no `ListNotification` (SGP.32 v1.3 5.9 has only

@@ -414,6 +414,26 @@ static void test_fallback(void)
 	OK(!(r.e->quirks & EMU_Q_NO_9F67), "fallback: a card that did not answer is asked with 9F67 again");
 	rig_close(&r);
 
+	/* an answer only in the shape of a profileInfoListError is no refusal:
+	 * an empty 81, one next to the list, a value ProfileInfoListError does
+	 * not name; garbage must not set a quirk for good */
+	{
+		static const char *const what[] = {
+			"fallback, BF2D{81 00}: no quirk stored",
+			"fallback, BF2D{A0 81 01}: no quirk stored",
+			"fallback, BF2D{81 01 05}: no quirk stored",
+		};
+		int k;
+
+		for (k = 0; k < 3; k++) {
+			OK(rig_open(&r, 2) == 0, "fallback: rig, garbage refusal");
+			r.f.refuse_taglist = 4 + k;
+			set_fallback(&r, B);
+			OK(!(r.e->quirks & EMU_Q_NO_9F67) && r.f.taglist_refusals == 0, what[k]);
+			rig_close(&r);
+		}
+	}
+
 	/* any status word but 6A80 is no refusal either (a one-off 6F00, a
 	 * memory failure, conditions not satisfied): the default list serves
 	 * this call, nothing is remembered, the next run asks with 9F67 */

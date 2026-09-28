@@ -802,6 +802,15 @@ int main(void)
 		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 6 && fc.nnotes == 1 &&
 		   strstr(h.last_log, "not read from the card") != NULL, "list: one the card does not give is kept");
 		fc.fetch_sw = 0;
+		/* notificationsListResultError to the read by seqNumber (the
+		 * card removing it meanwhile): not sent, no refusal recorded,
+		 * the next poll decides */
+		fc.fetch_err = 1;
+		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 6 && fc.nnotes == 1 &&
+		   strstr(h.last_log, "left to the next poll") != NULL,
+		   "list: notificationsListResultError, not sent and left to the next poll");
+		fc.fetch_err = 0;
+		/* no backoff held it: sent at once on the next poll */
 		OK(ipa_deliver_notifications(a) == 1 && count_got(&eim, mark, 0xBF3D) == 7 && fc.nnotes == 0,
 		   "list: then sent in full, and removed");
 		m = last_got(&eim, 0xBF3D);

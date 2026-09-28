@@ -254,6 +254,21 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 				f->taglist_sw_n--;
 				return f->taglist_sw;
 			}
+			if (sgp32 && f->refuse_taglist >= 4) {
+				/* garbage that only looks like a refusal */
+				static const char *const junk[] = {
+					"\xBF\x2D\x02\x81\x00",                  /* 81 without a value */
+					"\xBF\x2D\x05\xA0\x00\x81\x01\x01",      /* both alternatives */
+					"\xBF\x2D\x03\x81\x01\x05",              /* no ProfileInfoListError */
+				};
+				static const size_t jl[] = { 5, 8, 6 };
+				int k = f->refuse_taglist - 4;
+
+				if (k > 2)
+					k = 2;
+				db_put(r, junk[k], jl[k]);
+				return 0x9000;
+			}
 			if ((sgp32 && f->refuse_taglist) || f->refuse_taglist == 3) {
 				f->taglist_refusals++;
 				if (f->refuse_taglist == 1)
@@ -365,6 +380,11 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 			f->retrieves_all++;
 		else if (f->fetch_sw)
 			return f->fetch_sw;
+		else if (f->fetch_err) {
+			/* notificationsListResultError undefinedError(127) */
+			db_put(r, "\xBF\x2B\x03\x81\x01\x7F", 6);
+			return 0x9000;
+		}
 		else if (f->hide_seq && want == f->hide_seq)
 			want = INT64_MAX;   /* matches none */
 		m = der_begin(r, 0xBF2B);

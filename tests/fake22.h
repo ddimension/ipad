@@ -26,7 +26,8 @@ typedef struct {
 	 * (9F26, 9F67, 9F7B) with an error status word, as one that does not
 	 * know them may; other unknown tags are just not returned. 2: with a
 	 * profileInfoListError incorrectInputValues instead, as a real consumer
-	 * card did; 3: that error to every tag list */
+	 * card did; 3: that error to every tag list; 4, 5, 6: garbage in the
+	 * shape of one (BF2D{81 00}, BF2D{A0 00 81 01 01}, BF2D{81 01 05}) */
 	int refuse_taglist;
 	int taglist_refusals;             /* how often it did */
 	/* a transient failure, no refusal: the next taglist_sw_n tag lists
@@ -52,9 +53,10 @@ typedef struct {
 	int no_list_notification;         /* ListNotification unknown (6D00) */
 	/* a retrieval by seqNumber: hide_seq answers an empty list for that
 	 * one (removed since it was listed); fetch_sw answers with that status
-	 * word; 0 for neither */
+	 * word; fetch_err answers notificationsListResultError; 0 for none */
 	int64_t hide_seq;
 	uint16_t fetch_sw;
+	int fetch_err;
 	int broken_tail;                  /* the full list's last entry cut short */
 
 	/* download: the BPP segments seen ("BF36 A0 A1 88 A3 86 ..."), the

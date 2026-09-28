@@ -302,7 +302,14 @@ static int remove_seq(ipa *a, int64_t seq)
 }
 
 /* RetrieveNotificationsList (5.9.11); criteria: the content of the
- * searchCriteria CHOICE (80 seq / 81 events / 82 EPRs), NULL for none */
+ * searchCriteria CHOICE (80 seq / 81 events / 82 EPRs), NULL for none.
+ *
+ * BF2B { A0 { 80 seq } } is the right encoding: RSPDefinitions (SGP.22
+ * annex H) and SGP32Definitions are AUTOMATIC TAGS, and searchCriteria is
+ * the request's only field without a tag of its own, so it gets [0]; a tag
+ * on a CHOICE is always EXPLICIT (X.680 31.2.7 c), so the [0] wraps the
+ * chosen alternative (seqNumber [0] INTEGER, '80') instead of replacing its
+ * tag. A bare BF2B { 80 seq } would be wrong. */
 static int retrieve(ipa *a, const uint8_t *crit, size_t clen, dbuf *resp, der_tlv *t)
 {
 	dbuf q;
@@ -469,21 +476,28 @@ static int list_notifications(ipa *a, dbuf *r, der_tlv *list)
 
 /* One notification by its seqNumber (RetrieveNotificationsList with
  * searchCriteria seqNumber, SGP.22 5.7.10) into *n: 0 found; 1 no longer on
- * the card (an empty list); -1 the card did not give it */
+ * the card (an empty list); 2 the card answered notificationsListResultError
+ * (SGP.22 names only undefinedError(127), and a card removing the
+ * notification since the listing may well answer that rather than an empty
+ * list); -1 the card did not give it */
 static int fetch_one(ipa *a, int64_t seq, dbuf *r, der_tlv *n)
 {
 	dbuf c;
-	der_tlv t, list;
+	der_tlv t, list, e;
 	int64_t s;
 	int rc = -1;
 
 	db_init(&c);
 	der_put_int(&c, 0x80, seq);
-	if (!c.err && retrieve(a, c.d, c.len, r, &t) == 0 && der_find(t.val, t.len, 0xA0, &list) == 0) {
-		if (!list.len)
-			rc = 1;
-		else if (der_parse(list.val, list.len, n) == 0 && notif_seq(n, &s) == 0 && s == seq)
-			rc = 0;
+	if (!c.err && retrieve(a, c.d, c.len, r, &t) == 0) {
+		if (der_find(t.val, t.len, 0xA0, &list) == 0) {
+			if (!list.len)
+				rc = 1;
+			else if (der_parse(list.val, list.len, n) == 0 && notif_seq(n, &s) == 0 && s == seq)
+				rc = 0;
+		} else if (der_find(t.val, t.len, 0x81, &e) == 0 && der_get_int(&e, &s) == 0) {
+			rc = 2;
+		}
 	}
 	db_free(&c);
 	return rc;
@@ -570,6 +584,16 @@ int ipa_deliver_notifications(ipa *a)
 			rc = fetch_one(a, seq, &one, &n);
 			if (rc == 1)
 				continue;   /* gone since the listing */
+			if (rc == 2) {
+				/* Gone or unreadable, for this poll only: not
+				 * sent, and no refusal recorded, as the eIM
+				 * never saw it; its records stay (seen), and
+				 * the next poll's ListNotification decides. */
+				say(a, LOG_INFO, "notification %lld listed but not given by the card, left to the next poll",
+				    (long long)seq);
+				SEEN(seq);
+				continue;
+			}
 			if (rc < 0) {
 				say(a, LOG_WARNING, "notification %lld not read from the card, kept", (long long)seq);
 				SEEN(seq);
