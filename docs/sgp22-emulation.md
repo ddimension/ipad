@@ -114,9 +114,11 @@ marked (*)) does not contain it, so a card that does store the flag reports
 it only when asked for it by name. The emulation therefore reads the card's
 profiles with the tag list `5C { 5A 9F70 9F67 }`. A card that answers that
 tag list with an error gets the default list (`BF2D 00`) instead, and the
-flag counts as absent there. Such a card is remembered (`quirks` in the
-state) and asked with the default list directly from then on: the query with
-`9F67` was refused on every run otherwise. Without `9F67 = TRUE`, `setFallbackAttribute`
+flag counts as absent there. A card that refused the tag list
+(`profileInfoListError` or `6A80`) is remembered (`quirks` in the state) and
+asked with the default list directly from then on: the query with `9F67` was
+refused on every run otherwise. Any other error falls back for that call
+only. Without `9F67 = TRUE`, `setFallbackAttribute`
 answers `fallbackNotAllowed` (2), unless ipad runs with `-F` ("every
 profile may be the fallback", explicitly *not* SGP.32). wwand-ipa never
 passes `-F`.
@@ -200,10 +202,13 @@ State ::= SEQUENCE {
 `quirks` remembers what the card refused, so that it is not asked again on
 every run: bit 1, the `9F67` tag list of the profile check (see
 [`fallbackAllowed`](#what-an-sgp22-card-lacks-and-what-ipad-does-instead));
-bit 2, `9F7B`/`9F67` in a `listProfileInfo` tag list. Only a refusal the card
-answered counts (an error status word or a `profileInfoListError`, followed
-by an answer to the list without them); a call that got no answer proves
-nothing. `backoff` is the notification backoff (see
+bit 2, `9F7B`/`9F67` in a `listProfileInfo` tag list. Only a refusal of the
+tag list counts: a `profileInfoListError` (`BF2D 81 01 xx`) or the status
+word `6A80` (incorrect data), followed by an answer to the list without
+them. Any other failure (no answer, `6F00`, `6581`, `6985`, an answer that
+does not parse) can be a one-off: the list without them serves that call
+only, and the next asks with them again. Remembering a one-off would cost a
+card that knows `9F67` its `fallbackAllowed` for good. `backoff` is the notification backoff (see
 [Notifications](#notifications-and-profile-installation-results)); `fp` is a
 fingerprint of the eIM configurations it was recorded under. A damaged
 `backoff` is dropped, not a reason to refuse the state. `ipad reset <EID>`
@@ -457,7 +462,7 @@ sit under ES10b).
 | PSMO `enable` (3.4.1) | `ES10c.EnableProfile` (`BF31`, SGP.22 5.7.16), `refreshFlag` FALSE. SGP.22 disables the enabled profile itself | if the card enabled it: clears the fallback reference, and with `rollbackFlag` records the previous profile, the enabled one or the one a `disable` earlier in the package switched off (`rollbackNotAvailable` if there is neither) |
 | PSMO `disable` (3.4.2) | `ES10c.DisableProfile` (`BF32`, SGP.22 5.7.17), `refreshFlag` FALSE; a `disable` after an `enable` in the same package is refused | none |
 | PSMO `delete` (3.4.3) | `ES10c.DeleteProfile` (`BF33`, SGP.22 5.7.18), each as it is reached, with no limit per package | refused for the rollback target (`rollbackNotAvailable`) and, while the Fallback Profile is enabled on the card, for the profile to return to from fallback (`returnFallbackProfile`) |
-| PSMO `listProfileInfo` (2.11.1.1.3) | `ES10c.GetProfilesInfo` with an explicit tag list: the eIM's, or without one SGP.32's default (`5A 4F 9F70 91 92 95 9F7B 9F26 9F67`, which differs from SGP.22's), always without `9F26` and always with `5A`. If the card refuses the list, with an error status word or a `profileInfoListError`, it is sent again without `9F7B 9F67`, and its answer to that is the result; a card that did so once is sent the list without them from then on (`quirks`). `searchCriteria` and `iotSpecificTagList` are passed on as sent | if the list asks for `9F26`, it is added as TRUE to the Fallback Profile, before `9F67`/`BF64` (DER order of ProfileInfo). A `5A` the eIM did not ask for is dropped again |
+| PSMO `listProfileInfo` (2.11.1.1.3) | `ES10c.GetProfilesInfo` with an explicit tag list: the eIM's, or without one SGP.32's default (`5A 4F 9F70 91 92 95 9F7B 9F26 9F67`, which differs from SGP.22's), always without `9F26` and always with `5A`. If the card refuses the list (a `profileInfoListError`, or `6A80`), or the call fails otherwise, it is sent again without `9F7B 9F67`, and its answer to that is the result; a card that refused once is sent the list without them from then on (`quirks`), a card that failed otherwise is not `searchCriteria` and `iotSpecificTagList` are passed on as sent | if the list asks for `9F26`, it is added as TRUE to the Fallback Profile, before `9F67`/`BF64` (DER order of ProfileInfo). A `5A` the eIM did not ask for is dropped again |
 | PSMO `getRAT` | `ES10b.GetRAT` (`BF43`, SGP.22 5.7.22) | none |
 | PSMO `configureImmediateEnable` (3.4.4) | none | immediate-enable flag, OID, address |
 | PSMO `setFallbackAttribute` / `unsetFallbackAttribute` (3.4.6, 3.4.7) | `GetProfilesInfo` with the tag list `5A 9F70 9F67` (for the checks, including whether the Fallback Profile is enabled; the default list if the card refuses it) | fallback record |

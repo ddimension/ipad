@@ -250,6 +250,10 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 				want9f67 |= tg == 0x9F67;
 				sgp32 |= tg == 0x9F26 || tg == 0x9F67 || tg == 0x9F7B;
 			}
+			if (sgp32 && f->taglist_sw_n > 0) {
+				f->taglist_sw_n--;
+				return f->taglist_sw;
+			}
 			if ((sgp32 && f->refuse_taglist) || f->refuse_taglist == 3) {
 				f->taglist_refusals++;
 				if (f->refuse_taglist == 1)

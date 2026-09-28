@@ -28,6 +28,11 @@ typedef struct {
 	 * card did; 3: that error to every tag list */
 	int refuse_taglist;
 	int taglist_refusals;             /* how often it did */
+	/* a transient failure, no refusal: the next taglist_sw_n tag lists
+	 * naming an SGP.32 tag are answered with the status word taglist_sw
+	 * (6F00, 6581, 6985) */
+	uint16_t taglist_sw;
+	int taglist_sw_n;
 	/* the tag list of the last GetProfilesInfo, and whether it had one */
 	uint8_t last_taglist[32];
 	size_t last_taglist_len;

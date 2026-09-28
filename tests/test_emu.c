@@ -414,6 +414,35 @@ static void test_fallback(void)
 	OK(!(r.e->quirks & EMU_Q_NO_9F67), "fallback: a card that did not answer is asked with 9F67 again");
 	rig_close(&r);
 
+	/* any status word but 6A80 is no refusal either (a one-off 6F00, a
+	 * memory failure, conditions not satisfied): the default list serves
+	 * this call, nothing is remembered, the next run asks with 9F67 */
+	{
+		static const uint16_t sws[] = { 0x6F00, 0x6581, 0x6985 };
+		static const uint8_t with_fb[] = { 0x5A, 0x9F, 0x70, 0x9F, 0x67 };
+		size_t k;
+		char what[96];
+
+		for (k = 0; k < sizeof(sws) / sizeof(sws[0]); k++) {
+			OK(rig_open(&r, 2) == 0, "fallback: rig, transient status word");
+			r.f.p[1].fallback_allowed = 1;
+			r.f.taglist_sw = sws[k];
+			r.f.taglist_sw_n = 1;
+			snprintf(what, sizeof(what), "fallback, %04X once: the default list serves this call", sws[k]);
+			OK(set_fallback(&r, B) == 2 && !r.f.last_had_taglist && r.f.taglist_sw_n == 0, what);
+			snprintf(what, sizeof(what), "fallback, %04X once: no quirk stored", sws[k]);
+			OK(!(r.e->quirks & EMU_Q_NO_9F67), what);
+			emu_close(r.e);
+			r.e = emu_open(&r.c, &r.cfg);
+			snprintf(what, sizeof(what), "fallback, %04X once: the next run asks with 9F67 again", sws[k]);
+			OK(r.e && !(r.e->quirks & EMU_Q_NO_9F67) && set_fallback(&r, B) == 0 && r.f.last_had_taglist,
+			   what);
+			EQ_HEX(r.f.last_taglist, r.f.last_taglist_len, with_fb, sizeof(with_fb),
+			       "fallback, transient: the tag list with 9F67");
+			rig_close(&r);
+		}
+	}
+
 	db_free(&ops);
 	db_free(&resp);
 }
@@ -603,6 +632,25 @@ static void test_list_profile_info(void)
 	r.e = emu_open(&r.c, &r.cfg);
 	OK(r.e && list_psmo(&r, none, sizeof(none), &resp, &lst) && r.f.taglist_refusals == refusals,
 	   "listProfileInfo, tags refused: not asked with them again, also after a restart");
+
+	/* a one-off 6F00 on the list with 9F7B / 9F67 is no refusal: asked
+	 * without them for this call, and with them again on the next */
+	rig_close(&r);
+	OK(rig_open(&r, 2) == 0, "listProfileInfo: rig, transient status word");
+	r.f.p[1].fallback_allowed = 1;
+	OK(set_fallback(&r, "98001032547698103224") == 0, "listProfileInfo, 6F00 once: B the fallback");
+	r.f.taglist_sw = 0x6F00;
+	r.f.taglist_sw_n = 1;
+	r.e->quirks |= EMU_Q_NO_9F67;   /* only the PSMO's list meets the 6F00 */
+	OK(list_psmo(&r, none, sizeof(none), &resp, &lst), "listProfileInfo, 6F00 once: answered without the tags");
+	EQ_HEX(r.f.last_taglist, r.f.last_taglist_len, dflt22, sizeof(dflt22),
+	       "listProfileInfo, 6F00 once: this call without 9F7B 9F67");
+	OK(!(r.e->quirks & EMU_Q_NO_IOT_TAGS), "listProfileInfo, 6F00 once: no quirk stored");
+	emu_close(r.e);
+	r.e = emu_open(&r.c, &r.cfg);
+	OK(r.e && list_psmo(&r, none, sizeof(none), &resp, &lst), "listProfileInfo, 6F00 once: next run answered");
+	EQ_HEX(r.f.last_taglist, r.f.last_taglist_len, dflt, sizeof(dflt),
+	       "listProfileInfo, 6F00 once: the next run asks with 9F7B 9F67 again");
 
 	/* refused with profileInfoListError instead of a status word (a consumer
 	 * card, for the eIM's list): asked again without 9F7B 9F67, never 9F26 */
