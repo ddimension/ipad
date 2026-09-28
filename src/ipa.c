@@ -34,6 +34,45 @@ struct ipa {
 
 #define DAP_URL_PATH "/gsma/rsp2/asn1"
 
+/* ESipa error codes by name (SGP32Definitions.asn; 5.14.1 Table 13a adds
+ * 50-52 to InitiateAuthentication). The code is what the eIM operator
+ * searches for; neither carries an activation code or MatchingID. */
+typedef struct { int v; const char *name; } code_name;
+
+static const code_name IA_ERR[] = {
+	{ 1, "invalidDpAddress" }, { 2, "euiccVersionNotSupportedByDp" }, { 3, "ciPKIdNotSupported" },
+	{ 50, "smdpAddressMismatch" }, { 51, "smdpOidMismatch" }, { 52, "invalidEimTransactionId" },
+	{ 127, "undefinedError" }, { 0, NULL }
+};
+static const code_name AC_ERR[] = {
+	{ 1, "eumCertificateInvalid" }, { 2, "eumCertificateExpired" }, { 3, "euiccCertificateInvalid" },
+	{ 4, "euiccCertificateExpired" }, { 5, "euiccSignatureInvalid" }, { 6, "matchingIdRefused" },
+	{ 7, "eidMismatch" }, { 8, "noEligibleProfile" }, { 9, "ciPKUnknown" }, { 10, "invalidTransactionId" },
+	{ 11, "insufficientMemory" }, { 18, "downloadOrderExpired" }, { 50, "pprNotAllowed" },
+	{ 56, "eventIdUnknown" }, { 127, "undefinedError" }, { 0, NULL }
+};
+static const code_name GBPP_ERR[] = {
+	{ 1, "euiccSignatureInvalid" }, { 2, "confirmationCodeMissing" }, { 3, "confirmationCodeRefused" },
+	{ 4, "confirmationCodeRetriesExceeded" }, { 5, "bppRebindingRefused" }, { 6, "deprecated" },
+	{ 50, "metadataMismatch" }, { 95, "invalidTransactionId" }, { 127, "undefinedError" }, { 0, NULL }
+};
+/* eimPackageError of GetEimPackage and provideEimPackageResultError */
+static const code_name PKG_ERR[] = {
+	{ 1, "noEimPackageAvailable" }, { 2, "eidNotFound" }, { 3, "invalidEid" }, { 4, "missingEid" },
+	{ 127, "undefinedError" }, { 0, NULL }
+};
+
+/* v < 0: the answer carried no code */
+static const char *code_of(const code_name *t, int64_t v)
+{
+	if (v < 0)
+		return "no code";
+	for (; t->name; t++)
+		if (t->v == v)
+			return t->name;
+	return "unknown";
+}
+
 static void say(const ipa *a, int lvl, const char *fmt, ...)
 {
 	char buf[256];
@@ -161,14 +200,14 @@ static int esipa(ipa *a, const dbuf *msg, int *status, dbuf *resp)
 }
 
 /* a request that expects an answer tagged `tag`; t is that answer's TLV */
-static int esipa_call(ipa *a, const dbuf *msg, uint32_t tag, dbuf *resp, der_tlv *t)
+static int esipa_call(ipa *a, const char *fn, const dbuf *msg, uint32_t tag, dbuf *resp, der_tlv *t)
 {
 	int status;
 
 	if (esipa(a, msg, &status, resp) < 0)
 		return -1;
 	if (status != 200 || der_parse(resp->d, resp->len, t) < 0 || t->tag != tag) {
-		say(a, LOG_WARNING, "eIM answered HTTP %d without the expected %X", status, (unsigned)tag);
+		say(a, LOG_WARNING, "%s: the eIM answered HTTP %d without the expected %X", fn, status, (unsigned)tag);
 		return -1;
 	}
 	return 0;
@@ -455,7 +494,7 @@ static int provide(ipa *a, const uint8_t *result, size_t len, bool as_notificati
 		goto out;
 	}
 
-	if (esipa_call(a, &msg, 0xBF50, &resp, &t) < 0) {
+	if (esipa_call(a, "ProvideEimPackageResult", &msg, 0xBF50, &resp, &t) < 0) {
 		n = -1;
 		goto out;
 	}
@@ -473,7 +512,8 @@ static int provide(ipa *a, const uint8_t *result, size_t len, bool as_notificati
 		int64_t e = 0;
 
 		der_get_int(&s, &e);
-		say(a, LOG_WARNING, "eIM refused the result: provideEimPackageResultError %lld", (long long)e);
+		say(a, LOG_WARNING, "eIM refused the result: provideEimPackageResultError %lld (%s)", (long long)e,
+		    code_of(PKG_ERR, e));
 	}
 out:
 	db_free(&msg);
@@ -766,7 +806,7 @@ static void cancel_session(ipa *a, const der_tlv *txid, int reason)
 		db_put(&msg, t.val, t.len);
 		der_end(&msg, k);
 		der_end(&msg, m);
-		if (esipa_call(a, &msg, 0xBF41, &resp, &t) < 0)
+		if (esipa_call(a, "CancelSession", &msg, 0xBF41, &resp, &t) < 0)
 			say(a, LOG_WARNING, "CancelSession not confirmed by the eIM");
 	}
 	db_free(&q);
@@ -859,10 +899,16 @@ static int indirect_download(ipa *a, const char *ac, const der_tlv *eim_txid)
 	if (eim_txid)
 		der_put(&msg, 0x82, eim_txid->val, eim_txid->len);
 	der_end(&msg, m);
-	if (esipa_call(a, &msg, 0xBF39, &resp, &t) < 0)
+	if (esipa_call(a, "InitiateAuthentication", &msg, 0xBF39, &resp, &t) < 0)
 		goto out;
 	if (der_find(t.val, t.len, 0xA0, &ok) < 0) {
-		say(a, LOG_ERR, "InitiateAuthentication refused by the eIM");
+		int64_t e = -1;
+
+		/* initiateAuthenticationErrorEsipa: the CHOICE's [1] (AUTOMATIC TAGS) */
+		if (der_find(t.val, t.len, 0x81, &y) == 0)
+			der_get_int(&y, &e);
+		say(a, LOG_ERR, "InitiateAuthentication refused by the eIM: %lld (%s)", (long long)e,
+		    code_of(IA_ERR, e));
 		goto out;
 	}
 	/* 80 txid?, 30 serverSigned1, 5F37, 04 ciPKId, 30 serverCertificate,
@@ -913,14 +959,14 @@ static int indirect_download(ipa *a, const char *ac, const der_tlv *eim_txid)
 	der_put(&msg, 0x80, txid.val, txid.len);
 	db_put(&msg, ctx.d, ctx.len);
 	der_end(&msg, m);
-	if (esipa_call(a, &msg, 0xBF3B, &resp, &t) < 0)
+	if (esipa_call(a, "AuthenticateClient", &msg, 0xBF3B, &resp, &t) < 0)
 		goto cancel;
 	if (der_find(t.val, t.len, 0xA0, &ok) < 0) {
-		int64_t e = 127;
+		int64_t e = -1;
 
 		if (der_find(t.val, t.len, 0x82, &y) == 0)
 			der_get_int(&y, &e);
-		say(a, LOG_ERR, "AuthenticateClient refused: %lld", (long long)e);
+		say(a, LOG_ERR, "AuthenticateClient refused by the eIM: %lld (%s)", (long long)e, code_of(AC_ERR, e));
 		reason = e == 50 ? 3 : 127;   /* pprNotAllowed(50) -> reason pprNotAllowed(3) */
 		goto cancel;
 	}
@@ -956,14 +1002,14 @@ static int indirect_download(ipa *a, const char *ac, const der_tlv *eim_txid)
 	der_put(&msg, 0x80, txid.val, txid.len);
 	db_put(&msg, ctx.d, ctx.len);
 	der_end(&msg, m);
-	if (esipa_call(a, &msg, 0xBF3A, &resp, &t) < 0)
+	if (esipa_call(a, "GetBoundProfilePackage", &msg, 0xBF3A, &resp, &t) < 0)
 		goto cancel;
 	if (der_find(t.val, t.len, 0xA0, &ok) < 0 || der_find(ok.val, ok.len, 0xBF36, &x) < 0) {
-		int64_t e = 127;
+		int64_t e = -1;
 
 		if (der_find(t.val, t.len, 0x81, &y) == 0)
 			der_get_int(&y, &e);
-		say(a, LOG_ERR, "GetBoundProfilePackage refused: %lld", (long long)e);
+		say(a, LOG_ERR, "GetBoundProfilePackage refused by the eIM: %lld (%s)", (long long)e, code_of(GBPP_ERR, e));
 		reason = e == 50 ? 4 : 127;   /* metadataMismatch */
 		goto cancel;
 	}
@@ -1122,7 +1168,7 @@ int ipa_poll(ipa *a, ipa_summary *sum)
 			der_put(&msg, 0x82, a->c.rplmn, 3);
 		der_end(&msg, m);
 
-		if (esipa_call(a, &msg, 0xBF4F, &resp, &t) < 0 || der_parse(t.val, t.len, &alt) < 0) {
+		if (esipa_call(a, "GetEimPackage", &msg, 0xBF4F, &resp, &t) < 0 || der_parse(t.val, t.len, &alt) < 0) {
 			rc = -1;
 			break;
 		}
@@ -1133,7 +1179,7 @@ int ipa_poll(ipa *a, ipa_summary *sum)
 
 			der_get_int(&alt, &e);
 			if (e != 1) {   /* noEimPackageAvailable */
-				say(a, LOG_WARNING, "GetEimPackage: eimPackageError %lld", (long long)e);
+				say(a, LOG_WARNING, "GetEimPackage: eimPackageError %lld (%s)", (long long)e, code_of(PKG_ERR, e));
 				rc = -1;
 			}
 			break;

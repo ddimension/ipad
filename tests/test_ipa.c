@@ -44,6 +44,7 @@ typedef struct {
 	bool offline;
 	int refuse_notify;          /* > 0: the next notifications are answered 500 */
 	int64_t auth_client_error;  /* > 0: AuthenticateClient answers this error */
+	int64_t init_auth_error;    /* > 0: InitiateAuthentication answers this error */
 	bool invalid;               /* a deliberately malformed exchange: not dumped */
 	bool no_matching;           /* InitiateAuthentication without matchingId */
 } fake_eim;
@@ -134,6 +135,11 @@ static int eim_transport(void *ud, const uint8_t *req, size_t len, int *status, 
 		return 0;
 	case 0xBF39:   /* InitiateAuthenticationOkEsipa */
 		m = der_begin(resp, 0xBF39);
+		if (f->init_auth_error > 0) {
+			der_put_int(resp, 0x81, f->init_auth_error);
+			der_end(resp, m);
+			break;
+		}
 		k = der_begin(resp, 0xA0);
 		l = der_begin(resp, 0x30);   /* serverSigned1 */
 		der_put(resp, 0x80, txid, 16);
@@ -266,6 +272,8 @@ typedef struct {
 	char conn_iccid[21];
 	bool conn_params, conn_emulated;
 	char last_log[256];
+	char log[2048];   /* since the test last cleared it */
+	bool leaked;      /* a MatchingID ("MATCH") ever logged */
 } host;
 
 static bool on_changed(void *ud, const char *iccid)
@@ -339,6 +347,9 @@ static void on_log(void *ud, int lvl, const char *msg)
 
 	(void)lvl;
 	snprintf(h->last_log, sizeof(h->last_log), "%s", msg);
+	if (strlen(h->log) + strlen(msg) + 2 < sizeof(h->log))
+		strcat(strcat(h->log, msg), "\n");
+	h->leaked |= strstr(msg, "MATCH") != NULL;
 	if (getenv("IPAD_TEST_VERBOSE"))
 		fprintf(stderr, "  log: %s\n", msg);
 }
@@ -790,13 +801,28 @@ int main(void)
 		eim.auth_client_error = 50;
 		queue(&eim, &q);
 		mark = eim.ngot;
+		h.log[0] = 0;
 		ipa_poll(a, &sum);
 		OK(fc.cancels == 1 && fc.cancel_reason == 3, "cancel: ES10b.CancelSession, reason pprNotAllowed");
+		OK(strstr(h.log, "AuthenticateClient refused by the eIM: 50 (pprNotAllowed)") != NULL,
+		   "cancel: the eIM's code logged with its name");
 		m = last_got(&eim, 0xBF41);
 		OK(m && inner(m, 0x80, &x) == 0 && inner(m, 0xA1, &y) == 0 && der_parse(y.val, y.len, &x) == 0 &&
 		   x.tag == 0xA0, "cancel: BF41{80 txid, A1{card's response}}");
 		OK(count_got(&eim, mark, 0xBF3A) == 0, "cancel: no GetBPP after a refusal");
 		eim.auth_client_error = 0;
+
+		/* InitiateAuthentication refused (5.14.1 Table 13a): the code and
+		 * its name in the log, nothing to cancel without a session */
+		eim.init_auth_error = 52;
+		queue(&eim, &q);
+		mark = eim.ngot;
+		h.log[0] = 0;
+		ipa_poll(a, &sum);
+		OK(strstr(h.log, "InitiateAuthentication refused by the eIM: 52 (invalidEimTransactionId)") != NULL &&
+		   count_got(&eim, mark, 0xBF3B) == 0 && fc.cancels == 1,
+		   "refused: InitiateAuthentication's code logged by name, no AuthenticateClient");
+		eim.init_auth_error = 0;
 		db_free(&q);
 	}
 
@@ -912,6 +938,8 @@ int main(void)
 		unlink(es9);
 		db_free(&q);
 	}
+
+	OK(!h.leaked, "log: no activation code or MatchingID in any message");
 
 	/* --- the eIM unreachable: the poll says so --- */
 	eim.offline = true;

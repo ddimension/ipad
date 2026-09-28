@@ -247,6 +247,10 @@ step, for example:
 - "direct download done"
 - "card bound at the eIM (204)"
 - "notification … not delivered, kept"
+- "InitiateAuthentication refused by the eIM: 52 (invalidEimTransactionId)",
+  likewise AuthenticateClient and GetBoundProfilePackage with their ESipa
+  error code and its name (SGP.32 5.14.1–5.14.3); "…: the eIM answered HTTP
+  500 without the expected BF39" when there was no ESipa answer at all
 - "eIM …: trustedPublicKeyDataTls unusable (…)"
 
 ## Recover from a lost device key
