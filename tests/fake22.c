@@ -251,6 +251,7 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 				sgp32 |= tg == 0x9F26 || tg == 0x9F67 || tg == 0x9F7B;
 			}
 			if ((sgp32 && f->refuse_taglist) || f->refuse_taglist == 3) {
+				f->taglist_refusals++;
 				if (f->refuse_taglist == 1)
 					return 0x6A80;
 				/* profileInfoListError incorrectInputValues(1) */

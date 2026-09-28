@@ -53,6 +53,10 @@ static int sc_transmit(void *ctx, const uint8_t *a, size_t len, dbuf *r)
 
 	if (len < 4)
 		return -1;
+	if (s->fail_next > 0) {
+		s->fail_next--;
+		return -1;
+	}
 
 	if (s->dead) {
 		s->stale++;

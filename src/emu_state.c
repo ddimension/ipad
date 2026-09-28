@@ -19,7 +19,8 @@
  *     fallback   [6]  SEQUENCE { iccid 5A, active [1] BOOLEAN, prev [2] OCTET STRING OPTIONAL } OPTIONAL,
  *     immediate  [7]  SEQUENCE { flag [0] BOOLEAN, oid [1] OCTET STRING OPTIONAL,
  *                                addr [2] OCTET STRING OPTIONAL } OPTIONAL,
- *     tokenCtr   [8]  INTEGER
+ *     tokenCtr   [8]  INTEGER,
+ *     quirks     [9]  INTEGER OPTIONAL          -- emu_int.h EMU_Q_*
  *   }
  */
 #include <stdio.h>
@@ -169,6 +170,8 @@ int emu_state_save(const emu *e)
 	}
 
 	der_put_int(&b, 0x88, e->token_ctr);
+	if (e->quirks)
+		der_put_int(&b, 0x89, e->quirks);
 	der_end(&b, top);
 
 	if (b.err || snprintf(tmp, sizeof(tmp), "%s.tmp", e->cfg.state_path) >= (int)sizeof(tmp))
@@ -304,6 +307,9 @@ int emu_state_load(emu *e)
 
 	if (der_find(top.val, top.len, 0x88, &t) == 0)
 		der_get_int(&t, &e->token_ctr);
+
+	if (der_find(top.val, top.len, 0x89, &t) == 0 && der_get_int(&t, &v) == 0)
+		e->quirks = (int)v;
 
 	rc = 0;
 out:

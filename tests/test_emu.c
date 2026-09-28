@@ -398,6 +398,20 @@ static void test_fallback(void)
 	OK(set_fallback(&r, "98001032547698103244") == 1,
 	   "fallback, tag list refused: the profiles are still read (iccidOrAidNotFound for an unknown one)");
 	OK(set_fallback(&r, B) == 2, "fallback, tag list refused: fallbackAllowed absent, fallbackNotAllowed(2)");
+	/* refused once, not asked again: on this run nor, from the state, the next */
+	OK(r.f.taglist_refusals == 1 && !r.f.last_had_taglist,
+	   "fallback, tag list refused: 9F67 remembered, the default list asked directly");
+	emu_close(r.e);
+	r.e = emu_open(&r.c, &r.cfg);
+	OK(r.e && set_fallback(&r, B) == 2 && r.f.taglist_refusals == 1,
+	   "fallback, tag list refused: remembered across a restart");
+	rig_close(&r);
+
+	/* no answer at all is no refusal: nothing remembered */
+	OK(rig_open(&r, 2) == 0, "fallback: rig, card silent once");
+	r.s.fail_next = 1;
+	set_fallback(&r, B);
+	OK(!(r.e->quirks & EMU_Q_NO_9F67), "fallback: a card that did not answer is asked with 9F67 again");
 	rig_close(&r);
 
 	db_free(&ops);
@@ -538,6 +552,7 @@ static void test_list_profile_info(void)
 	dbuf resp;
 	der_tlv lst;
 	char m[128];
+	int refusals;
 
 	db_init(&resp);
 	OK(rig_open(&r, 2) == 0, "listProfileInfo: rig");
@@ -581,6 +596,13 @@ static void test_list_profile_info(void)
 	       "listProfileInfo, tags refused: asked again without 9F7B 9F67");
 	members(&lst, 1, m, sizeof(m));
 	OK(!strcmp(m, "5A 9F70 91 9F26"), "listProfileInfo, tags refused: 9F26 still on B");
+	/* the package's own profile check was refused too (9F67), once */
+	refusals = r.f.taglist_refusals;
+	OK(refusals == 2, "listProfileInfo, tags refused: refused once each, the check and the PSMO");
+	emu_close(r.e);
+	r.e = emu_open(&r.c, &r.cfg);
+	OK(r.e && list_psmo(&r, none, sizeof(none), &resp, &lst) && r.f.taglist_refusals == refusals,
+	   "listProfileInfo, tags refused: not asked with them again, also after a restart");
 
 	/* refused with profileInfoListError instead of a status word (a consumer
 	 * card, for the eIM's list): asked again without 9F7B 9F67, never 9F26 */

@@ -91,18 +91,27 @@ typedef struct {
 
 #define MAX_PROF 32
 
-/* GetProfilesInfo (SGP.22 5.7.15) as a parsed answer: 0 with *list set,
- * -1 on an error status word or a profileInfoListError (no A0 in it) */
+/* GetProfilesInfo (SGP.22 5.7.15) as a parsed answer: 0 with *list set;
+ * -2 when the card refused it, by an error status word or with a
+ * profileInfoListError (no A0 in it); -1 when there was no answer */
 static int profiles_query(emu *e, const uint8_t *req, size_t len, dbuf *resp, der_tlv *list)
 {
 	der_tlv t;
 
 	resp->len = 0;
-	if (card_es10(e->card, req, len, resp) < 0 ||
-	    der_parse(resp->d, resp->len, &t) < 0 || t.tag != 0xBF2D ||
-	    der_find(t.val, t.len, 0xA0, list) < 0)
-		return -1;
+	e->card->sw = 0;
+	if (card_es10(e->card, req, len, resp) < 0)
+		return e->card->sw ? -2 : -1;
+	if (der_parse(resp->d, resp->len, &t) < 0 || t.tag != 0xBF2D || der_find(t.val, t.len, 0xA0, list) < 0)
+		return -2;
 	return 0;
+}
+
+/* the card refused something once: not asked again, the state remembers */
+static void quirk(emu *e, int q)
+{
+	e->quirks |= q;
+	emu_state_save(e);
 }
 
 /* The card's profiles, with state and fallbackAllowed.
@@ -115,7 +124,10 @@ static int profiles_query(emu *e, const uint8_t *req, size_t len, dbuf *resp, de
  * tag list (SGP.22 5.7.20, GetEID, answers an unsupported tag list with an
  * error status word; 5.7.15 does not say), so the default list is asked next,
  * and the flag then counts as absent, which is what 3.4.6 makes of an
- * absent flag anyway. */
+ * absent flag anyway. A card that refused, and answered the default list,
+ * is not asked with 9F67 again (EMU_Q_NO_9F67): each such query cost a
+ * refused exchange on every run. A query that got no answer at all proves
+ * nothing and is not remembered. */
 static int profiles(emu *e, prof *out, int cap)
 {
 	static const uint8_t with_fb[] = {   /* 5C { 5A 9F70 9F67 } */
@@ -125,13 +137,18 @@ static int profiles(emu *e, prof *out, int cap)
 	dbuf resp;
 	der_tlv list, it, x;
 	const uint8_t *p, *end;
-	int n = 0;
+	int n = 0, rc = -2;
 
 	db_init(&resp);
-	if (profiles_query(e, with_fb, sizeof(with_fb), &resp, &list) < 0 &&
-	    profiles_query(e, dflt, sizeof(dflt), &resp, &list) < 0) {
-		db_free(&resp);
-		return -1;
+	if (!(e->quirks & EMU_Q_NO_9F67))
+		rc = profiles_query(e, with_fb, sizeof(with_fb), &resp, &list);
+	if (rc < 0) {
+		if (profiles_query(e, dflt, sizeof(dflt), &resp, &list) < 0) {
+			db_free(&resp);
+			return -1;
+		}
+		if (rc == -2 && !(e->quirks & EMU_Q_NO_9F67))
+			quirk(e, EMU_Q_NO_9F67);
 	}
 
 	for (p = list.val, end = list.val + list.len; p < end && n < cap; ) {
@@ -295,9 +312,11 @@ static bool has_tag(const uint32_t *tags, int n, uint32_t t)
  *   Profile in the answer, and dropped again when the eIM did not ask.
  * - A card that refuses the list for an SGP.32 tag it does not know (9F7B,
  *   9F67), by status word or by profileInfoListError, is asked once more
- *   without them; its answer to that one is passed on. A requested data object that a
- *   profile does not have is omitted (SGP.22 5.7.15), which is what an
- *   SGP.22 card's profile is for those tags.
+ *   without them, and its answer to that one is passed on. Once it has
+ *   refused and then answered, it is asked without them from the start
+ *   (EMU_Q_NO_IOT_TAGS). A requested data object that a profile does not
+ *   have is omitted (SGP.22 5.7.15), which is what an SGP.22 card's profile
+ *   is for those tags.
  * searchCriteria and iotSpecificTagList go to the card as the eIM sent them. */
 static int64_t list_profile_info(emu *e, const der_tlv *op, dbuf *res)
 {
@@ -306,7 +325,7 @@ static int64_t list_profile_info(emu *e, const der_tlv *op, dbuf *res)
 	int nwant, i, attempt;
 	der_tlv x;
 	dbuf req, resp;
-	bool with_fb, keep_iccid, strip, sent = false;
+	bool with_fb, keep_iccid, strip, sent = false, answered, first_refused = false;
 	int64_t v = 0;
 
 	if (der_find(op->val, op->len, 0x5C, &x) == 0) {
@@ -321,7 +340,7 @@ static int64_t list_profile_info(emu *e, const der_tlv *op, dbuf *res)
 
 	db_init(&req);
 	db_init(&resp);
-	for (attempt = 0; attempt < (strip ? 2 : 1) && !sent; attempt++) {
+	for (attempt = strip && (e->quirks & EMU_Q_NO_IOT_TAGS); attempt < (strip ? 2 : 1) && !sent; attempt++) {
 		der_tlv top;
 		size_t m, l;
 
@@ -339,11 +358,16 @@ static int64_t list_profile_info(emu *e, const der_tlv *op, dbuf *res)
 		if (der_find(op->val, op->len, 0x5D, &x) == 0)
 			db_put(&req, x.raw, x.raw_len);
 		der_end(&req, m);
+		e->card->sw = 0;
 		sent = !req.err && card_call(e, &req, &resp) == 0;
+		answered = sent || e->card->sw != 0;   /* no answer at all proves nothing */
 		/* SGP.22 only reserves 9F7B/9F67 (5.7.15) */
 		if (sent && attempt == 0 && strip && der_parse(resp.d, resp.len, &top) == 0 &&
 		    der_find(top.val, top.len, 0xA0, &x) < 0)
 			sent = false;
+		if (attempt == 1 && sent && first_refused)
+			quirk(e, EMU_Q_NO_IOT_TAGS);
+		first_refused = attempt == 0 && answered;
 	}
 
 	if (!sent) {

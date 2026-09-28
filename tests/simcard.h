@@ -23,6 +23,7 @@ struct simcard {
 	 * every logical channel: until the next open, an APDU is answered
 	 * 6881, logical channel not supported (ISO/IEC 7816-4 5.4.1) */
 	int dead, stale;      /* channel gone; APDUs sent on it anyway */
+	int fail_next;        /* > 0: that many APDUs get no answer at all */
 	dbuf req, pending;
 	int expect_block;
 };

@@ -14,6 +14,10 @@
 #define EMU_MAX_EIMS 8
 #define EMU_MAX_EPRS 16
 
+/* what a card refused once and is not asked again (state: quirks [9]) */
+#define EMU_Q_NO_9F67 1        /* GetProfilesInfo with 5C { 5A 9F70 9F67 } */
+#define EMU_Q_NO_IOT_TAGS 2    /* a listProfileInfo tag list with 9F7B / 9F67 */
+
 typedef struct {
 	dbuf cfg;              /* EimConfigurationData, universal SEQUENCE form */
 	char id[129];
@@ -64,6 +68,8 @@ struct emu {
 	uint8_t ie_iccid[10];
 
 	int64_t token_ctr;               /* associationToken generation */
+
+	int quirks;                      /* EMU_Q_* */
 };
 
 /* state file */

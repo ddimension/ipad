@@ -27,6 +27,7 @@ typedef struct {
 	 * profileInfoListError incorrectInputValues instead, as a real consumer
 	 * card did; 3: that error to every tag list */
 	int refuse_taglist;
+	int taglist_refusals;             /* how often it did */
 	/* the tag list of the last GetProfilesInfo, and whether it had one */
 	uint8_t last_taglist[32];
 	size_t last_taglist_len;
