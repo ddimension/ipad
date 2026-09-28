@@ -113,10 +113,13 @@ reserves that tag for SGP.32, and its default tag list (5.7.15, the tags
 marked (*)) does not contain it, so a card that does store the flag reports
 it only when asked for it by name. The emulation therefore reads the card's
 profiles with the tag list `5C { 5A 9F70 9F67 }`. A card that answers that
-tag list with an error gets the default list (`BF2D 00`) instead, and the
-flag counts as absent there. A card that refused the tag list
+tag list with an error is asked `5C { 5A 9F70 }` instead (the same request
+the IPA sends before every package, so it usually comes from the card
+layer's cache, see below), and the flag counts as absent there; the default
+list (`BF2D 00`, every starred tag including icons, about 1.6 KB on router
+245) only if that fails too. A card that refused the tag list
 (`profileInfoListError` or `6A80`) is remembered (`quirks` in the state) and
-asked with the default list directly from then on: the query with `9F67` was
+asked without `9F67` directly from then on: the query with `9F67` was
 refused on every run otherwise. Any other error falls back for that call
 only. Without `9F67 = TRUE`, `setFallbackAttribute`
 answers `fallbackNotAllowed` (2), unless ipad runs with `-F` ("every
@@ -466,7 +469,7 @@ sit under ES10b).
 | PSMO `listProfileInfo` (2.11.1.1.3) | `ES10c.GetProfilesInfo` with an explicit tag list: the eIM's, or without one SGP.32's default (`5A 4F 9F70 91 92 95 9F7B 9F26 9F67`, which differs from SGP.22's), always without `9F26` and always with `5A`. If the card refuses the list (a `profileInfoListError`, or `6A80`), or the call fails otherwise, it is sent again without `9F7B 9F67`, and its answer to that is the result; a card that refused once is sent the list without them from then on (`quirks`), a card that failed otherwise is not `searchCriteria` and `iotSpecificTagList` are passed on as sent | if the list asks for `9F26`, it is added as TRUE to the Fallback Profile, before `9F67`/`BF64` (DER order of ProfileInfo). A `5A` the eIM did not ask for is dropped again |
 | PSMO `getRAT` | `ES10b.GetRAT` (`BF43`, SGP.22 5.7.22) | none |
 | PSMO `configureImmediateEnable` (3.4.4) | none | immediate-enable flag, OID, address |
-| PSMO `setFallbackAttribute` / `unsetFallbackAttribute` (3.4.6, 3.4.7) | `GetProfilesInfo` with the tag list `5A 9F70 9F67` (for the checks, including whether the Fallback Profile is enabled; the default list if the card refuses it) | fallback record |
+| PSMO `setFallbackAttribute` / `unsetFallbackAttribute` (3.4.6, 3.4.7) | `GetProfilesInfo` with the tag list `5A 9F70 9F67` (for the checks, including whether the Fallback Profile is enabled; `5A 9F70` if the card refuses it) | fallback record |
 | PSMO `setDefaultDpAddress` (5.9.25) | `ES10a.SetDefaultDpAddress` (`BF3F`, SGP.22 5.7.4) | none |
 | eCO `addEim`, `updateEim`, `deleteEim`, `listEim` (3.5.1) | none | eIM records (a deleted eIM is removed after the result is signed, because it may be the requester) |
 | **ES10b.AddInitialEim** (5.9.4, 3.5.2.1) | none | eIM records; refused once any eIM is stored |
@@ -692,6 +695,15 @@ What the code does:
   either kind of card, and it is read again only after something that
   changes the card (a package, a download, a removal, the host's ES9+
   client).
+- The same holds one level lower for the two reads every run repeats
+  (`src/card.h`): `GetEUICCData { 5A }` (the EID: main, the emulation and
+  the IPA each ask for it) and `GetProfilesInfo { 5A 9F70 }` (ICCID and
+  state: before and after a package, the emulation's profile checks) go to
+  the card once per run. Any other request that is not a known read
+  (SGP.22 5.7 / SGP.32 5.9: an enable, disable, delete, download segment,
+  rollback, memory reset, notification removal, anything unknown or
+  unparsable) and every close of the channel (the host's lpac, a SIM reset)
+  forget both answers; in doubt, forgotten.
 - A notification the eIM answers but does not take (an error status, see
   below) waits out a **backoff**, kept per card in `<EID>.nbo` (`src/nbo.h`),
   on an emulated card and an IoT eUICC alike: it is offered again an hour

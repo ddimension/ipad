@@ -218,6 +218,7 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 
 	switch (t.tag) {
 	case 0xBF3E:
+		f->geteids++;
 		m = der_begin(r, 0xBF3E);
 		der_put(r, 0x5A, f->eid, 16);
 		der_end(r, m);
@@ -230,6 +231,11 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 
 		f->last_had_taglist = der_find(t.val, t.len, 0x5C, &x) == 0;
 		f->last_taglist_len = 0;
+		f->infos++;
+		if (!f->last_had_taglist)
+			f->infos_default++;
+		else if (x.len == 3 && !memcmp(x.val, "\x5A\x9F\x70", 3))
+			f->infos_state++;
 		if (f->last_had_taglist) {
 			const uint8_t *q = x.val, *qe = x.val + x.len;
 			bool sgp32 = false;

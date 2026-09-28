@@ -130,6 +130,7 @@ static int rig_open(rig *r, int nmore)
 static void rig_close(rig *r)
 {
 	emu_close(r->e);
+	card_close(&r->c);
 	simcard_free(&r->s);
 	fake22_free(&r->f);
 	unlink(r->state);
@@ -391,7 +392,7 @@ static void test_fallback(void)
 	rig_close(&r);
 
 	/* a card that refuses 9F67 in a tag list: the default list is asked
-	 * instead, and the flag counts as absent */
+	 * without 9F67 instead, and the flag counts as absent */
 	OK(rig_open(&r, 2) == 0, "fallback: rig, tag list refused");
 	r.f.refuse_taglist = 1;
 	r.f.p[1].fallback_allowed = 1;
@@ -399,8 +400,9 @@ static void test_fallback(void)
 	   "fallback, tag list refused: the profiles are still read (iccidOrAidNotFound for an unknown one)");
 	OK(set_fallback(&r, B) == 2, "fallback, tag list refused: fallbackAllowed absent, fallbackNotAllowed(2)");
 	/* refused once, not asked again: on this run nor, from the state, the next */
-	OK(r.f.taglist_refusals == 1 && !r.f.last_had_taglist,
-	   "fallback, tag list refused: 9F67 remembered, the default list asked directly");
+	OK(r.f.taglist_refusals == 1 && r.f.last_had_taglist && r.f.last_taglist_len == 3 &&
+	   !memcmp(r.f.last_taglist, "\x5A\x9F\x70", 3),
+	   "fallback, tag list refused: 9F67 remembered, the list without it asked directly");
 	emu_close(r.e);
 	r.e = emu_open(&r.c, &r.cfg);
 	OK(r.e && set_fallback(&r, B) == 2 && r.f.taglist_refusals == 1,
@@ -435,7 +437,7 @@ static void test_fallback(void)
 	}
 
 	/* any status word but 6A80 is no refusal either (a one-off 6F00, a
-	 * memory failure, conditions not satisfied): the default list serves
+	 * memory failure, conditions not satisfied): the list without 9F67 serves
 	 * this call, nothing is remembered, the next run asks with 9F67 */
 	{
 		static const uint16_t sws[] = { 0x6F00, 0x6581, 0x6985 };
@@ -448,8 +450,9 @@ static void test_fallback(void)
 			r.f.p[1].fallback_allowed = 1;
 			r.f.taglist_sw = sws[k];
 			r.f.taglist_sw_n = 1;
-			snprintf(what, sizeof(what), "fallback, %04X once: the default list serves this call", sws[k]);
-			OK(set_fallback(&r, B) == 2 && !r.f.last_had_taglist && r.f.taglist_sw_n == 0, what);
+			snprintf(what, sizeof(what), "fallback, %04X once: the list without 9F67 serves this call", sws[k]);
+			OK(set_fallback(&r, B) == 2 && r.f.last_had_taglist && r.f.last_taglist_len == 3 &&
+			   r.f.taglist_sw_n == 0, what);
 			snprintf(what, sizeof(what), "fallback, %04X once: no quirk stored", sws[k]);
 			OK(!(r.e->quirks & EMU_Q_NO_9F67), what);
 			emu_close(r.e);
@@ -1030,10 +1033,12 @@ int main(void)
 	/* a state file of another card is refused */
 	emu_close(e);
 	f.eid[0] ^= 0x10;
+	card_forget(&c);   /* another card: another run */
 	OK(emu_open(&c, &cfg) == NULL, "state: another card's file is not reused");
 
 	/* the probe: an SGP.22 card does not know GetEimConfigurationData */
 	f.eid[0] ^= 0x10;
+	card_forget(&c);
 	OK(euicc_probe(&c) == EUICC_EMU, "probe: an SGP.22 card is driven through the emulation");
 
 	unlink(state);
@@ -1045,6 +1050,7 @@ int main(void)
 	db_free(&req);
 	db_free(&resp);
 	db_free(&ops);
+	card_close(&c);
 	simcard_free(&s);
 	crypto_key_free(eim_key);
 	crypto_key_free(dev_key);

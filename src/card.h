@@ -13,6 +13,7 @@
 #ifndef IPAD_CARD_H
 #define IPAD_CARD_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "der.h"
@@ -23,22 +24,37 @@ typedef struct {
 	int (*close)(void *ctx, int channel);
 } card_ops;
 
+#define CARD_CACHED 2
+
 typedef struct {
 	const card_ops *ops;
 	void *ctx;
 	int channel;    /* open ISD-R channel, -1 when none */
 	uint16_t sw;    /* last status word, for the error a caller reports */
+	/* answers to the reads a run repeats (card_es10), per request */
+	dbuf cache[CARD_CACHED];
+	bool cached[CARD_CACHED];
 } card;
 
 extern const uint8_t ISDR_AID[16];
 
 void card_init(card *c, const card_ops *ops, void *ctx);
 int card_open(card *c);   /* the ISD-R; idempotent */
+/* Closes the ISD-R channel and forgets the cached answers: whoever uses
+ * the card next (the host's lpac, a SIM reset) may change it. */
 void card_close(card *c);
+
+/* Forgets the cached answers; card_close does too. */
+void card_forget(card *c);
 
 /* One ES10 function: req is the complete command data object (e.g. BF51...),
  * resp receives the complete response data object. 0 on success, -1 on a
- * transport or status word error (c->sw holds the last SW). */
+ * transport or status word error (c->sw holds the last SW).
+ *
+ * A run asks the same two things several times (GetEUICCData for the EID,
+ * GetProfilesInfo for ICCID and state: main, the emulation, the IPA, before
+ * and after a package): their answers are kept and served again until any
+ * request that is not a known read, or card_close. */
 int card_es10(card *c, const uint8_t *req, size_t len, dbuf *resp);
 
 /* CLA for a logical channel (ISO/IEC 7816-4 5.4.1): 0-3 in bits 1-2 of the

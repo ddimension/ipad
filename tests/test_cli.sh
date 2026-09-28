@@ -113,6 +113,9 @@ out=$(run -s "$w/b" -u "$url" poll)
 ok '[ "$(binds)" = 1 ] && [ ! -e "$w/b/bind.after" ]' 'bind 429 Retry-After: asked again once the time has passed'
 out=$(run -s "$w/b" -u "$url" poll)
 ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"poll\""' 'bind 204: then the poll runs'
+# a run that changes nothing asks the card for its EID and its profiles once
+# (main, the emulation, the IPA share the card layer's cache)
+ok 'echo "$out" | grep -q "^card: geteid 1, profiles 1, default list 0$"' 'read-only poll: GetEID once, GetProfilesInfo once'
 ok '[ -e "$w/b/bind.done" ] && [ ! -e "$w/b/bind.pending" ]' 'bind 204: bound'
 ok '[ "$(binds)" = 2 ]' 'bind: posted once per poll'
 ok 'echo "$out" | grep -q "host: .*\"event\":\"info\".*\"bind\":\"pending\",\"counter\":5"' \

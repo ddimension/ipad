@@ -8,12 +8,64 @@
 const uint8_t ISDR_AID[16] = { 0xA0, 0x00, 0x00, 0x05, 0x59, 0x10, 0x10, 0xFF,
                                0xFF, 0xFF, 0xFF, 0x89, 0x00, 0x00, 0x01, 0x00 };
 
+/* The reads a run repeats, answered from the cache. Only exact requests:
+ * another tag list is another answer. */
+static const uint8_t *const CACHED_REQ[CARD_CACHED] = {
+	(const uint8_t[]){ 0xBF, 0x3E, 0x03, 0x5C, 0x01, 0x5A },                /* GetEUICCData {EID} */
+	(const uint8_t[]){ 0xBF, 0x2D, 0x05, 0x5C, 0x03, 0x5A, 0x9F, 0x70 },    /* GetProfilesInfo {ICCID, state} */
+};
+static const size_t CACHED_LEN[CARD_CACHED] = { 6, 8 };
+
 void card_init(card *c, const card_ops *ops, void *ctx)
 {
+	int i;
+
 	c->ops = ops;
 	c->ctx = ctx;
 	c->channel = -1;
 	c->sw = 0;
+	for (i = 0; i < CARD_CACHED; i++) {
+		db_init(&c->cache[i]);
+		c->cached[i] = false;
+	}
+}
+
+void card_forget(card *c)
+{
+	int i;
+
+	for (i = 0; i < CARD_CACHED; i++) {
+		db_free(&c->cache[i]);
+		c->cached[i] = false;
+	}
+}
+
+/* Functions that change nothing a cached answer holds (SGP.22 5.7, SGP.32
+ * 5.9): the reads, and GetEUICCChallenge, whose challenge is no part of them. Any
+ * other request, one that does not parse (a BPP segment) included, may
+ * change the profiles, and forgets the cache: in doubt, forget. */
+static bool is_read(const uint8_t *req, size_t len)
+{
+	uint16_t tag;
+
+	if (len < 2 || req[0] != 0xBF)
+		return false;
+	tag = (uint16_t)(req[0] << 8 | req[1]);
+	switch (tag) {
+	case 0xBF20:   /* GetEUICCInfo1 */
+	case 0xBF22:   /* GetEUICCInfo2 */
+	case 0xBF28:   /* ListNotification */
+	case 0xBF2B:   /* RetrieveNotificationsList */
+	case 0xBF2D:   /* GetProfilesInfo */
+	case 0xBF2E:   /* GetEUICCChallenge */
+	case 0xBF3C:   /* EuiccConfiguredAddresses */
+	case 0xBF3E:   /* GetEUICCData */
+	case 0xBF43:   /* GetRAT */
+	case 0xBF55:   /* GetEimConfigurationData (SGP.32 5.9.18), the probe */
+	case 0xBF56:   /* GetCerts (SGP.32 5.9.10) */
+		return true;
+	}
+	return false;
 }
 
 uint8_t card_cla(uint8_t base, int channel)
@@ -42,6 +94,7 @@ void card_close(card *c)
 	if (c->channel >= 0)
 		c->ops->close(c->ctx, c->channel);
 	c->channel = -1;
+	card_forget(c);
 }
 
 static uint16_t sw_of(const dbuf *r)
@@ -87,7 +140,33 @@ static uint16_t xfer(card *c, uint8_t *apdu, size_t len, dbuf *resp)
 	return 0;
 }
 
+static int es10(card *c, const uint8_t *req, size_t len, dbuf *resp);
+
 int card_es10(card *c, const uint8_t *req, size_t len, dbuf *resp)
+{
+	size_t start = resp->len;
+	int i, rc;
+
+	for (i = 0; i < CARD_CACHED; i++)
+		if (len == CACHED_LEN[i] && !memcmp(req, CACHED_REQ[i], len))
+			break;
+	if (i < CARD_CACHED && c->cached[i]) {
+		c->sw = 0x9000;
+		db_put(resp, c->cache[i].d, c->cache[i].len);
+		return resp->err ? -1 : 0;
+	}
+	if (i == CARD_CACHED && !is_read(req, len))
+		card_forget(c);
+	rc = es10(c, req, len, resp);
+	if (rc == 0 && i < CARD_CACHED) {
+		c->cache[i].len = 0;
+		db_put(&c->cache[i], resp->d + start, resp->len - start);
+		c->cached[i] = !c->cache[i].err;
+	}
+	return rc;
+}
+
+static int es10(card *c, const uint8_t *req, size_t len, dbuf *resp)
 {
 	uint8_t apdu[5 + 255 + 1];
 	size_t off = 0;

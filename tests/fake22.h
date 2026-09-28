@@ -39,6 +39,10 @@ typedef struct {
 	uint8_t last_taglist[32];
 	size_t last_taglist_len;
 	int last_had_taglist;
+	/* GetEUICCData calls; GetProfilesInfo calls, and of them those
+	 * without a tag list (the full default list), and those asking for
+	 * {5A 9F70} (ICCID and state) */
+	int geteids, infos, infos_default, infos_state;
 	int last_refresh;                 /* refreshFlag of the last enable/disable */
 	char dp[64];
 

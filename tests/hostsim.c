@@ -182,8 +182,13 @@ int main(int argc, char **argv)
 			for (k = i; k < j && n < 63; k++)
 				av[n++] = argv[k];
 			av[n] = NULL;
+			int g0 = fcard.geteids, i0 = fcard.infos, d0 = fcard.infos_default;
+
 			rc = run(av);
 			printf("exit: %d\n", rc);
+			/* what the run asked of the card, for tests/test_cli.sh */
+			printf("card: geteid %d, profiles %d, default list %d\n", fcard.geteids - g0,
+			       fcard.infos - i0, fcard.infos_default - d0);
 			fflush(stdout);
 		}
 		i = j;

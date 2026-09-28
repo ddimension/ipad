@@ -662,6 +662,7 @@ int main(void)
 		static const uint8_t lpi[] = { 0xBF, 0x2D, 0x00 }, rat[] = { 0xA6, 0x00 };
 		dbuf ops, p;
 		bool fb;
+		int i0, s0, d0, g0;
 
 		fc.p[1].fallback_allowed = 1;
 		db_init(&ops);
@@ -672,7 +673,16 @@ int main(void)
 		eimpkg_package(&p, EIM, fc.eid, 8, 0xA0, &ops, eim_key, 0, false);
 		queue(&eim, &p);
 		mark = eim.ngot;
+		i0 = fc.infos;
+		s0 = fc.infos_state;
+		d0 = fc.infos_default;
+		g0 = fc.geteids;
 		ipa_poll(a, &sum);
+		/* the card asked for ICCID and state once (before the package;
+		 * after it, from the cache, as nothing in it touched the card),
+		 * 9F67 for the PSMOs, the eIM's list: no full default list */
+		OK(fc.infos - i0 == 3 && fc.infos_state - s0 == 1 && fc.infos_default == d0 && fc.geteids == g0,
+		   "cache: a package that leaves the card alone reads ICCID and state once, the EID not again");
 		m = last_got(&eim, 0xBF50);
 		{
 			size_t i;
@@ -685,6 +695,27 @@ int main(void)
 		OK(m && inner(m, 0xBF51, &y) == 0 && epr_has(&y, 0x8D) && epr_has(&y, 0xBF2D) && fb,
 		   "fallback: setFallbackAttribute and a listProfileInfo with 9F26 reach the eIM");
 		OK(m && inner(m, 0xBF51, &y) == 0 && epr_has(&y, 0xA6), "getRAT: the card's table reaches the eIM");
+
+		/* a card that refuses 9F67 in a tag list (router 245): the
+		 * PSMOs' profiles come from the {5A 9F70} answer read just
+		 * before, not from the full default list (about 1.6 KB) */
+		fc.refuse_taglist = 1;
+		ops.len = p.len = 0;
+		db_put(&ops, lpi, sizeof(lpi));
+		eimpkg_package(&p, EIM, fc.eid, 9, 0xA0, &ops, eim_key, 0, false);
+		queue(&eim, &p);
+		i0 = fc.infos;
+		s0 = fc.infos_state;
+		d0 = fc.infos_default;
+		ipa_poll(a, &sum);
+		m = last_got(&eim, 0xBF50);
+		OK(m && inner(m, 0xBF51, &y) == 0 && epr_has(&y, 0xBF2D), "cache, 9F67 refused: listProfileInfo answered");
+		/* ICCID and state not even once: nothing touched the card since
+		 * the last package's read */
+		OK(fc.infos_default == d0 && fc.infos_state == s0,
+		   "cache, 9F67 refused: no default list, ICCID and state from the cache");
+		OK(fc.infos - i0 == 3, "cache, 9F67 refused: 9F67 refused, the eIM's list refused and without");
+		fc.refuse_taglist = 0;
 		db_free(&ops);
 		db_free(&p);
 	}
@@ -1181,6 +1212,7 @@ int main(void)
 		db_free(&r0);
 		unlink(st3);
 	}
+	card_close(&c);
 	simcard_free(&s);
 	fake22_free(&fc);
 	for (mark = 0; mark < eim.ngot; mark++)

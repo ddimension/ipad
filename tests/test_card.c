@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * card.c: STORE DATA chaining, 61xx collection and the CLA for the channel,
  * against the simulated card. */
+#include <string.h>
+
 #include "check.h"
 #include "simcard.h"
 
@@ -12,6 +14,14 @@ static uint16_t echo(simcard *s, const uint8_t *req, size_t len, dbuf *resp)
 
 	for (i = 0; i < n; i++)
 		db_put(resp, req, len);
+	return 0x9000;
+}
+
+/* counts its calls; answers the command back */
+static uint16_t counted(simcard *s, const uint8_t *req, size_t len, dbuf *resp)
+{
+	(*(int *)s->user)++;
+	db_put(resp, req, len);
 	return 0x9000;
 }
 
@@ -66,6 +76,51 @@ int main(void)
 	card_close(&c);
 	OK(s.opens == 2 && s.closes == 2, "channel: opened once per use and closed");
 	simcard_free(&s);
+
+	/* the reads a run repeats come from the cache until anything else,
+	 * or a close, may have changed the card */
+	{
+		static const uint8_t eid[] = { 0xBF, 0x3E, 0x03, 0x5C, 0x01, 0x5A };
+		static const uint8_t st[] = { 0xBF, 0x2D, 0x05, 0x5C, 0x03, 0x5A, 0x9F, 0x70 };
+		static const uint8_t other[] = { 0xBF, 0x2D, 0x03, 0x5C, 0x01, 0x5A };
+		static const uint8_t list[] = { 0xBF, 0x28, 0x00 };
+		static const uint8_t enable[] = { 0xBF, 0x31, 0x00 };
+		static const uint8_t seg[] = { 0x86, 0x01, 0x00 };   /* a BPP segment: no ES10 tag */
+		int calls = 0;
+
+		simcard_init(&s, 1, counted, &calls);
+		card_init(&c, &SIMCARD_OPS, &s);
+		db_init(&r);
+		card_es10(&c, eid, sizeof(eid), &r);
+		card_es10(&c, st, sizeof(st), &r);
+		r.len = 0;
+		OK(card_es10(&c, eid, sizeof(eid), &r) == 0 && card_es10(&c, st, sizeof(st), &r) == 0 && calls == 2,
+		   "cache: GetEID and GetProfilesInfo {5A 9F70} asked once");
+		OK(r.len == sizeof(eid) + sizeof(st) && !memcmp(r.d, eid, sizeof(eid)) &&
+		   !memcmp(r.d + sizeof(eid), st, sizeof(st)), "cache: the answers as the card gave them, appended");
+		card_es10(&c, other, sizeof(other), &r);
+		card_es10(&c, list, sizeof(list), &r);
+		card_es10(&c, st, sizeof(st), &r);
+		OK(calls == 4, "cache: another tag list is no hit, and a read forgets nothing");
+		card_es10(&c, enable, sizeof(enable), &r);
+		card_es10(&c, st, sizeof(st), &r);
+		OK(calls == 6, "cache: an EnableProfile forgets it");
+		card_es10(&c, seg, sizeof(seg), &r);
+		card_es10(&c, eid, sizeof(eid), &r);
+		OK(calls == 8, "cache: a request without an ES10 tag forgets it");
+		card_close(&c);
+		card_es10(&c, eid, sizeof(eid), &r);
+		OK(calls == 9, "cache: a close forgets it (the host may use the card)");
+		s.handler = refuse;
+		card_forget(&c);
+		OK(card_es10(&c, eid, sizeof(eid), &r) < 0, "cache: a refused read");
+		s.handler = counted;
+		card_es10(&c, eid, sizeof(eid), &r);
+		OK(calls == 10, "cache: a refused read is not kept");
+		db_free(&r);
+		card_close(&c);
+		simcard_free(&s);
+	}
 
 	DONE("test_card");
 }

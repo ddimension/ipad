@@ -148,18 +148,25 @@ static void quirk(emu *e, int q)
  * default answer, and every setFallbackAttribute (3.4.6 step 4) would be
  * fallbackNotAllowed. A card that does not know 9F67 may refuse the whole
  * tag list (SGP.22 5.7.20, GetEID, answers an unsupported tag list with an
- * error status word; 5.7.15 does not say), so the default list is asked next,
- * and the flag then counts as absent, which is what 3.4.6 makes of an
+ * error status word; 5.7.15 does not say), so the list without it is asked
+ * next, and the flag then counts as absent, which is what 3.4.6 makes of an
  * absent flag anyway. A card that refused (taglist_refused), and answered
- * the default list, is not asked with 9F67 again (EMU_Q_NO_9F67): each such
- * query cost a refused exchange on every run. Any other failure of the
- * query (no answer, 6F00, 6581, ...) falls back to the default list for
- * this call only. */
+ * the list without it, is not asked with 9F67 again (EMU_Q_NO_9F67): each
+ * such query cost a refused exchange on every run. Any other failure of the
+ * query (no answer, 6F00, 6581, ...) falls back to the list without 9F67
+ * for this call only.
+ *
+ * That list is { 5A 9F70 }, the very request ipa_enabled_iccid sends
+ * before every package, so the card layer answers it from its cache (card.h)
+ * and it costs no exchange of its own. The default list ('BF2D 00') is
+ * asked only when that fails too: it carries every starred tag, icons
+ * included (router 245: about 1.6 KB of GET RESPONSE), for two of them. */
 static int profiles(emu *e, prof *out, int cap)
 {
 	static const uint8_t with_fb[] = {   /* 5C { 5A 9F70 9F67 } */
 		0xBF, 0x2D, 0x07, 0x5C, 0x05, 0x5A, 0x9F, 0x70, 0x9F, 0x67
 	};
+	static const uint8_t no_fb[] = { 0xBF, 0x2D, 0x05, 0x5C, 0x03, 0x5A, 0x9F, 0x70 };
 	static const uint8_t dflt[] = { 0xBF, 0x2D, 0x00 };
 	dbuf resp;
 	der_tlv list, it, x;
@@ -170,7 +177,8 @@ static int profiles(emu *e, prof *out, int cap)
 	if (!(e->quirks & EMU_Q_NO_9F67))
 		rc = profiles_query(e, with_fb, sizeof(with_fb), &resp, &list);
 	if (rc < 0) {
-		if (profiles_query(e, dflt, sizeof(dflt), &resp, &list) < 0) {
+		if (profiles_query(e, no_fb, sizeof(no_fb), &resp, &list) < 0 &&
+		    profiles_query(e, dflt, sizeof(dflt), &resp, &list) < 0) {
 			db_free(&resp);
 			return -1;
 		}
