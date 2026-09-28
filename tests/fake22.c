@@ -250,8 +250,13 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 				want9f67 |= tg == 0x9F67;
 				sgp32 |= tg == 0x9F26 || tg == 0x9F67 || tg == 0x9F7B;
 			}
-			if (sgp32 && f->refuse_taglist)
-				return 0x6A80;
+			if ((sgp32 && f->refuse_taglist) || f->refuse_taglist == 3) {
+				if (f->refuse_taglist == 1)
+					return 0x6A80;
+				/* profileInfoListError incorrectInputValues(1) */
+				db_put(r, "\xBF\x2D\x03\x81\x01\x01", 6);
+				return 0x9000;
+			}
 		}
 		m = der_begin(r, 0xBF2D);
 		l = der_begin(r, 0xA0);

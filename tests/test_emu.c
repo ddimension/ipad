@@ -530,6 +530,10 @@ static void test_list_profile_info(void)
 	static const uint8_t no_fb[] = { 0xBF, 0x2D, 0x05, 0x5C, 0x03, 0x5A, 0x9F, 0x70 };
 	static const uint8_t dflt[] = { 0x5A, 0x4F, 0x9F, 0x70, 0x91, 0x92, 0x95, 0x9F, 0x7B, 0x9F, 0x67 };
 	static const uint8_t dflt22[] = { 0x5A, 0x4F, 0x9F, 0x70, 0x91, 0x92, 0x95 };
+	/* the list the eIM asked of a consumer card that refused it (router 245) */
+	static const uint8_t eim_list[] = { 0xBF, 0x2D, 0x12, 0x5C, 0x10, 0x5A, 0x4F, 0x9F, 0x70, 0x90, 0x91, 0x92,
+	                                    0x95, 0x99, 0x9F, 0x7B, 0xB7, 0x9F, 0x26, 0x9F, 0x67 };
+	static const uint8_t eim_list22[] = { 0x5A, 0x4F, 0x9F, 0x70, 0x90, 0x91, 0x92, 0x95, 0x99, 0xB7 };
 	rig r;
 	dbuf resp;
 	der_tlv lst;
@@ -577,6 +581,23 @@ static void test_list_profile_info(void)
 	       "listProfileInfo, tags refused: asked again without 9F7B 9F67");
 	members(&lst, 1, m, sizeof(m));
 	OK(!strcmp(m, "5A 9F70 91 9F26"), "listProfileInfo, tags refused: 9F26 still on B");
+
+	/* refused with profileInfoListError instead of a status word (a consumer
+	 * card, for the eIM's list): asked again without 9F7B 9F67, never 9F26 */
+	r.f.refuse_taglist = 2;
+	OK(list_psmo(&r, eim_list, sizeof(eim_list), &resp, &lst),
+	   "listProfileInfo, profileInfoListError: answered on the second try");
+	EQ_HEX(r.f.last_taglist, r.f.last_taglist_len, eim_list22, sizeof(eim_list22),
+	       "listProfileInfo, profileInfoListError: asked again without 9F7B 9F26 9F67");
+	members(&lst, 1, m, sizeof(m));
+	OK(!strcmp(m, "5A 9F70 91 9F26"), "listProfileInfo, profileInfoListError: 9F26 still on B");
+
+	/* refused again: the card's error is the result */
+	r.f.refuse_taglist = 3;
+	/* list_psmo's failed search for A0 leaves lst on BF2D's last member */
+	OK(!list_psmo(&r, eim_list, sizeof(eim_list), &resp, &lst) && lst.tag == 0x81 &&
+	   lst.len == 1 && lst.val[0] == 1,
+	   "listProfileInfo, refused twice: the card's profileInfoListError passed on");
 	rig_close(&r);
 	db_free(&resp);
 }

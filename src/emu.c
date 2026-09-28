@@ -294,7 +294,8 @@ static bool has_tag(const uint32_t *tags, int n, uint32_t t)
  * - The ICCID is always asked for, as the only way to find the Fallback
  *   Profile in the answer, and dropped again when the eIM did not ask.
  * - A card that refuses the list for an SGP.32 tag it does not know (9F7B,
- *   9F67) is asked once more without them; a requested data object that a
+ *   9F67), by status word or by profileInfoListError, is asked once more
+ *   without them; its answer to that one is passed on. A requested data object that a
  *   profile does not have is omitted (SGP.22 5.7.15), which is what an
  *   SGP.22 card's profile is for those tags.
  * searchCriteria and iotSpecificTagList go to the card as the eIM sent them. */
@@ -305,7 +306,7 @@ static int64_t list_profile_info(emu *e, const der_tlv *op, dbuf *res)
 	int nwant, i, attempt;
 	der_tlv x;
 	dbuf req, resp;
-	bool with_fb, keep_iccid, sent = false;
+	bool with_fb, keep_iccid, strip, sent = false;
 	int64_t v = 0;
 
 	if (der_find(op->val, op->len, 0x5C, &x) == 0) {
@@ -316,14 +317,14 @@ static int64_t list_profile_info(emu *e, const der_tlv *op, dbuf *res)
 	}
 	with_fb = has_tag(want, nwant, 0x9F26);
 	keep_iccid = has_tag(want, nwant, 0x5A);
+	strip = has_tag(want, nwant, 0x9F7B) || has_tag(want, nwant, 0x9F67);
 
 	db_init(&req);
 	db_init(&resp);
-	for (attempt = 0; attempt < 2 && !sent; attempt++) {
+	for (attempt = 0; attempt < (strip ? 2 : 1) && !sent; attempt++) {
+		der_tlv top;
 		size_t m, l;
 
-		if (attempt == 1 && !has_tag(want, nwant, 0x9F7B) && !has_tag(want, nwant, 0x9F67))
-			break;   /* nothing left to leave out */
 		req.len = resp.len = 0;
 		m = der_begin(&req, 0xBF2D);
 		if (der_find(op->val, op->len, 0xA0, &x) == 0)
@@ -339,6 +340,10 @@ static int64_t list_profile_info(emu *e, const der_tlv *op, dbuf *res)
 			db_put(&req, x.raw, x.raw_len);
 		der_end(&req, m);
 		sent = !req.err && card_call(e, &req, &resp) == 0;
+		/* SGP.22 only reserves 9F7B/9F67 (5.7.15) */
+		if (sent && attempt == 0 && strip && der_parse(resp.d, resp.len, &top) == 0 &&
+		    der_find(top.val, top.len, 0xA0, &x) < 0)
+			sent = false;
 	}
 
 	if (!sent) {

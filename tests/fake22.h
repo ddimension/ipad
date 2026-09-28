@@ -23,7 +23,9 @@ typedef struct {
 	void *before_arg;
 	/* a card that answers a GetProfilesInfo tag list naming an SGP.32 tag
 	 * (9F26, 9F67, 9F7B) with an error status word, as one that does not
-	 * know them may; other unknown tags are just not returned */
+	 * know them may; other unknown tags are just not returned. 2: with a
+	 * profileInfoListError incorrectInputValues instead, as a real consumer
+	 * card did; 3: that error to every tag list */
 	int refuse_taglist;
 	/* the tag list of the last GetProfilesInfo, and whether it had one */
 	uint8_t last_taglist[32];
