@@ -325,15 +325,17 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 
 	case 0xBF43: {   /* one rule: PPR1 for any operator */
 		size_t a, rule, ops;
-		uint8_t ppr1[2] = { 1, 0 }, none[1] = { 0 };
+		uint8_t ppr1[2] = { 0, 1 }, none[1] = { 0 };
 
+		/* ProfilePolicyAuthorisationRule under SGP.22's AUTOMATIC TAGS:
+		 * pprIds [0], allowedOperators [1], pprFlags [2] */
 		m = der_begin(r, 0xBF43);
 		a = der_begin(r, 0xA0);
 		rule = der_begin(r, 0x30);
-		der_put_bits(r, 0x03, ppr1, 2);
-		ops = der_begin(r, 0x30);
+		der_put_bits(r, 0x80, ppr1, 2);
+		ops = der_begin(r, 0xA1);
 		der_end(r, ops);
-		der_put_bits(r, 0x03, none, 1);
+		der_put_bits(r, 0x82, none, 1);
 		der_end(r, rule);
 		der_end(r, a);
 		der_end(r, m);
