@@ -20,11 +20,13 @@
  *     immediate  [7]  SEQUENCE { flag [0] BOOLEAN, oid [1] OCTET STRING OPTIONAL,
  *                                addr [2] OCTET STRING OPTIONAL } OPTIONAL,
  *     tokenCtr   [8]  INTEGER,
- *     quirks     [9]  INTEGER OPTIONAL,         -- emu_int.h EMU_Q_*
- *     backoff    [10] SEQUENCE { fp [0] OCTET STRING (8),
- *                                SEQUENCE OF SEQUENCE { seq [0] INTEGER, due [1] INTEGER,
- *                                                       delay [2] INTEGER } } OPTIONAL
+ *     quirks     [9]  INTEGER OPTIONAL          -- emu_int.h EMU_Q_*
  *   }
+ *
+ * [10] held the notification backoff for a while (3790ad3). It moved to
+ * <EID>.nbo (nbo.h), for IoT eUICCs too; a state file that still has it is
+ * read as if it had not, and the next save leaves it out. The records are
+ * not carried over: that costs one more offer of each refused notification.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,22 +179,6 @@ int emu_state_save(const emu *e)
 	if (e->quirks)
 		der_put_int(&b, 0x89, e->quirks);
 
-	if (e->nnb) {
-		uint8_t fp[8];
-
-		for (i = 0; i < 8; i++)
-			fp[i] = (uint8_t)(e->nb_fp >> (56 - 8 * i));
-		m = der_begin(&b, 0xAA);
-		der_put(&b, 0x80, fp, 8);
-		for (i = 0; i < e->nnb; i++) {
-			it = der_begin(&b, 0x30);
-			der_put_int(&b, 0x80, e->nb[i].seq);
-			der_put_int(&b, 0x81, e->nb[i].due);
-			der_put_int(&b, 0x82, e->nb[i].delay);
-			der_end(&b, it);
-		}
-		der_end(&b, m);
-	}
 	der_end(&b, top);
 
 	if (b.err || snprintf(tmp, sizeof(tmp), "%s.tmp", e->cfg.state_path) >= (int)sizeof(tmp))
@@ -332,102 +318,9 @@ int emu_state_load(emu *e)
 	if (der_find(top.val, top.len, 0x89, &t) == 0 && der_get_int(&t, &v) == 0)
 		e->quirks = (int)v;
 
-	/* the backoff is an optimisation: a damaged record is dropped, not
-	 * a reason to refuse the state */
-	if (der_find(top.val, top.len, 0xAA, &t) == 0 && der_find(t.val, t.len, 0x80, &x) == 0 && x.len == 8) {
-		int i;
-
-		for (i = 0; i < 8; i++)
-			e->nb_fp = e->nb_fp << 8 | x.val[i];
-		for (p = t.val, end = t.val + t.len; p < end && e->nnb < EMU_MAX_NB; ) {
-			der_tlv s, d, l;
-
-			if (der_next(&p, end, &it) < 0)
-				break;
-			if (it.tag != 0x30 || der_find(it.val, it.len, 0x80, &s) < 0 ||
-			    der_find(it.val, it.len, 0x81, &d) < 0 || der_find(it.val, it.len, 0x82, &l) < 0 ||
-			    der_get_int(&s, &e->nb[e->nnb].seq) < 0 || der_get_int(&d, &e->nb[e->nnb].due) < 0 ||
-			    der_get_int(&l, &e->nb[e->nnb].delay) < 0)
-				continue;
-			e->nnb++;
-		}
-	}
-
 	rc = 0;
 out:
 	db_free(&b);
 	return rc;
 }
 
-/* --- notification backoff (emu.h) ------------------------------------------ */
-
-/* FNV-1a over every eIM configuration: only a change is to be seen, a
- * collision costs one early retry */
-static uint64_t eims_fp(const emu *e)
-{
-	uint64_t h = 0xcbf29ce484222325ULL;
-	size_t j;
-	int i;
-
-	for (i = 0; i < e->neims; i++)
-		for (j = 0; j < e->eims[i].cfg.len; j++)
-			h = (h ^ e->eims[i].cfg.d[j]) * 0x100000001b3ULL;
-	return h;
-}
-
-static int nb_find(emu *e, int64_t seq)
-{
-	int i;
-	uint64_t fp = eims_fp(e);
-
-	if (fp != e->nb_fp) {
-		e->nnb = 0;
-		e->nb_fp = fp;
-	}
-	for (i = 0; i < e->nnb && e->nb[i].seq != seq; i++)
-		;
-	return i < e->nnb ? i : -1;
-}
-
-bool emu_notif_due(emu *e, int64_t seq, int64_t now)
-{
-	int i = nb_find(e, seq);
-
-	/* a due date further out than the cap: the clock went back (a router
-	 * sets it late), and the record would hold the notification too long */
-	return i < 0 || now >= e->nb[i].due || e->nb[i].due - now > EMU_NB_CAP;
-}
-
-int64_t emu_notif_refused(emu *e, int64_t seq, int64_t now)
-{
-	int i = nb_find(e, seq);
-	int64_t d = i < 0 ? 0 : e->nb[i].delay;
-
-	d = d < EMU_NB_FIRST ? EMU_NB_FIRST : d >= EMU_NB_CAP / 2 ? EMU_NB_CAP : 2 * d;
-	if (i < 0) {
-		if (e->nnb == EMU_MAX_NB)   /* full: the oldest record goes */
-			memmove(e->nb, e->nb + 1, sizeof(e->nb[0]) * (size_t)--e->nnb);
-		i = e->nnb++;
-		e->nb[i].seq = seq;
-	}
-	e->nb[i].delay = d;
-	e->nb[i].due = now + d;
-	emu_state_save(e);
-	return d;
-}
-
-void emu_notif_keep(emu *e, const int64_t *seqs, int n)
-{
-	int i, j, k = 0;
-
-	for (i = 0; i < e->nnb; i++) {
-		for (j = 0; j < n && seqs[j] != e->nb[i].seq; j++)
-			;
-		if (j < n)
-			e->nb[k++] = e->nb[i];
-	}
-	if (k != e->nnb) {
-		e->nnb = k;
-		emu_state_save(e);
-	}
-}

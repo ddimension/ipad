@@ -67,6 +67,9 @@ typedef struct {
 	 * not handed to the eIM, which would drop it. NULL: kept for this run
 	 * only. */
 	const char *es9_path;
+	/* the notification backoff (nbo.h), <EID>.nbo; NULL: kept for this run
+	 * only */
+	const char *nbo_path;
 	int64_t (*clock)(void);    /* test seam: seconds now; NULL: time() */
 	ipa_transport transport;   /* NULL: HTTPS */
 	void *transport_ud;

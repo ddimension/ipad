@@ -174,6 +174,7 @@ last component. The wwand-ipa package keeps it across a sysupgrade
 | `<EID>.state` | The emulation's state for one card (32-digit EID in the name). | After every function that changes it: written to `<file>.tmp` with `fsync`, then renamed, so a crash leaves either the old state or the new one. |
 | `bind.pending`, `bind.done`, `bind.refused`, `bind.after` | Where the self-binding of a bundle stands (see [below](#b-a-provisioning-bundle-eim-decision-d-69)). | By `provision` and `poll`. |
 | `<EID>.es9` | The seqNumbers of direct-download PIRs not yet delivered to their SM-DP+ over ES9+ (see [The PIR of a direct download](#the-pir-of-a-direct-download)). Only with `-D`, for an IoT eUICC as well. | Before the trigger result goes out; removed once nothing is owed. |
+| `<EID>.nbo` | The notification backoff (see [Notifications](#notifications-and-profile-installation-results)), for an IoT eUICC as well. Text: a line `ipad-nbo/1 <eIM configurations fingerprint>`, then one line per refused notification, `<seqNumber> <due> <delay> <metadata fingerprint>` (seconds, 16 hex digits). A damaged file or line is no record, never an error. | After each refusal and each change; removed when no record is left. |
 
 The state file is DER (`emu_state.c`):
 
@@ -192,10 +193,7 @@ State ::= SEQUENCE {
   immediate  [7]  SEQUENCE { flag [0] BOOLEAN, oid [1] OPTIONAL,
                              addr [2] OPTIONAL } OPTIONAL,
   tokenCtr   [8]  INTEGER,
-  quirks     [9]  INTEGER OPTIONAL,                -- what the card refused once
-  backoff    [10] SEQUENCE { fp [0] OCTET STRING (8),
-                             SEQUENCE OF SEQUENCE { seq [0] INTEGER,
-                                                    due [1] INTEGER, delay [2] INTEGER } } OPTIONAL
+  quirks     [9]  INTEGER OPTIONAL                 -- what the card refused once
 }
 ```
 
@@ -208,11 +206,12 @@ word `6A80` (incorrect data), followed by an answer to the list without
 them. Any other failure (no answer, `6F00`, `6581`, `6985`, an answer that
 does not parse) can be a one-off: the list without them serves that call
 only, and the next asks with them again. Remembering a one-off would cost a
-card that knows `9F67` its `fallbackAllowed` for good. `backoff` is the notification backoff (see
-[Notifications](#notifications-and-profile-installation-results)); `fp` is a
-fingerprint of the eIM configurations it was recorded under. A damaged
-`backoff` is dropped, not a reason to refuse the state. `ipad reset <EID>`
-forgets both with the rest of the card's state.
+card that knows `9F67` its `fallbackAllowed` for good.
+
+A `[10]` in the state is the notification backoff as 3790ad3 kept it,
+before it moved to `<EID>.nbo`. It is ignored when read and left out on
+the next save; its records are not carried over, which costs one more offer
+of each refused notification.
 
 The state is bound to the card. `emu_open()` reads the EID from the card
 (`GetEUICCData`, tag list `5A`) and refuses a state file whose `eid` does not
@@ -274,11 +273,12 @@ profile list, `rollbackNotAvailable(20)` and `returnFallbackProfile(21)`.
 | Both | As above, plus a new key. | As for `device.key`: `ipad reset all`, a configuration at the eIM's counter + 1, `export`, re-key on the eIM before the first poll ([Re-keying](#re-keying)). |
 
 `ipad reset <EID>` (and `wwandctl ipa reset`) deletes that card's
-`<EID>.state` and nothing else. The device key and the `bind.*` markers stay:
+`<EID>.state` and its `<EID>.nbo`, the backoff made under the eIM
+association it forgets, and nothing else. The device key and the `bind.*` markers stay:
 under wwand the directory is shared by all modems, and a new key would leave
 every other card's results unverifiable at the eIM. `ipad reset all` (and
-`wwandctl ipa reset --all`) deletes `device.key`, **every** `*.state` and the
-`bind.*` markers, for every card on the router; a re-key and a refused
+`wwandctl ipa reset --all`) deletes `device.key`, **every** `*.state` and
+`*.nbo`, and the `bind.*` markers, for every card on the router; a re-key and a refused
 binding need that. A bare `ipad reset` is refused. No card is needed for
 either.
 
@@ -677,9 +677,9 @@ What the code does:
   removal, the host's ES9+ client). On a consumer card that keeps old
   notifications one read is tens of kilobytes of GET RESPONSE.
 - A notification the eIM answers but does not take (an error status, see
-  below) waits out a **backoff** per seqNumber on an emulated card, kept in
-  the state (`backoff`): it is offered again an hour after the first
-  refusal, then after 2, 4, 8 and 16 hours, and then once a day. It stays on
+  below) waits out a **backoff**, kept per card in `<EID>.nbo` (`src/nbo.h`),
+  on an emulated card and an IoT eUICC alike: it is offered again an hour
+  after the first refusal, then after 2, 4, 8 and 16 hours, and then once a day. It stays on
   the card throughout (3.7: the IPA deletes only what the eIM acknowledged);
   only the frequency changes. On router 245, eleven old consumer-card
   notifications cost 11 ESipa calls on every poll without it. The records
@@ -688,8 +688,17 @@ What the code does:
   a record is dropped once its notification is no longer on the card (as
   with the ES9+ record below, only after a list read to its end). A due
   date more than a day ahead means the clock went back (a router sets it
-  late), and the notification is offered. An IoT eUICC has no such state,
-  and its refused notifications go out on every poll as before.
+  late), and the notification is offered.
+- A record holds for one notification, not for its seqNumber alone: it
+  carries the first 8 octets of SHA-256 over the notification's
+  `NotificationMetadata` (seqNumber, operation, address, ICCID), and a
+  seqNumber that comes back with other metadata is offered at once. The
+  metadata rather than the whole notification, so that a listing of the
+  metadata alone (SGP.22 `ListNotification`) can decide it without reading
+  the notification. The eIM
+  configurations are fingerprinted the same way, over
+  `GetEimConfigurationData` (5.9.18), which carries no `counterValue`, so a
+  package is no change.
 - ipad sends no notification to an SM-DP+ itself: it has no ES9+ client. The
   one exception to the eIM route is the PIR of a direct download, which the
   host's ES9+ client (lpac) delivers (next section). Everything else reaches

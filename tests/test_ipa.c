@@ -12,6 +12,7 @@
 #include "emu.h"
 #include "euicc.h"
 #include "ipa.h"
+#include "nbo.h"
 #include "hex.h"
 
 static const char *EIM = "eim.test.example";
@@ -410,7 +411,7 @@ static int stored_eprs(euicc *eu)
 
 int main(void)
 {
-	char state[] = "/tmp/ipad-test-ipa-XXXXXX";
+	char state[] = "/tmp/ipad-test-ipa-XXXXXX", nbo[] = "/tmp/ipad-test-nbo-XXXXXX";
 	int fd = mkstemp(state);
 	simcard s;
 	fake22 fc;
@@ -430,6 +431,8 @@ int main(void)
 
 	close(fd);
 	unlink(state);
+	close(mkstemp(nbo));
+	unlink(nbo);
 	if (getenv("IPAD_ESIPA_DUMP"))
 		dump = fopen(getenv("IPAD_ESIPA_DUMP"), "w");
 
@@ -472,6 +475,7 @@ int main(void)
 	cfg.transport = eim_transport;
 	cfg.transport_ud = &eim;
 	cfg.clock = clock_now;
+	cfg.nbo_path = nbo;
 
 	/* --- IpaCapabilities bytes (4.1), both ways; a BIT STRING drops
 	 * trailing zero bits, so direct off leaves one named bit less --- */
@@ -711,16 +715,17 @@ int main(void)
 	mark = eim.ngot;
 	OK(ipa_deliver_notifications(a) == 0 && fc.nnotes == 1 && count_got(&eim, mark, 0xBF3D) == 0,
 	   "notify: the refused one is held back within its hour");
-	emu_close(eu.emu);   /* a new run: the backoff is in the state file */
-	eu.emu = emu_open(&c, &ecfg);
-	now += EMU_NB_FIRST - 1;
+	ipa_close(a);   /* a new run: the backoff is in <EID>.nbo */
+	a = ipa_open(&cfg);
+	OK(a != NULL && file_exists(nbo), "notify: the backoff written to its file");
+	now += NBO_FIRST - 1;
 	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 0,
 	   "notify: still held after a restart, a second before the hour");
 	now += 1;
 	eim.refuse_notify = 1;
 	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1 && fc.nnotes == 1,
 	   "notify: offered again after the hour, and refused again");
-	now += 2 * EMU_NB_FIRST - 1;
+	now += 2 * NBO_FIRST - 1;
 	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1,
 	   "notify: the second refusal doubled the delay");
 	now += 1;
@@ -753,8 +758,24 @@ int main(void)
 		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1,
 		   "notify: after an entry without a seqNumber the backoff still holds it");
 	}
-	now += EMU_NB_FIRST;
+	now += NBO_FIRST;
 	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0, "notify: taken after its hour");
+
+	/* an IoT eUICC gets the same backoff, from the same file: the card
+	 * driven without the emulation (fake22 has no GetEimConfigurationData,
+	 * which leaves the records' eIM fingerprint as it is) */
+	eu.kind = EUICC_IOT;
+	fake22_add_other(&fc);
+	eim.refuse_notify = 1;
+	mark = eim.ngot;
+	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1 &&
+	   strstr(h.last_log, "offered again in 3600s") != NULL, "iot: refused, the backoff recorded");
+	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1 && fc.nnotes == 1,
+	   "iot: held within its hour");
+	now += NBO_FIRST;
+	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0 && count_got(&eim, mark, 0xBF3D) == 2,
+	   "iot: taken after it, and removed");
+	eu.kind = EUICC_EMU;
 
 	/* --- direct download through the host (3.2.3.1) --- */
 	{
@@ -1060,6 +1081,47 @@ int main(void)
 		db_free(&c1);
 		unlink(st2);
 	}
+
+	/* --- the backoff holds for the eIM configurations it was made under:
+	 * another one (reset, provisioned anew) may take the notification --- */
+	{
+		static const uint8_t reset_eim[] = { 0xBF, 0x64, 0x04, 0x82, 0x02, 0x02, 0x04 };
+		char st3[] = "/tmp/ipad-test-ipa3-XXXXXX";
+		dbuf c0, r0;
+
+		close(mkstemp(st3));
+		unlink(st3);
+		ecfg.state_path = st3;
+		eu.emu = emu_open(&c, &ecfg);
+		db_init(&c0);
+		db_init(&r0);
+		eimpkg_cfg_ex(&c0, EIM, "eim.test.example:8443", 4, eim_key, false, NULL);
+		OK(eu.emu && ipa_add_initial_eim(&eu, c0.d, c0.len, err, sizeof(err)) == 0, "nbo eIM: provisioned");
+		a = ipa_open(&cfg);
+		fake22_add_other(&fc);
+		eim.refuse_notify = 1;
+		mark = eim.ngot;
+		OK(a && ipa_deliver_notifications(a) == 0 && ipa_deliver_notifications(a) == 0 &&
+		   count_got(&eim, mark, 0xBF3D) == 1, "nbo eIM: refused once, then held");
+		/* the same configuration again is no change (no counterValue in
+		 * GetEimConfigurationData, 5.9.18): still held */
+		OK(emu_es10(eu.emu, reset_eim, sizeof(reset_eim), &r0) == 0 &&
+		   ipa_add_initial_eim(&eu, c0.d, c0.len, err, sizeof(err)) == 0 && ipa_deliver_notifications(a) == 0 &&
+		   count_got(&eim, mark, 0xBF3D) == 1, "nbo eIM: the same configuration provisioned again, still held");
+		c0.len = 0;
+		eimpkg_cfg_ex(&c0, EIM, "eim2.test.example:8443", 9, eim_key, false, NULL);
+		r0.len = 0;
+		OK(emu_es10(eu.emu, reset_eim, sizeof(reset_eim), &r0) == 0 &&
+		   ipa_add_initial_eim(&eu, c0.d, c0.len, err, sizeof(err)) == 0,
+		   "nbo eIM: reset and provisioned with another FQDN");
+		OK(a && ipa_deliver_notifications(a) == 1 && count_got(&eim, mark, 0xBF3D) == 2 && fc.nnotes == 0,
+		   "nbo eIM: offered at once under the new configuration, and taken");
+		ipa_close(a);
+		emu_close(eu.emu);
+		db_free(&c0);
+		db_free(&r0);
+		unlink(st3);
+	}
 	simcard_free(&s);
 	fake22_free(&fc);
 	for (mark = 0; mark < eim.ngot; mark++)
@@ -1071,6 +1133,7 @@ int main(void)
 	crypto_key_free(dev_key);
 	crypto_key_free(tls_key);
 	unlink(state);
+	unlink(nbo);
 	if (dump)
 		fclose(dump);
 	DONE("test_ipa");

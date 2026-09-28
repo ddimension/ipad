@@ -150,14 +150,17 @@ ok 'echo "$out" | grep -q "\"bind\":\"done\""' 'info: bound'
 eid=89049032123451234512345678901235
 other=89049032000000000000000000000001
 cp "$w/b/$eid.state" "$w/b/$other.state"
+: >"$w/b/$eid.nbo"
+: >"$w/b/$other.nbo"
 out=$(run -s "$w/b" reset)
 ok 'echo "$out" | grep -q "\"code\":2,\"message\":\"reset\"" && [ -e "$w/b/$eid.state" ] && [ -e "$w/b/device.key" ]' \
 	'reset: without an EID or "all", refused and nothing removed'
 out=$(run -s "$w/b" reset 8904903212345123451234567890123)
 ok 'echo "$out" | grep -q "\"code\":2" && [ -e "$w/b/$eid.state" ]' 'reset: a malformed EID is refused'
 out=$(run -s "$w/b" reset "$eid")
-ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"reset\"" && [ ! -e "$w/b/$eid.state" ]' 'reset <EID>: the state of that card removed'
-ok '[ -e "$w/b/$other.state" ] && [ -e "$w/b/device.key" ] && [ -e "$w/b/bind.done" ]' \
+ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"reset\"" && [ ! -e "$w/b/$eid.state" ] && [ ! -e "$w/b/$eid.nbo" ]' \
+	'reset <EID>: the state and the notification backoff of that card removed'
+ok '[ -e "$w/b/$other.state" ] && [ -e "$w/b/$other.nbo" ] && [ -e "$w/b/device.key" ] && [ -e "$w/b/bind.done" ]' \
 	'reset <EID>: the other card, the device key and the binding stay'
 out=$(run -s "$w/b" -u "$url" poll)
 ok 'echo "$out" | grep -q "\"code\":3"' 'reset <EID>: poll says no eIM configured'
@@ -165,8 +168,8 @@ ok 'echo "$out" | grep -q "\"code\":3"' 'reset <EID>: poll says no eIM configure
 # reset all: configuration, state, key and binding gone; a second bundle starts over
 out=$(run -s "$w/b" reset all)
 ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"reset\""' 'reset all: done'
-ok '[ ! -e "$w/b/device.key" ] && [ ! -e "$w/b/bind.done" ] && ! ls "$w/b"/*.state >/dev/null 2>&1' \
-	'reset all: key, binding and every state removed'
+ok '[ ! -e "$w/b/device.key" ] && [ ! -e "$w/b/bind.done" ] && ! ls "$w/b"/*.state >/dev/null 2>&1 && ! ls "$w/b"/*.nbo >/dev/null 2>&1' \
+	'reset all: key, binding, every state and backoff removed'
 out=$(run -s "$w/b" -u "$url" poll)
 ok 'echo "$out" | grep -q "\"code\":3"' 'reset all: poll says no eIM configured'
 

@@ -595,6 +595,10 @@ static int cmd_reset(const char *dir, const char *which)
 		snprintf(p, sizeof(p), "%s/%s.state", dir, eidhex);
 		if (unlink(p) == 0)
 			n++;
+		/* the backoff belongs to the eIM association that is forgotten */
+		snprintf(p, sizeof(p), "%s/%s.nbo", dir, eidhex);
+		if (unlink(p) == 0)
+			n++;
 		syslog(LOG_NOTICE, "reset: card %s: %d file(s) removed from %s", eidhex, n, dir);
 		return 0;
 	}
@@ -607,7 +611,7 @@ static int cmd_reset(const char *dir, const char *which)
 	if ((d = opendir(dir))) {
 		while ((e = readdir(d))) {
 			l = strlen(e->d_name);
-			if (l > 6 && !strcmp(e->d_name + l - 6, ".state")) {
+			if ((l > 6 && !strcmp(e->d_name + l - 6, ".state")) || (l > 4 && !strcmp(e->d_name + l - 4, ".nbo"))) {
 				snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
 				if (unlink(p) == 0)
 					n++;
@@ -773,6 +777,7 @@ int main(int argc, char **argv)
 	uint8_t eid[16];
 	char state[600];   /* function scope: the emulation opened below uses it until the end */
 	char es9[600];     /* the same for ipa_config.es9_path */
+	char nbo[600];     /* and ipa_config.nbo_path */
 	int opt, verbose = 0, rc = 1, fallback_all = 0;
 	bool direct = false;
 
@@ -853,13 +858,18 @@ int main(int argc, char **argv)
 		cfg.host.log(&hl, LOG_ERR, "no EID: the card does not answer the ISD-R");
 		goto out;
 	}
-	if (direct) {
+	{
 		char eidhex[33];
 
 		hex_encode(eid, 16, eidhex);
 		mkdir_p(dir);
-		snprintf(es9, sizeof(es9), "%s/%s.es9", dir, eidhex);
-		cfg.es9_path = es9;
+		if (direct) {
+			snprintf(es9, sizeof(es9), "%s/%s.es9", dir, eidhex);
+			cfg.es9_path = es9;
+		}
+		/* the notification backoff, for either backend (nbo.h) */
+		snprintf(nbo, sizeof(nbo), "%s/%s.nbo", dir, eidhex);
+		cfg.nbo_path = nbo;
 	}
 
 	if (!strcmp(backend, "iot"))

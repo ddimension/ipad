@@ -16,7 +16,7 @@
 #include <time.h>
 
 #include "ipa.h"
-#include "emu.h"
+#include "nbo.h"
 #include "crypto.h"
 #include "hex.h"
 
@@ -38,6 +38,8 @@ struct ipa {
 	 * RESPONSE. Dropped whenever the list may change. */
 	dbuf nl;
 	bool nl_ok;
+	nbo nb;                  /* notification backoff (nbo.h, nbo_path) */
+	bool nb_synced;          /* its eIM fingerprint checked in this delivery run */
 };
 
 #define DAP_URL_PATH "/gsma/rsp2/asn1"
@@ -240,11 +242,11 @@ static int esipa_notify(ipa *a, const dbuf *msg)
 
 /* ---- notifications ---- */
 
-/* seqNumber of a PendingNotification as the card stores it: BF37 (its
- * BF27 carries the metadata) or OtherSignedNotification 30 */
-static int notif_seq(const der_tlv *n, int64_t *seq)
+/* NotificationMetadata of a PendingNotification as the card stores it:
+ * inside BF37's BF27 for a PIR, directly in an OtherSignedNotification 30 */
+static int notif_meta(const der_tlv *n, der_tlv *md)
 {
-	der_tlv a, b, s;
+	der_tlv a;
 	const uint8_t *p = n->val;
 	size_t len = n->len;
 
@@ -254,9 +256,26 @@ static int notif_seq(const der_tlv *n, int64_t *seq)
 		p = a.val;
 		len = a.len;
 	}
-	if (der_find(p, len, 0xBF2F, &b) < 0 || der_find(b.val, b.len, 0x80, &s) < 0)
+	return der_find(p, len, 0xBF2F, md);
+}
+
+static int meta_seq(const der_tlv *md, int64_t *seq)
+{
+	der_tlv s;
+
+	if (der_find(md->val, md->len, 0x80, &s) < 0)
 		return -1;
 	return der_get_int(&s, seq);
+}
+
+/* seqNumber of a PendingNotification */
+static int notif_seq(const der_tlv *n, int64_t *seq)
+{
+	der_tlv md;
+
+	if (notif_meta(n, &md) < 0)
+		return -1;
+	return meta_seq(&md, seq);
 }
 
 static int remove_seq(ipa *a, int64_t seq)
@@ -412,6 +431,28 @@ static int es9_deliver(ipa *a, int64_t seq)
 	return rc;
 }
 
+/* The backoff's records hold for the eIM configurations they were made
+ * under (nbo.h): checked once per delivery run, against
+ * GetEimConfigurationData (5.9.18, which carries no counterValue, so a
+ * package does not count as a change). A card that does not answer leaves
+ * the records as they are. */
+static void nb_sync(ipa *a)
+{
+	dbuf r;
+	der_tlv t;
+	uint8_t fp[8];
+
+	if (a->nb_synced)
+		return;
+	a->nb_synced = true;
+	db_init(&r);
+	if (es10_empty(a->c.eu, 0xBF55, &r, &t) == 0) {
+		nbo_fp(t.raw, t.raw_len, fp);
+		nbo_eims(&a->nb, fp);
+	}
+	db_free(&r);
+}
+
 #define SEEN_MAX 64
 
 int ipa_deliver_notifications(ipa *a)
@@ -425,18 +466,20 @@ int ipa_deliver_notifications(ipa *a)
 	int64_t seen[SEEN_MAX];
 	int nseen = 0, i, rc;
 	bool listed = false;
-	emu *em = a->c.eu->kind == EUICC_EMU ? a->c.eu->emu : NULL;
 	int64_t now = a->c.clock ? a->c.clock() : (int64_t)time(NULL);
 
 #define SEEN(s) (nseen < SEEN_MAX ? (void)(seen[nseen++] = (s)) : (void)(listed = false))
 
 	db_init(&r);
 	db_init(&msg);
+	a->nb_synced = false;
 	if (retrieve(a, NULL, 0, &r, &t) == 0 && der_find(t.val, t.len, 0xA0, &list) == 0) {
 		listed = true;
 		for (p = list.val, end = list.val + list.len; p < end; ) {
 			int64_t seq;
 			size_t m, k;
+			der_tlv md;
+			uint8_t fp[8];
 
 			/* a list that does not parse to its end, or a notification
 			 * without a seqNumber, leaves notifications unseen: every
@@ -446,7 +489,7 @@ int ipa_deliver_notifications(ipa *a)
 				listed = false;
 				break;
 			}
-			if (notif_seq(&n, &seq) < 0) {
+			if (notif_meta(&n, &md) < 0 || meta_seq(&md, &seq) < 0) {
 				say(a, LOG_WARNING, "notification without a sequence number, skipped");
 				listed = false;
 				continue;
@@ -458,7 +501,12 @@ int ipa_deliver_notifications(ipa *a)
 					SEEN(seq);
 				continue;
 			}
-			if (em && !emu_notif_due(em, seq, now)) {
+			/* the metadata identifies the notification: what a
+			 * metadata-only listing gives as well */
+			nbo_fp(md.raw, md.raw_len, fp);
+			if (a->nb.n)
+				nb_sync(a);
+			if (!nbo_due(&a->nb, seq, fp, now)) {
 				held++;
 				SEEN(seq);
 				continue;
@@ -476,15 +524,11 @@ int ipa_deliver_notifications(ipa *a)
 			 * (3.7: only an acknowledged one is removed) and the next one
 			 * goes out: stopping here let a single notification the eIM
 			 * keeps refusing (a PIR it cannot attribute) hold back every
-			 * later one of the card. On an emulated card it then waits
-			 * out a backoff (emu.h emu_notif_due). */
+			 * later one of the card. It then waits out a backoff (nbo.h). */
 			if (rc == -2) {
-				if (em)
-					say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept; offered again in %llds",
-					    (long long)seq, (long long)emu_notif_refused(em, seq, now));
-				else
-					say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept for a later run",
-					    (long long)seq);
+				nb_sync(a);
+				say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept; offered again in %llds",
+				    (long long)seq, (long long)nbo_refused(&a->nb, seq, fp, now));
 				SEEN(seq);
 				continue;
 			}
@@ -514,8 +558,8 @@ int ipa_deliver_notifications(ipa *a)
 				es9_set(a, a->es9[i], false);
 		}
 	}
-	if (listed && em)
-		emu_notif_keep(em, seen, nseen);
+	if (listed)
+		nbo_keep(&a->nb, seen, nseen);
 	a->nl_ok = false;   /* the run's last reader; others change the card */
 	db_free(&r);
 	db_free(&msg);
@@ -1432,6 +1476,7 @@ ipa *ipa_open(const ipa_config *cfg)
 	a->c = *cfg;
 	a->cause = cfg->state_change_cause;
 	es9_load(a);
+	nbo_load(&a->nb, cfg->nbo_path);
 	db_init(&a->ca);
 	db_init(&a->nl);
 	db_init(&r);

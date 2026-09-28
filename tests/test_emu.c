@@ -672,60 +672,60 @@ static void test_list_profile_info(void)
 	db_free(&resp);
 }
 
-/* the backoff of notifications the eIM did not take (emu.h emu_notif_due) */
-static void test_notif_backoff(void)
+/* A state file from 3790ad3 carried the notification backoff as [10]; it
+ * moved to <EID>.nbo. Such a file still loads, and the next save drops it. */
+static void test_old_backoff_field(void)
 {
-	static const uint8_t reset_eim[] = { 0xBF, 0x64, 0x04, 0x82, 0x02, 0x02, 0x04 };   /* resetEimConfigData */
-	static const int64_t want[] = { 7200, 14400, 28800, 57600, 86400, 86400 };
-	const int64_t t0 = 1790000000, only61[] = { 61 };
-	int64_t t = t0;
-	dbuf req, resp;
-	size_t m, l, i;
-	bool ok = true;
+	static const uint8_t backoff[] = { 0xAA, 0x17, 0x80, 0x08, 1, 2, 3, 4, 5, 6, 7, 8,
+	                                   0x30, 0x0B, 0x80, 0x01, 0x26, 0x81, 0x03, 0x01, 0x00, 0x00,
+	                                   0x82, 0x01, 0x10 };
+	dbuf b, w;
+	der_tlv top, x;
+	FILE *f;
 	rig r;
+	size_t m;
+	long n;
 
-	OK(rig_open(&r, 0) == 0, "backoff: rig");
-	OK(emu_notif_due(r.e, 38, t0), "backoff: a notification never refused is due");
-	OK(emu_notif_refused(r.e, 38, t0) == EMU_NB_FIRST, "backoff: an hour after the first refusal");
-	OK(!emu_notif_due(r.e, 38, t0 + EMU_NB_FIRST - 1) && emu_notif_due(r.e, 38, t0 + EMU_NB_FIRST),
-	   "backoff: held for the hour, due after it");
-	OK(emu_notif_due(r.e, 61, t0), "backoff: per seqNumber");
-	for (i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
-		t += EMU_NB_CAP;
-		ok = ok && emu_notif_refused(r.e, 38, t) == want[i];
+	OK(rig_open(&r, 0) == 0, "old [10]: rig");
+	r.e->quirks = EMU_Q_NO_9F67;
+	OK(emu_state_save(r.e) == 0, "old [10]: a state saved");
+	db_init(&b);
+	db_init(&w);
+	f = fopen(r.state, "rb");
+	OK(f != NULL, "old [10]: state file there");
+	if (f) {
+		uint8_t buf[8192];
+
+		n = (long)fread(buf, 1, sizeof(buf), f);
+		fclose(f);
+		db_put(&b, buf, (size_t)n);
 	}
-	OK(ok, "backoff: doubling, capped at a day");
+	OK(der_parse(b.d, b.len, &top) == 0, "old [10]: state parses");
+	m = der_begin(&w, top.tag);
+	db_put(&w, top.val, top.len);
+	db_put(&w, backoff, sizeof(backoff));
+	der_end(&w, m);
+	f = fopen(r.state, "wb");
+	fwrite(w.d, 1, w.len, f);
+	fclose(f);
 
 	emu_close(r.e);
 	r.e = emu_open(&r.c, &r.cfg);
-	OK(r.e && !emu_notif_due(r.e, 38, t + EMU_NB_CAP - 1) && emu_notif_due(r.e, 38, t + EMU_NB_CAP),
-	   "backoff: kept in the state across a restart");
-	OK(emu_notif_due(r.e, 38, t0), "backoff: a clock gone back does not hold it longer than the cap");
+	OK(r.e && (r.e->quirks & EMU_Q_NO_9F67), "old [10]: the state with [10] loads, the rest intact");
+	OK(r.e && emu_state_save(r.e) == 0, "old [10]: saved again");
+	b.len = 0;
+	f = fopen(r.state, "rb");
+	if (f) {
+		uint8_t buf[8192];
 
-	emu_notif_refused(r.e, 61, t);
-	emu_notif_keep(r.e, only61, 1);
-	OK(emu_notif_due(r.e, 38, t) && !emu_notif_due(r.e, 61, t),
-	   "backoff: the record of one no longer on the card is dropped");
-
-	/* another eIM configuration (reset, provisioned anew at another
-	 * counter): the notifications are offered again at once */
-	db_init(&req);
-	db_init(&resp);
-	OK(emu_es10(r.e, reset_eim, sizeof(reset_eim), &resp) == 0, "backoff: eIM configuration reset");
-	m = der_begin(&req, 0xBF57);
-	l = der_begin(&req, 0xA0);
-	eimpkg_cfg(&req, EIM, 7, eim_key, false);
-	der_end(&req, l);
-	der_end(&req, m);
-	resp.len = 0;
-	OK(emu_es10(r.e, req.d, req.len, &resp) == 0 && emu_notif_due(r.e, 61, t),
-	   "backoff: forgotten once the eIM configuration changed");
-	emu_notif_refused(r.e, 61, t);
-	emu_close(r.e);
-	r.e = emu_open(&r.c, &r.cfg);
-	OK(r.e && !emu_notif_due(r.e, 61, t), "backoff: under the new configuration, recorded again");
-	db_free(&req);
-	db_free(&resp);
+		n = (long)fread(buf, 1, sizeof(buf), f);
+		fclose(f);
+		db_put(&b, buf, (size_t)n);
+	}
+	OK(der_parse(b.d, b.len, &top) == 0 && der_find(top.val, top.len, 0xAA, &x) < 0 &&
+	   der_find(top.val, top.len, 0x89, &x) == 0, "old [10]: the next save leaves [10] out");
+	db_free(&b);
+	db_free(&w);
 	rig_close(&r);
 }
 
@@ -1021,7 +1021,7 @@ int main(void)
 	test_fallback();
 	test_fallback_card_state();
 	test_list_profile_info();
-	test_notif_backoff();
+	test_old_backoff_field();
 	db_free(&req);
 	db_free(&resp);
 	db_free(&ops);

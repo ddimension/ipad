@@ -116,7 +116,7 @@ ipad [options] poll | provision <file> | export <file> | connectivity | notify |
 | `connectivity` | Reports the enabled profile's connectivity parameters only. |
 | `notify` | Delivers pending notifications only. |
 | `info` | EID, backend, device-key fingerprint, enabled ICCID, binding, counter and the configured eIMs, as one JSON line. |
-| `reset <EID>` / `reset all` | `<EID>` (32 hex digits) deletes that card's `<EID>.state` only; the device key and the `bind.*` markers stay, since every card in the directory shares them. `all` deletes `device.key`, every `*.state` and the `bind.*` markers. Without either it is refused (exit 2). No card is needed. `ipad -h` does not list it. |
+| `reset <EID>` / `reset all` | `<EID>` (32 hex digits) deletes that card's `<EID>.state` and `<EID>.nbo` (the notification backoff) only; the device key, the `bind.*` markers and `<EID>.es9` stay, since the first two are shared by every card in the directory and the last describes notifications on the card. `all` deletes `device.key`, every `*.state` and `*.nbo`, and the `bind.*` markers. Without either it is refused (exit 2). No card is needed. `ipad -h` does not list it. |
 
 | Option | Meaning |
 |---|---|
@@ -247,8 +247,8 @@ step, for example:
 - "direct download done"
 - "card bound at the eIM (204)"
 - "notification … not delivered, kept" (the eIM was not reached)
-- "notification … not taken by the eIM, kept; offered again in 3600s" (an
-  emulated card's backoff, see
+- "notification … not taken by the eIM, kept; offered again in 3600s" (the
+  backoff, `<EID>.nbo`, see
   [sgp22-emulation.md](sgp22-emulation.md#notifications-and-profile-installation-results))
 - "InitiateAuthentication refused by the eIM: 52 (invalidEimTransactionId)",
   likewise AuthenticateClient and GetBoundProfilePackage with their ESipa
