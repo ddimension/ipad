@@ -9,6 +9,8 @@
 #               localhost, its key pinned in the eIM configuration
 #               (trustedPublicKeyDataTls), and a run with a wrong pin that
 #               must not get through
+#   E2E_KEEP=<dir>  on a failure, copy the work directory (server log,
+#               state) there
 #   IPAD=...    the ipad command, e.g. "qemu-aarch64-static build-aarch64/ipad"
 #               to run a cross-built binary
 #
@@ -16,8 +18,9 @@
 # the import file is accepted (proof, key, DER objects); listProfileInfo and
 # enable run, are signed with the device key, verified and acknowledged; an
 # enable whose connection does not come back is rolled back and reported as
-# such; results signed with another key complete no operation (the eIM
-# discards them, and may acknowledge them — SGP.32 5.14.6).
+# such; an indirect download is sent as an empty trigger and reaches ES9+',
+# after the getRAT the eIM reads first; results signed with another key
+# complete no operation (the eIM discards them, and may acknowledge them — SGP.32 5.14.6).
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 eim=$(cd "${1:-$root/../../eim}" && pwd)
@@ -40,6 +43,7 @@ cleanup() {
 trap cleanup EXIT
 fail() {
 	echo "e2e: FAIL: $*"
+	[ -n "${E2E_KEEP:-}" ] && cp -r "$w" "$E2E_KEEP"
 	[ -f "$w/server.log" ] && sed 's/\x1b\[[0-9;]*m//g' "$w/server.log" | tail -5
 	exit 1
 }
@@ -152,6 +156,25 @@ echo "e2e: listProfileInfo + enable done, verified with the device key"
 "$B/eimctl" op list $eid | grep -q 'rolled back by the IPA' || fail "rollback not reported"
 echo "e2e: offline after enable -> rolled back, reported"
 
+# An indirect download (SGP.32 3.2.3.2) with the activation code kept by the
+# eIM: the import file reports eimDownloadDataHandling, so the eIM queues it
+# and sends an empty trigger (2.11.1.3). ipad calls InitiateAuthentication
+# with the eimTransactionId and no smdpAddress (5.14.1); the eIM takes the
+# address from the code and calls ES9+' there. No SM-DP+ listens on it: the
+# property is that the eIM matched the call to the operation and tried the
+# code's SM-DP+, which it does only for an eimTransactionId it knows.
+printf '{"type":"download","activation_code":"1$127.0.0.1:1$E2E-TOKEN"}' |
+	"$B/eimctl" op add $eid - >/dev/null || fail "indirect download not queued (capabilities?)"
+out=$("$hs" -- $ipad -v -s "$st" $url_opt poll 2>&1) || true
+echo "$out" | grep -q 'downloads=[1-9]' || { echo "$out"; fail "no download trigger"; }
+sed 's/\x1b\[[0-9;]*m//g' "$w/server.log" | grep -q 'download: ES9+.*function=InitiateAuthentication operation_id=' ||
+	{ sed 's/\x1b\[[0-9;]*m//g' "$w/server.log" | tail -20; fail "the eIM did not call ES9+' InitiateAuthentication"; }
+"$B/eimctl" op list $eid | grep -Eq 'get_rat +done' || fail "getRAT before the download not done"
+echo "e2e: empty trigger -> InitiateAuthentication without smdpAddress, ES9+' tried at the code's SM-DP+"
+
+# before a download the eIM reads the card (getRAT, listProfileInfo): they
+# run in the same poll and count as done
+done=$("$B/eimctl" op list $eid | grep -c ' done ')
 mv "$st/device.key" "$st/device.key.good"
 "$B/eimctl" op add $eid list_profile_info >/dev/null
 # A result under a key the eIM does not know must never complete an
@@ -161,7 +184,7 @@ mv "$st/device.key" "$st/device.key.good"
 # acknowledged=0 is not the property, and checking for it failed against a
 # conforming eIM.
 "$hs" -- $ipad -s "$st" $url_opt poll >/dev/null
-[ "$("$B/eimctl" op list $eid | grep -c ' done ')" = 2 ] || fail "a result under another key completed an operation"
+[ "$("$B/eimctl" op list $eid | grep -c ' done ')" = "$done" ] || fail "a result under another key completed an operation"
 grep -q 'result discarded: eUICC signature' "$w/server.log" || fail "eIM did not discard the signature"
 echo "e2e: results under another key discarded, no operation completed"
 echo "e2e: all passed"

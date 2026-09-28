@@ -406,6 +406,12 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 	}
 
 	case 0xBF38:   /* AuthenticateServer / PrepareDownload: the eIM's vectors */
+		f->auth_mid[0] = 0;
+		if (der_find(t.val, t.len, 0xA0, &x) == 0 && der_find(x.val, x.len, 0x80, &x) == 0 &&
+		    x.len < sizeof(f->auth_mid)) {
+			memcpy(f->auth_mid, x.val, x.len);
+			f->auth_mid[x.len] = 0;
+		}
 		return fake22_vector("AuthenticateServerResponse", "", r) == 0 ? 0x9000 : 0x6F00;
 	case 0xBF21:
 		return fake22_vector("PrepareDownloadResponse", "", r) == 0 ? 0x9000 : 0x6F00;

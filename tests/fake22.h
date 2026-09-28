@@ -45,6 +45,7 @@ typedef struct {
 	char segs[256];
 	int cancels, cancel_reason;
 	char install_iccid[21];   /* the profile a completed load adds */
+	char auth_mid[64];        /* MatchingID of the last AuthenticateServer, "" none */
 
 	/* a real DER certificate, stands in for CERT.EUICC / CERT.EUM */
 	const uint8_t *cert;

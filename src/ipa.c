@@ -566,12 +566,13 @@ static bool has_tag(const der_tlv *list, uint32_t want)
 void ipa_put_capabilities(dbuf *b, uint32_t tag, bool direct)
 {
 	/* ipaFeatures: directRspServerCommunication(0) when the host downloads,
-	 * indirectRspServerCommunication(1) always; ipaSupportedProtocols:
-	 * ipaRetrieveHttps(0) (4.1) */
-	const uint8_t feat[2] = { direct, 1 }, proto[1] = { 1 };   /* one byte per named bit */
+	 * indirectRspServerCommunication(1) and eimDownloadDataHandling(2)
+	 * always: the eIM may keep the activation code and send an empty
+	 * trigger (2.11.1.3); ipaSupportedProtocols: ipaRetrieveHttps(0) (4.1) */
+	const uint8_t feat[3] = { direct, 1, 1 }, proto[1] = { 1 };   /* one byte per named bit */
 	size_t m = der_begin(b, tag);
 
-	der_put_bits(b, 0x80, feat, 2);
+	der_put_bits(b, 0x80, feat, 3);
 	der_put_bits(b, 0x81, proto, 1);
 	der_end(b, m);
 }
@@ -716,8 +717,9 @@ send:
 
 /* ---- Profile download (3.2.3) ---- */
 
-/* SGP.22 4.1: [LPA:]1$SM-DP+ address$AC token[$SM-DP+ OID[$CC flag]] */
-static int parse_ac(const char *ac, char *dp, size_t dpl, char *mid, size_t midl)
+/* SGP.22 4.1: [LPA:]1$SM-DP+ address$AC token[$SM-DP+ OID[$CC flag]]; the
+ * token (MatchingID) for ctxParams1. The address stays with the eIM (5.14.1). */
+static int parse_ac(const char *ac, char *mid, size_t midl)
 {
 	const char *p, *q;
 
@@ -726,10 +728,8 @@ static int parse_ac(const char *ac, char *dp, size_t dpl, char *mid, size_t midl
 	if (strncmp(ac, "1$", 2))
 		return -1;
 	p = ac + 2;
-	if (!(q = strchr(p, '$')) || q == p || (size_t)(q - p) >= dpl)
+	if (!(q = strchr(p, '$')) || q == p)
 		return -1;
-	memcpy(dp, p, (size_t)(q - p));
-	dp[q - p] = 0;
 	p = q + 1;
 	q = strchr(p, '$');
 	if (!q)
@@ -823,7 +823,7 @@ static int load_bpp(ipa *a, const der_tlv *bpp, dbuf *pir)
  * notifications, step 23), -1 otherwise. */
 static int indirect_download(ipa *a, const char *ac, const der_tlv *eim_txid)
 {
-	char dp[256] = "", mid[256] = "";
+	char mid[256] = "";
 	dbuf msg, resp, r, info1, chal, ctx, pir;
 	der_tlv t, ok, x, ss1, sig1, ckid, cert, txid, y;
 	const uint8_t *p, *end;
@@ -839,7 +839,7 @@ static int indirect_download(ipa *a, const char *ac, const der_tlv *eim_txid)
 	db_init(&ctx);
 	db_init(&pir);
 
-	if (ac && parse_ac(ac, dp, sizeof(dp), mid, sizeof(mid)) < 0) {
+	if (ac && parse_ac(ac, mid, sizeof(mid)) < 0) {
 		say(a, LOG_ERR, "activation code not understood");
 		goto out;
 	}
@@ -849,11 +849,12 @@ static int indirect_download(ipa *a, const char *ac, const der_tlv *eim_txid)
 		goto out;
 	}
 
-	/* InitiateAuthenticationRequestEsipa */
+	/* InitiateAuthenticationRequestEsipa. No smdpAddress, even from an
+	 * activation code: with eimDownloadDataHandling the IPA SHALL NOT send
+	 * it (5.14.1), the eIM holds the address and checks serverSigned1
+	 * against it; an empty trigger (3.2.3.2 step 3) has none anyway */
 	m = der_begin(&msg, 0xBF39);
 	der_put(&msg, 0x81, x.val, x.len);
-	if (dp[0])
-		der_put_str(&msg, 0x83, dp);
 	db_put(&msg, info1.d, info1.len);
 	if (eim_txid)
 		der_put(&msg, 0x82, eim_txid->val, eim_txid->len);

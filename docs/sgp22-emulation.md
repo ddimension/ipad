@@ -302,7 +302,7 @@ JSON object (`build_import()` in `main.c`):
 | `counter` | the replay counter the emulation holds for the eIM (the one named with `-e`, else the first) |
 | `association_token` | when that eIM has one |
 | `euicc_info1` | the card's `GetEUICCInfo1` (`BF20`), base64, when it answers |
-| `ipa_capabilities` | base64 `IpaCapabilities` (4.1): indirect download always, direct download with `-D` |
+| `ipa_capabilities` | base64 `IpaCapabilities` (4.1): indirect download and `eimDownloadDataHandling` always, direct download with `-D` |
 | `device.imei` | with `-i` |
 | `proof` | the device key's signature (base64 `r‖s`) over `"eim-euicc-import/1\n" + eid + "\n" + ipa_public_key + "\n" + counter + "\n"` |
 
@@ -540,6 +540,17 @@ passes unless `option ipa_direct '0'`). Otherwise, including triggers with
 `contactDefaultSmdp` or `contactSmds`, it downloads indirectly through the eIM.
 `IpaCapabilities` tells the eIM which paths are available.
 
+ipad reports `eimDownloadDataHandling` (4.1, bit 2): for an indirect
+download the eIM may keep the activation code and send an **empty** trigger,
+with only its `eimTransactionId` (2.11.1.3 allows that "if and only if" the
+IPA reports the capability). ipad then goes on at 3.2.3.2 step 5. It never
+sends `smdpAddress` in `ESipa.InitiateAuthentication`, not even from an
+activation code in the trigger (5.14.1: an IPA with the capability "SHALL
+NOT send smdpAddress"); the eIM takes the address from the code it holds and
+checks the SM-DP+'s `serverSigned1` against it. The MatchingID for
+`ctxParams1` comes from the eIM's response (`matchingId`, 5.14.1 Table 13
+NOTE 3), or else from the activation code in the trigger.
+
 ### Indirect download (3.2.3.2)
 
 ipad runs the SGP.22 download through the eIM, which relays ES9+ to the
@@ -553,11 +564,11 @@ sequenceDiagram
     participant I as ipad
     participant E as eIM
     participant D as SM-DP+
-    E-->>I: ProfileDownloadTriggerRequest (AC or none, eimTransactionId)
+    E-->>I: ProfileDownloadTriggerRequest (eimTransactionId, empty or AC)
     I->>U: GetEUICCInfo1, GetEUICCChallenge
-    I->>E: ESipa.InitiateAuthentication (challenge, info1, SM-DP+ address, txid)
+    I->>E: ESipa.InitiateAuthentication (challenge, info1, txid; no SM-DP+ address)
     E->>D: ES9+' InitiateAuthentication
-    E-->>I: serverSigned1, signature, CI key id, certificate [, ctxParams1]
+    E-->>I: serverSigned1, signature, CI key id, certificate [, matchingId or ctxParams1]
     I->>U: AuthenticateServer (SGP.22 5.7.13)
     I->>E: ESipa.AuthenticateClient (card's response)
     Note over E: the eIM learns the card's certificates here (D-62)

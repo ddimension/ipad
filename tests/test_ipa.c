@@ -45,6 +45,7 @@ typedef struct {
 	int refuse_notify;          /* > 0: the next notifications are answered 500 */
 	int64_t auth_client_error;  /* > 0: AuthenticateClient answers this error */
 	bool invalid;               /* a deliberately malformed exchange: not dumped */
+	bool no_matching;           /* InitiateAuthentication without matchingId */
 } fake_eim;
 
 static void dump_hex(const char *dir, const uint8_t *p, size_t n)
@@ -144,7 +145,8 @@ static int eim_transport(void *ud, const uint8_t *req, size_t len, int *status, 
 		der_put(resp, 0x5F37, txid, 16);
 		der_put(resp, 0x04, "\xF5\xF5\xF5\xF5", 4);
 		db_put(resp, CERT.d, CERT.len);   /* serverCertificate */
-		der_put_str(resp, 0x0C, "MATCH");
+		if (!f->no_matching)
+			der_put_str(resp, 0x0C, "MATCH");
 		der_end(resp, k);
 		der_end(resp, m);
 		break;
@@ -456,15 +458,15 @@ int main(void)
 	/* --- IpaCapabilities bytes (4.1), both ways; a BIT STRING drops
 	 * trailing zero bits, so direct off leaves one named bit less --- */
 	{
-		static const uint8_t both[] = { 0x30, 0x08, 0x80, 0x02, 0x06, 0xC0, 0x81, 0x02, 0x07, 0x80 };
-		static const uint8_t ind[] = { 0x30, 0x08, 0x80, 0x02, 0x06, 0x40, 0x81, 0x02, 0x07, 0x80 };
+		static const uint8_t both[] = { 0x30, 0x08, 0x80, 0x02, 0x05, 0xE0, 0x81, 0x02, 0x07, 0x80 };
+		static const uint8_t ind[] = { 0x30, 0x08, 0x80, 0x02, 0x05, 0x60, 0x81, 0x02, 0x07, 0x80 };
 
 		db_init(&b);
 		ipa_put_capabilities(&b, 0x30, true);
-		EQ_HEX(b.d, b.len, both, sizeof(both), "caps: direct + indirect, ipaRetrieveHttps");
+		EQ_HEX(b.d, b.len, both, sizeof(both), "caps: direct + indirect + eimDownloadDataHandling, ipaRetrieveHttps");
 		b.len = 0;
 		ipa_put_capabilities(&b, 0x30, false);
-		EQ_HEX(b.d, b.len, ind, sizeof(ind), "caps: indirect only");
+		EQ_HEX(b.d, b.len, ind, sizeof(ind), "caps: indirect + eimDownloadDataHandling");
 		db_free(&b);
 	}
 
@@ -578,7 +580,7 @@ int main(void)
 		OK(m && inner(m, 0xBF52, &y) == 0 && der_find(y.val, y.len, 0xA0, &x) == 0, "data: BF52{A0 ipaEuiccData}");
 		{
 			der_tlv z, l;
-			static const uint8_t caps[] = { 0xA8, 0x08, 0x80, 0x02, 0x06, 0xC0, 0x81, 0x02, 0x07, 0x80 };
+			static const uint8_t caps[] = { 0xA8, 0x08, 0x80, 0x02, 0x05, 0xE0, 0x81, 0x02, 0x07, 0x80 };
 
 			OK(der_find(x.val, x.len, 0xA2, &l) == 0 && der_find(l.val, l.len, 0xBF51, &z) == 0,
 			   "data: the stored EPR under A2");
@@ -587,7 +589,7 @@ int main(void)
 			   "data: eimTransactionId echoed as 87");
 			OK(der_find(x.val, x.len, 0xA8, &z) == 0, "data: ipaCapabilities");
 			if (der_find(x.val, x.len, 0xA8, &z) == 0)
-				EQ_HEX(z.raw, z.raw_len, caps, sizeof(caps), "data: direct+indirect, ipaRetrieveHttps");
+				EQ_HEX(z.raw, z.raw_len, caps, sizeof(caps), "data: direct+indirect+eimDownloadDataHandling, ipaRetrieveHttps");
 			OK(der_find(x.val, x.len, 0xA9, &z) == 0 && der_find(z.val, z.len, 0x80, &l) == 0 &&
 			   l.len == 4, "data: deviceInfo with TAC");
 			OK(der_find(x.val, x.len, 0x84, &z) < 0, "data: no associationToken when none was issued");
@@ -723,7 +725,8 @@ int main(void)
 		   "direct: failure reported as profileDownloadError undefinedError");
 		h.download_rc = 0;
 
-		/* --- indirect download through the eIM (3.2.3.2) --- */
+		/* --- indirect download through the eIM (3.2.3.2), an empty
+		 * trigger: the eIM keeps the activation code (2.11.1.3) --- */
 		q.len = 0;
 		k = der_begin(&q, 0xBF54);
 		der_put(&q, 0x82, tx, 16);
@@ -741,12 +744,47 @@ int main(void)
 		OK(m && inner(m, 0x81, &x) == 0 && x.len == 16 && x.val[0] == 0xC4, "indirect: the card's challenge");
 		OK(m && inner(m, 0xBF20, &x) == 0, "indirect: euiccInfo1 sent (no minimizeEsipaBytes)");
 		OK(m && inner(m, 0x82, &x) == 0 && !memcmp(x.val, tx, 16), "indirect: eimTransactionId passed on");
+		OK(m && inner(m, 0x83, &x) < 0, "indirect: no smdpAddress, the eIM has it (5.14.1)");
+		OK(!strcmp(fc.auth_mid, "MATCH"), "indirect: the eIM's matchingId in ctxParams1 (5.14.1 NOTE 3)");
 		m = last_got(&eim, 0xBF3B);
 		OK(m && inner(m, 0x80, &x) == 0 && inner(m, 0xBF38, &y) == 0, "indirect: BF3B{80 txid, BF38 response}");
 		m = last_got(&eim, 0xBF3D);
 		OK(m && inner(m, 0xA0, &x) == 0 && der_parse(x.val, x.len, &y) == 0 && y.tag == 0xBF37,
 		   "indirect: PIR delivered as pendingNotification (step 23)");
 		OK(fc.nnotes == 0 && fc.cancels == 0, "indirect: PIR removed, nothing cancelled");
+
+		/* an activation code in the trigger, and a host without direct
+		 * download: indirect, still no smdpAddress (eimDownloadDataHandling,
+		 * 5.14.1), the MatchingID from the code */
+		{
+			ipa_config c3 = cfg;
+			ipa *b3;
+
+			c3.host.download = NULL;
+			b3 = ipa_open(&c3);
+			q.len = 0;
+			k = der_begin(&q, 0xBF54);
+			l = der_begin(&q, 0xA0);
+			der_put_str(&q, 0x80, "1$smdp.test.example$AC-TOKEN");
+			der_end(&q, l);
+			der_put(&q, 0x82, tx, 16);
+			der_end(&q, k);
+			queue(&eim, &q);
+			eim.no_matching = true;
+			snprintf(fc.install_iccid, sizeof(fc.install_iccid), "98001032547698103274");
+			mark = eim.ngot;
+			ipa_poll(b3, &sum);
+			eim.no_matching = false;
+			m = last_got(&eim, 0xBF39);
+			OK(count_got(&eim, mark, 0xBF3A) == 1 && m && inner(m, 0x83, &x) < 0 &&
+			   inner(m, 0x82, &x) == 0, "indirect with AC: InitiateAuthentication without smdpAddress");
+			OK(!strcmp(fc.auth_mid, "AC-TOKEN"), "indirect with AC: its MatchingID in ctxParams1");
+			ipa_close(b3);
+			q.len = 0;
+			k = der_begin(&q, 0xBF54);
+			der_put(&q, 0x82, tx, 16);
+			der_end(&q, k);
+		}
 
 		/* AuthenticateClient refused: cancel with pprNotAllowed (3.2.3.3) */
 		eim.auth_client_error = 50;

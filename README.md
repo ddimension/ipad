@@ -39,7 +39,7 @@ Section numbers are SGP.32 v1.3.
 | eUICC Packages (3.3.1) | every PSMO (enable ± rollback, disable, delete, listProfileInfo, getRAT, configureImmediateEnable, set/unsetFallbackAttribute, setDefaultDpAddress) and eCO (add/update/delete/listEim); results acknowledged and removed |
 | Profile Rollback (3.3.2) | when the connection does not come back after a profile change, the rollback's result replaces the package's |
 | IPA/eUICC data (2.11.1.2) | every tag in the tag list, search criteria, `incorrectTagList` |
-| Indirect download (3.2.3.2) | through the eIM, BPP loaded in the SGP.22 segments, CancelSession (3.2.3.3) |
+| Indirect download (3.2.3.2) | through the eIM, BPP loaded in the SGP.22 segments, CancelSession (3.2.3.3); `eimDownloadDataHandling` (4.1): an empty trigger is followed, the activation code stays with the eIM and `smdpAddress` is never sent (2.11.1.3, 5.14.1) |
 | Direct download (3.2.3.1) | the host's ES9+ client (lpac) downloads; ipad reports the PIR as `ProfileDownloadTriggerResult` (step 13), then has the host send it to the SM-DP+ over ES9+ (step 14), retried on later runs until the SM-DP+ has it |
 | Notifications (3.7) | delivered through `ESipa.HandleNotification`, removed once the eIM has them; a direct download's PIR over ES9+ through the host (3.7 [2a]) |
 | Connectivity parameters (5.9.24) | APN, PDP type and credentials of the enabled profile, handed to the host. An emulated SGP.22 card has none. |
