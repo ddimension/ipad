@@ -8,9 +8,12 @@
  *   <seqNumber> <due, seconds> <delay, seconds> <notification, 16 hex digits>
  *   ...
  */
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "nbo.h"
 #include "crypto.h"
@@ -30,7 +33,7 @@ static void save(const nbo *b)
 {
 	char tmp[600], hx[17];
 	FILE *f;
-	int i;
+	int i, fd, ok;
 
 	if (!b->path)
 		return;
@@ -38,15 +41,29 @@ static void save(const nbo *b)
 		remove(b->path);
 		return;
 	}
-	if (snprintf(tmp, sizeof(tmp), "%s.tmp", b->path) >= (int)sizeof(tmp) || !(f = fopen(tmp, "w")))
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", b->path) >= (int)sizeof(tmp))
 		return;
+	/* 0600 like the emulation's state, whatever the umask: the records
+	 * tell which notifications an eIM refuses, which is nobody else's
+	 * business on a shared router. O_NOFOLLOW: a link planted at the
+	 * temporary name must not redirect the write; fchmod: a temporary a
+	 * crash left behind keeps its old mode under O_TRUNC. */
+	fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return;
+	if (fchmod(fd, 0600) != 0 || !(f = fdopen(fd, "w"))) {
+		close(fd);
+		remove(tmp);
+		return;
+	}
 	hex_encode(b->eims, 8, hx);
 	fprintf(f, NBO_MAGIC " %s\n", hx);
 	for (i = 0; i < b->n; i++) {
 		hex_encode(b->r[i].fp, 8, hx);
 		fprintf(f, "%" PRId64 " %" PRId64 " %" PRId64 " %s\n", b->r[i].seq, b->r[i].due, b->r[i].delay, hx);
 	}
-	if (fclose(f) != 0 || rename(tmp, b->path) != 0)
+	ok = fflush(f) == 0 && !ferror(f) && fsync(fileno(f)) == 0;
+	if (fclose(f) != 0 || !ok || rename(tmp, b->path) != 0)
 		remove(tmp);
 }
 

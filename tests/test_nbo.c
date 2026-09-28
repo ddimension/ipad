@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "check.h"
@@ -99,6 +100,38 @@ int main(void)
 	for (i = 0; i < NBO_MAX + 1; i++)
 		nbo_refused(&b, (int64_t)i, f61, t);
 	OK(b.n == NBO_MAX && nbo_due(&b, 0, f61, t) && !nbo_due(&b, NBO_MAX, f61, t), "nbo: full, the oldest goes");
+
+	/* the file is 0600 whatever the umask, and a link planted at the
+	 * temporary name is not followed */
+	{
+		char tmp[64], target[64];
+		struct stat st;
+		mode_t old = umask(0);
+
+		unlink(path);
+		nbo_load(&b, path);
+		nbo_eims(&b, e1);
+		nbo_refused(&b, 61, f61, t);
+		OK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0600, "nbo: the file is 0600 under umask 0");
+
+		/* a temporary a crash left with a wider mode keeps it under
+		 * O_TRUNC unless the writer sets it */
+		snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+		f = fopen(tmp, "w");
+		fclose(f);
+		chmod(tmp, 0666);
+		nbo_refused(&b, 61, f61, t);
+		OK(stat(path, &st) == 0 && (st.st_mode & 07777) == 0600, "nbo: 0600 over a stale temporary of 0666");
+
+		snprintf(target, sizeof(target), "%s.target", path);
+		unlink(target);
+		OK(symlink(target, tmp) == 0, "nbo: a link at the temporary name");
+		nbo_refused(&b, 38, f38, t);
+		OK(access(target, F_OK) != 0, "nbo: the link is not followed");
+		unlink(tmp);
+		unlink(target);
+		umask(old);
+	}
 
 	unlink(path);
 	DONE("test_nbo");
