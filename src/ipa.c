@@ -33,9 +33,10 @@ struct ipa {
 	int64_t es9[ES9_MAX];    /* PIRs owed to their SM-DP+ over ES9+ (es9_path) */
 	int nes9;
 	/* the card's RetrieveNotificationsList without criteria, read once per
-	 * poll (the package phase and the notification phase share it): on a
-	 * consumer card with old notifications it is tens of kilobytes of GET
-	 * RESPONSE. Dropped whenever the list may change. */
+	 * poll (IpaEuiccData, a direct download's PIR search and, on an IoT
+	 * eUICC, the delivery share it): on a consumer card with old
+	 * notifications it is tens of kilobytes of GET RESPONSE. Dropped
+	 * whenever the list may change. */
 	dbuf nl;
 	bool nl_ok;
 	nbo nb;                  /* notification backoff (nbo.h, nbo_path) */
@@ -455,9 +456,42 @@ static void nb_sync(ipa *a)
 
 #define SEEN_MAX 64
 
+/* ES10b.ListNotification (SGP.22 5.7.9): BF28 { A0 { NotificationMetadata
+ * ... } }, the metadata of every pending notification without the
+ * notifications themselves */
+static int list_notifications(ipa *a, dbuf *r, der_tlv *list)
+{
+	static const uint8_t req[] = { 0xBF, 0x28, 0x00 };
+	der_tlv t;
+
+	return es10(a->c.eu, req, sizeof(req), r, &t) == 0 && der_find(t.val, t.len, 0xA0, list) == 0 ? 0 : -1;
+}
+
+/* One notification by its seqNumber (RetrieveNotificationsList with
+ * searchCriteria seqNumber, SGP.22 5.7.10) into *n: 0 found; 1 no longer on
+ * the card (an empty list); -1 the card did not give it */
+static int fetch_one(ipa *a, int64_t seq, dbuf *r, der_tlv *n)
+{
+	dbuf c;
+	der_tlv t, list;
+	int64_t s;
+	int rc = -1;
+
+	db_init(&c);
+	der_put_int(&c, 0x80, seq);
+	if (!c.err && retrieve(a, c.d, c.len, r, &t) == 0 && der_find(t.val, t.len, 0xA0, &list) == 0) {
+		if (!list.len)
+			rc = 1;
+		else if (der_parse(list.val, list.len, n) == 0 && notif_seq(n, &s) == 0 && s == seq)
+			rc = 0;
+	}
+	db_free(&c);
+	return rc;
+}
+
 int ipa_deliver_notifications(ipa *a)
 {
-	dbuf r, msg;
+	dbuf r, one, msg;
 	der_tlv t, list, n;
 	const uint8_t *p, *end;
 	int sent = 0, held = 0;
@@ -465,82 +499,112 @@ int ipa_deliver_notifications(ipa *a)
 	 * records (ES9+ and backoff); only once the whole list was seen */
 	int64_t seen[SEEN_MAX];
 	int nseen = 0, i, rc;
-	bool listed = false;
+	bool listed = false, meta = false;
 	int64_t now = a->c.clock ? a->c.clock() : (int64_t)time(NULL);
 
 #define SEEN(s) (nseen < SEEN_MAX ? (void)(seen[nseen++] = (s)) : (void)(listed = false))
 
 	db_init(&r);
+	db_init(&one);
 	db_init(&msg);
 	a->nb_synced = false;
-	if (retrieve(a, NULL, 0, &r, &t) == 0 && der_find(t.val, t.len, 0xA0, &list) == 0) {
+	/* An SGP.22 card lists the metadata alone (ListNotification), and only
+	 * the notifications that go out are read in full, by seqNumber: a
+	 * consumer card that keeps old notifications the eIM does not take
+	 * cost tens of kilobytes of GET RESPONSE on every poll otherwise
+	 * (router 245: 28 KB for eleven held ones). SGP.32 v1.3 has no
+	 * ListNotification (5.9: RetrieveNotificationsList only), so an IoT
+	 * eUICC, or a card that does not answer it, is read in full once. */
+	if (a->c.eu->kind == EUICC_EMU && list_notifications(a, &r, &list) == 0) {
+		meta = true;
 		listed = true;
-		for (p = list.val, end = list.val + list.len; p < end; ) {
-			int64_t seq;
-			size_t m, k;
-			der_tlv md;
-			uint8_t fp[8];
+	} else if (retrieve(a, NULL, 0, &r, &t) == 0 && der_find(t.val, t.len, 0xA0, &list) == 0) {
+		listed = true;
+	}
+	p = end = NULL;
+	if (listed) {
+		p = list.val;
+		end = p + list.len;
+	}
+	while (p < end) {
+		int64_t seq;
+		size_t m, k;
+		der_tlv md;
+		uint8_t fp[8];
 
-			/* a list that does not parse to its end, or a notification
-			 * without a seqNumber, leaves notifications unseen: every
-			 * record stays, as one of them may be theirs */
-			if (der_next(&p, end, &n) < 0) {
-				say(a, LOG_WARNING, "notification list does not parse to its end, the rest skipped");
-				listed = false;
-				break;
-			}
-			if (notif_meta(&n, &md) < 0 || meta_seq(&md, &seq) < 0) {
-				say(a, LOG_WARNING, "notification without a sequence number, skipped");
-				listed = false;
-				continue;
-			}
-			if (a->c.host.notify && es9_owed(a, seq)) {
-				if (es9_deliver(a, seq) == 0)
-					sent++;
-				else
-					SEEN(seq);
-				continue;
-			}
-			/* the metadata identifies the notification: what a
-			 * metadata-only listing gives as well */
-			nbo_fp(md.raw, md.raw_len, fp);
-			if (a->nb.n)
-				nb_sync(a);
-			if (!nbo_due(&a->nb, seq, fp, now)) {
-				held++;
-				SEEN(seq);
-				continue;
-			}
-			/* HandleNotificationEsipa { pendingNotification [0] } (5.14.7);
-			 * [0] is explicit because PendingNotification is a CHOICE */
-			msg.len = 0;
-			m = der_begin(&msg, 0xBF3D);
-			k = der_begin(&msg, 0xA0);
-			db_put(&msg, n.raw, n.raw_len);
-			der_end(&msg, k);
-			der_end(&msg, m);
-			rc = esipa_notify(a, &msg);
-			/* One the eIM answers but does not take stays on the card
-			 * (3.7: only an acknowledged one is removed) and the next one
-			 * goes out: stopping here let a single notification the eIM
-			 * keeps refusing (a PIR it cannot attribute) hold back every
-			 * later one of the card. It then waits out a backoff (nbo.h). */
-			if (rc == -2) {
-				nb_sync(a);
-				say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept; offered again in %llds",
-				    (long long)seq, (long long)nbo_refused(&a->nb, seq, fp, now));
-				SEEN(seq);
-				continue;
-			}
-			if (rc < 0) {
-				say(a, LOG_WARNING, "notification %lld not delivered, kept", (long long)seq);
-				listed = false;   /* not all seen: no record is dropped */
-				break;   /* the eIM is unreachable; the rest waits too */
-			}
-			if (remove_seq(a, seq) < 0)
-				SEEN(seq);
-			sent++;
+		/* a list that does not parse to its end, or a notification
+		 * without a seqNumber, leaves notifications unseen: every
+		 * record stays, as one of them may be theirs */
+		if (der_next(&p, end, &n) < 0) {
+			say(a, LOG_WARNING, "notification list does not parse to its end, the rest skipped");
+			listed = false;
+			break;
 		}
+		if (meta)
+			md = n;   /* the listing's entry is the metadata */
+		else if (notif_meta(&n, &md) < 0)
+			md.tag = 0;
+		if (md.tag != 0xBF2F || meta_seq(&md, &seq) < 0) {
+			say(a, LOG_WARNING, "notification without a sequence number, skipped");
+			listed = false;
+			continue;
+		}
+		if (a->c.host.notify && es9_owed(a, seq)) {
+			if (es9_deliver(a, seq) == 0)
+				sent++;
+			else
+				SEEN(seq);
+			continue;
+		}
+		/* the metadata identifies the notification (nbo.h), and a
+		 * metadata listing has it without reading the notification */
+		nbo_fp(md.raw, md.raw_len, fp);
+		if (a->nb.n)
+			nb_sync(a);
+		if (!nbo_due(&a->nb, seq, fp, now)) {
+			held++;
+			SEEN(seq);
+			continue;
+		}
+		if (meta) {
+			rc = fetch_one(a, seq, &one, &n);
+			if (rc == 1)
+				continue;   /* gone since the listing */
+			if (rc < 0) {
+				say(a, LOG_WARNING, "notification %lld not read from the card, kept", (long long)seq);
+				SEEN(seq);
+				continue;
+			}
+		}
+		/* HandleNotificationEsipa { pendingNotification [0] } (5.14.7);
+		 * [0] is explicit because PendingNotification is a CHOICE */
+		msg.len = 0;
+		m = der_begin(&msg, 0xBF3D);
+		k = der_begin(&msg, 0xA0);
+		db_put(&msg, n.raw, n.raw_len);
+		der_end(&msg, k);
+		der_end(&msg, m);
+		rc = esipa_notify(a, &msg);
+		/* One the eIM answers but does not take stays on the card
+		 * (3.7: only an acknowledged one is removed) and the next one
+		 * goes out: stopping here let a single notification the eIM
+		 * keeps refusing (a PIR it cannot attribute) hold back every
+		 * later one of the card. It then waits out a backoff (nbo.h). */
+		if (rc == -2) {
+			nb_sync(a);
+			say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept; offered again in %llds",
+			    (long long)seq, (long long)nbo_refused(&a->nb, seq, fp, now));
+			SEEN(seq);
+			continue;
+		}
+		if (rc < 0) {
+			say(a, LOG_WARNING, "notification %lld not delivered, kept", (long long)seq);
+			listed = false;   /* not all seen: no record is dropped */
+			break;   /* the eIM is unreachable; the rest waits too */
+		}
+		if (remove_seq(a, seq) < 0)
+			SEEN(seq);
+		sent++;
 	}
 #undef SEEN
 	if (held)
@@ -562,6 +626,7 @@ int ipa_deliver_notifications(ipa *a)
 		nbo_keep(&a->nb, seen, nseen);
 	a->nl_ok = false;   /* the run's last reader; others change the card */
 	db_free(&r);
+	db_free(&one);
 	db_free(&msg);
 	return sent;
 }

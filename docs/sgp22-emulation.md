@@ -475,6 +475,7 @@ sit under ES10b).
 | **ES10b.ImmediateEnable** (5.9.15) | `ES10c.EnableProfile` of the profile just installed | flag in the state; the "download just completed" context exists only in memory, for this run |
 | **ES10b.ConfigureImmediateProfileEnabling** (5.9.17) | none | immediate-enable settings; refused while an eIM is configured |
 | **ES10b.RetrieveNotificationsList** (5.9.11) | passed to the card (`BF2B`, SGP.22 5.7.10), except a request for eUICC Package Results or for a sequence number from `0x40000000` up | result store |
+| ES10b.ListNotification (SGP.22 5.7.9, not in SGP.32) | passed to the card (`BF28`); the delivery lists the metadata with it, see [Notifications](#notifications-and-profile-installation-results) | none |
 | **ES10b.RemoveNotificationFromList** (5.9.12) | passed to the card (SGP.22 5.7.11) below `0x40000000` | result store at or above it |
 | **ES10b.GetProfilesInfo** (5.9.14) | passed to the card | adds `fallbackAttribute` to the fallback profile, in DER order |
 | **ES10b.eUICCMemoryReset** (5.9.5) | `ES10c.eUICCMemoryReset` (`BF34`, SGP.22 5.7.19) for the SGP.22 options | eIM records and immediate-enable settings for the SGP.32 bits |
@@ -670,12 +671,24 @@ What the code does:
   [2b]). A notification is removed from the card (`RemoveNotificationFromList`)
   only after the eIM answers 204 or 200. When the eIM cannot be reached, the
   rest are kept for the next run.
-- The card's notification list (`RetrieveNotificationsList` without
-  criteria) is read once per poll: the IpaEuiccData of an
-  `IpaEuiccDataRequest` and the delivery at the end share it, and it is read
-  again only after something that changes it (a package, a download, a
-  removal, the host's ES9+ client). On a consumer card that keeps old
-  notifications one read is tens of kilobytes of GET RESPONSE.
+- On an emulated card the delivery lists the notifications' metadata
+  alone (`ES10b.ListNotification`, SGP.22 5.7.9: seqNumber, operation,
+  address, ICCID) and reads a notification in full
+  (`RetrieveNotificationsList` with `searchCriteria` seqNumber, SGP.22
+  5.7.10) only when it goes to the eIM. A poll in which every notification
+  is held back (below) reads none of them: on router 245 the full list was
+  about 28 KB of GET RESPONSE on every poll, for eleven notifications the
+  eIM does not take. A notification gone between the listing and the read
+  is skipped; one the card does not give is kept for the next run. A card
+  that does not answer `ListNotification` is read in full, as an IoT eUICC
+  is.
+- An IoT eUICC has no `ListNotification` (SGP.32 v1.3 5.9 has only
+  `RetrieveNotificationsList`), so its full list (without criteria) is read
+  once per poll. The IpaEuiccData of an `IpaEuiccDataRequest`, a direct
+  download's search for its PIR and the delivery share that read, on
+  either kind of card, and it is read again only after something that
+  changes the card (a package, a download, a removal, the host's ES9+
+  client).
 - A notification the eIM answers but does not take (an error status, see
   below) waits out a **backoff**, kept per card in `<EID>.nbo` (`src/nbo.h`),
   on an emulated card and an IoT eUICC alike: it is offered again an hour
@@ -693,9 +706,8 @@ What the code does:
   carries the first 8 octets of SHA-256 over the notification's
   `NotificationMetadata` (seqNumber, operation, address, ICCID), and a
   seqNumber that comes back with other metadata is offered at once. The
-  metadata rather than the whole notification, so that a listing of the
-  metadata alone (SGP.22 `ListNotification`) can decide it without reading
-  the notification. The eIM
+  metadata rather than the whole notification, so that the listing of the
+  metadata alone (above) decides it without reading the notification. The eIM
   configurations are fingerprinted the same way, over
   `GetEimConfigurationData` (5.9.18), which carries no `counterValue`, so a
   package is no change.

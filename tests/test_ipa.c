@@ -426,7 +426,7 @@ int main(void)
 	dbuf b;
 	der_tlv x, y;
 	char err[160];
-	int mark;
+	int mark, mark2;
 	const dbuf *m;
 
 	close(fd);
@@ -600,7 +600,7 @@ int main(void)
 		mark = eim.ngot;
 		n = fc.retrieves;
 		ipa_poll(a, &sum);
-		OK(fc.retrieves == n + 1, "data: the card's notification list read once in the poll, for data and delivery");
+		OK(fc.retrieves == n + 1, "data: the card's full notification list read once in the poll (the delivery lists the metadata)");
 		m = last_got(&eim, 0xBF50);
 		OK(m && inner(m, 0xBF52, &y) == 0 && der_find(y.val, y.len, 0xA0, &x) == 0, "data: BF52{A0 ipaEuiccData}");
 		{
@@ -761,6 +761,54 @@ int main(void)
 	now += NBO_FIRST;
 	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0, "notify: taken after its hour");
 
+	/* --- an SGP.22 card: the metadata listed (ListNotification, SGP.22
+	 * 5.7.9), a notification read in full only when it goes out --- */
+	{
+		int r0, l0, all0;
+
+		fake22_add_other(&fc);
+		fake22_add_other(&fc);
+		fake22_add_other(&fc);
+		eim.refuse_notify = 3;
+		mark = eim.ngot;
+		r0 = fc.retrieves;
+		l0 = fc.lists;
+		all0 = fc.retrieves_all;
+		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 3 && fc.nnotes == 3,
+		   "list: three refused");
+		OK(fc.lists == l0 + 1 && fc.retrieves == r0 + 3 && fc.retrieves_all == all0,
+		   "list: one listing, each read by its seqNumber, the full list never");
+		r0 = fc.retrieves;
+		l0 = fc.lists;
+		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 3, "list: all three held");
+		OK(fc.lists == l0 + 1 && fc.retrieves == r0,
+		   "list: everything held back, the listing alone and no notification read");
+		/* a card that does not answer ListNotification: the full list, once */
+		fc.no_list_notification = 1;
+		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 3 && fc.retrieves == r0 + 1 &&
+		   fc.retrieves_all == all0 + 1, "list: without ListNotification the full list is read once, still held");
+		fc.no_list_notification = 0;
+		now += NBO_FIRST;
+		OK(ipa_deliver_notifications(a) == 3 && fc.nnotes == 0 && count_got(&eim, mark, 0xBF3D) == 6,
+		   "list: taken after their hour, and removed");
+
+		/* listed, then gone before it was read (lpac removed it): nothing
+		 * sent, least of all the bare metadata; not read: kept */
+		fc.hide_seq = fake22_add_other(&fc);
+		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 6 && fc.nnotes == 1,
+		   "list: one gone since the listing is not sent");
+		fc.hide_seq = 0;
+		fc.fetch_sw = 0x6F00;
+		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 6 && fc.nnotes == 1 &&
+		   strstr(h.last_log, "not read from the card") != NULL, "list: one the card does not give is kept");
+		fc.fetch_sw = 0;
+		OK(ipa_deliver_notifications(a) == 1 && count_got(&eim, mark, 0xBF3D) == 7 && fc.nnotes == 0,
+		   "list: then sent in full, and removed");
+		m = last_got(&eim, 0xBF3D);
+		OK(m && inner(m, 0xA0, &x) == 0 && der_parse(x.val, x.len, &y) == 0 && y.tag == 0x30,
+		   "list: the eIM got the OtherSignedNotification, not its metadata");
+	}
+
 	/* an IoT eUICC gets the same backoff, from the same file: the card
 	 * driven without the emulation (fake22 has no GetEimConfigurationData,
 	 * which leaves the records' eIM fingerprint as it is) */
@@ -770,8 +818,10 @@ int main(void)
 	mark = eim.ngot;
 	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1 &&
 	   strstr(h.last_log, "offered again in 3600s") != NULL, "iot: refused, the backoff recorded");
+	mark2 = fc.lists;
 	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1 && fc.nnotes == 1,
 	   "iot: held within its hour");
+	OK(fc.lists == mark2, "iot: no ListNotification (SGP.32 v1.3 has none), the full list");
 	now += NBO_FIRST;
 	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0 && count_got(&eim, mark, 0xBF3D) == 2,
 	   "iot: taken after it, and removed");

@@ -361,6 +361,12 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 		f->retrieves++;
 		if (der_find(t.val, t.len, 0xA0, &x) == 0 && der_find(x.val, x.len, 0x80, &y) == 0)
 			der_get_int(&y, &want);
+		if (want < 0)
+			f->retrieves_all++;
+		else if (f->fetch_sw)
+			return f->fetch_sw;
+		else if (f->hide_seq && want == f->hide_seq)
+			want = INT64_MAX;   /* matches none */
 		m = der_begin(r, 0xBF2B);
 		l = der_begin(r, 0xA0);
 		for (i = 0; i < f->nnotes; i++)
@@ -372,6 +378,30 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 		der_end(r, m);
 		return 0x9000;
 	}
+
+	case 0xBF28:   /* ListNotification (SGP.22 5.7.9): the metadata alone */
+		if (f->no_list_notification)
+			return 0x6D00;
+		f->lists++;
+		m = der_begin(r, 0xBF28);
+		l = der_begin(r, 0xA0);
+		for (i = 0; i < f->nnotes; i++) {
+			der_tlv n, a, md;
+
+			if (der_parse(f->notes[i].d, f->notes[i].len, &n) < 0)
+				continue;
+			if (n.tag == 0xBF37 && der_find(n.val, n.len, 0xBF27, &a) == 0)
+				n = a;
+			if (der_find(n.val, n.len, 0xBF2F, &md) < 0)
+				db_put(r, "\xBF\x2F\x00", 3);   /* damaged: metadata without a seqNumber */
+			else if (f->broken_tail && i == f->nnotes - 1)
+				db_put(r, md.raw, 4);             /* its header, a little content */
+			else
+				db_put(r, md.raw, md.raw_len);
+		}
+		der_end(r, l);
+		der_end(r, m);
+		return 0x9000;
 
 	case 0xBF30: {
 		int64_t seq = -1;

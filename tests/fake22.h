@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * A simulated SGP.22 consumer eUICC for the tests (behind simcard): profiles
  * with state, ES10c enable/disable/delete, GetEUICCData, GetProfilesInfo,
- * GetRAT, SetDefaultDpAddress, an empty notification list. It knows no
+ * GetRAT, SetDefaultDpAddress, notifications (ListNotification,
+ * RetrieveNotificationsList, RemoveNotificationFromList). It knows no
  * SGP.32 function, as a real SGP.22 card does not. */
 #ifndef IPAD_FAKE22_H
 #define IPAD_FAKE22_H
@@ -46,6 +47,14 @@ typedef struct {
 	int nnotes;
 	int64_t next_seq;
 	int retrieves;                    /* RetrieveNotificationsList calls */
+	int retrieves_all;                /* of them without searchCriteria */
+	int lists;                        /* ListNotification calls */
+	int no_list_notification;         /* ListNotification unknown (6D00) */
+	/* a retrieval by seqNumber: hide_seq answers an empty list for that
+	 * one (removed since it was listed); fetch_sw answers with that status
+	 * word; 0 for neither */
+	int64_t hide_seq;
+	uint16_t fetch_sw;
 	int broken_tail;                  /* the full list's last entry cut short */
 
 	/* download: the BPP segments seen ("BF36 A0 A1 88 A3 86 ..."), the
