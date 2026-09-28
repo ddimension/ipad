@@ -17,7 +17,13 @@
 static const char *EIM = "eim.test.example";
 static crypto_key *eim_key, *dev_key, *tls_key;
 static FILE *dump;
-static dbuf CERT;   /* a real certificate for every Certificate field */
+static dbuf CERT;
+static int64_t now = 1790000000;   /* the IPA's clock (ipa_config.clock) */
+
+static int64_t clock_now(void)
+{
+	return now;
+}   /* a real certificate for every Certificate field */
 
 static void load_fixture(const char *name, dbuf *out)
 {
@@ -465,6 +471,7 @@ int main(void)
 	cfg.host.ud = &h;
 	cfg.transport = eim_transport;
 	cfg.transport_ud = &eim;
+	cfg.clock = clock_now;
 
 	/* --- IpaCapabilities bytes (4.1), both ways; a BIT STRING drops
 	 * trailing zero bits, so direct off leaves one named bit less --- */
@@ -577,6 +584,7 @@ int main(void)
 		dbuf q;
 		size_t k;
 		uint8_t tx[16];
+		int n;
 
 		memset(tx, 0x44, sizeof(tx));
 		db_init(&q);
@@ -586,7 +594,9 @@ int main(void)
 		der_end(&q, k);
 		queue(&eim, &q);
 		mark = eim.ngot;
+		n = fc.retrieves;
 		ipa_poll(a, &sum);
+		OK(fc.retrieves == n + 1, "data: the card's notification list read once in the poll, for data and delivery");
 		m = last_got(&eim, 0xBF50);
 		OK(m && inner(m, 0xBF52, &y) == 0 && der_find(y.val, y.len, 0xA0, &x) == 0, "data: BF52{A0 ipaEuiccData}");
 		{
@@ -696,7 +706,26 @@ int main(void)
 	eim.refuse_notify = 1;
 	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 1,
 	   "notify: a refused one is kept, the next still goes out");
-	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0, "notify: the refused one goes on a later run");
+	OK(strstr(h.last_log, "offered again in 3600s") != NULL, "notify: the refusal logged with its backoff");
+	/* SGP.32 3.7 keeps it on the card; only how often it is offered changes */
+	mark = eim.ngot;
+	OK(ipa_deliver_notifications(a) == 0 && fc.nnotes == 1 && count_got(&eim, mark, 0xBF3D) == 0,
+	   "notify: the refused one is held back within its hour");
+	emu_close(eu.emu);   /* a new run: the backoff is in the state file */
+	eu.emu = emu_open(&c, &ecfg);
+	now += EMU_NB_FIRST - 1;
+	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 0,
+	   "notify: still held after a restart, a second before the hour");
+	now += 1;
+	eim.refuse_notify = 1;
+	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1 && fc.nnotes == 1,
+	   "notify: offered again after the hour, and refused again");
+	now += 2 * EMU_NB_FIRST - 1;
+	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1,
+	   "notify: the second refusal doubled the delay");
+	now += 1;
+	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0 && count_got(&eim, mark, 0xBF3D) == 2,
+	   "notify: taken after two hours, and removed");
 
 	/* --- direct download through the host (3.2.3.1) --- */
 	{

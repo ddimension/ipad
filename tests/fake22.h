@@ -40,6 +40,7 @@ typedef struct {
 	int64_t note_seq[8];
 	int nnotes;
 	int64_t next_seq;
+	int retrieves;                    /* RetrieveNotificationsList calls */
 
 	/* download: the BPP segments seen ("BF36 A0 A1 88 A3 86 ..."), the
 	 * sessions cancelled, and what the last segment installs */

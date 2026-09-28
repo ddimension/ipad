@@ -354,6 +354,7 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 	case 0xBF2B: {
 		int64_t want = -1;
 
+		f->retrieves++;
 		if (der_find(t.val, t.len, 0xA0, &x) == 0 && der_find(x.val, x.len, 0x80, &y) == 0)
 			der_get_int(&y, &want);
 		m = der_begin(r, 0xBF2B);

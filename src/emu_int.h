@@ -13,6 +13,7 @@
 
 #define EMU_MAX_EIMS 8
 #define EMU_MAX_EPRS 16
+#define EMU_MAX_NB 32
 
 /* what a card refused once and is not asked again (state: quirks [9]) */
 #define EMU_Q_NO_9F67 1        /* GetProfilesInfo with 5C { 5A 9F70 9F67 } */
@@ -70,6 +71,13 @@ struct emu {
 	int64_t token_ctr;               /* associationToken generation */
 
 	int quirks;                      /* EMU_Q_* */
+
+	/* Notifications the eIM answered without taking them (emu.h
+	 * emu_notif_due), valid for the eIM configurations fingerprinted in
+	 * nb_fp: a changed configuration starts them afresh */
+	uint64_t nb_fp;
+	struct { int64_t seq, due, delay; } nb[EMU_MAX_NB];
+	int nnb;
 };
 
 /* state file */

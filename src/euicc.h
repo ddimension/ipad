@@ -12,8 +12,9 @@
  *        replay counter and the result signatures kept by the IPA; the rest
  *        goes to the card unchanged.
  *
- * Because the call is the same, everything above it (ipa.c) is written once
- * and does not know which one it drives.
+ * Because the call is the same, everything above it (ipa.c) is written once.
+ * It asks which one it drives only for what an IoT eUICC has no place for:
+ * the notification backoff, kept in the emulation's state (emu.h).
  */
 #ifndef IPAD_EUICC_H
 #define IPAD_EUICC_H

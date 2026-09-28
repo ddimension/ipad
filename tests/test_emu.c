@@ -624,6 +624,63 @@ static void test_list_profile_info(void)
 	db_free(&resp);
 }
 
+/* the backoff of notifications the eIM did not take (emu.h emu_notif_due) */
+static void test_notif_backoff(void)
+{
+	static const uint8_t reset_eim[] = { 0xBF, 0x64, 0x04, 0x82, 0x02, 0x02, 0x04 };   /* resetEimConfigData */
+	static const int64_t want[] = { 7200, 14400, 28800, 57600, 86400, 86400 };
+	const int64_t t0 = 1790000000, only61[] = { 61 };
+	int64_t t = t0;
+	dbuf req, resp;
+	size_t m, l, i;
+	bool ok = true;
+	rig r;
+
+	OK(rig_open(&r, 0) == 0, "backoff: rig");
+	OK(emu_notif_due(r.e, 38, t0), "backoff: a notification never refused is due");
+	OK(emu_notif_refused(r.e, 38, t0) == EMU_NB_FIRST, "backoff: an hour after the first refusal");
+	OK(!emu_notif_due(r.e, 38, t0 + EMU_NB_FIRST - 1) && emu_notif_due(r.e, 38, t0 + EMU_NB_FIRST),
+	   "backoff: held for the hour, due after it");
+	OK(emu_notif_due(r.e, 61, t0), "backoff: per seqNumber");
+	for (i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+		t += EMU_NB_CAP;
+		ok = ok && emu_notif_refused(r.e, 38, t) == want[i];
+	}
+	OK(ok, "backoff: doubling, capped at a day");
+
+	emu_close(r.e);
+	r.e = emu_open(&r.c, &r.cfg);
+	OK(r.e && !emu_notif_due(r.e, 38, t + EMU_NB_CAP - 1) && emu_notif_due(r.e, 38, t + EMU_NB_CAP),
+	   "backoff: kept in the state across a restart");
+	OK(emu_notif_due(r.e, 38, t0), "backoff: a clock gone back does not hold it longer than the cap");
+
+	emu_notif_refused(r.e, 61, t);
+	emu_notif_keep(r.e, only61, 1);
+	OK(emu_notif_due(r.e, 38, t) && !emu_notif_due(r.e, 61, t),
+	   "backoff: the record of one no longer on the card is dropped");
+
+	/* another eIM configuration (reset, provisioned anew at another
+	 * counter): the notifications are offered again at once */
+	db_init(&req);
+	db_init(&resp);
+	OK(emu_es10(r.e, reset_eim, sizeof(reset_eim), &resp) == 0, "backoff: eIM configuration reset");
+	m = der_begin(&req, 0xBF57);
+	l = der_begin(&req, 0xA0);
+	eimpkg_cfg(&req, EIM, 7, eim_key, false);
+	der_end(&req, l);
+	der_end(&req, m);
+	resp.len = 0;
+	OK(emu_es10(r.e, req.d, req.len, &resp) == 0 && emu_notif_due(r.e, 61, t),
+	   "backoff: forgotten once the eIM configuration changed");
+	emu_notif_refused(r.e, 61, t);
+	emu_close(r.e);
+	r.e = emu_open(&r.c, &r.cfg);
+	OK(r.e && !emu_notif_due(r.e, 61, t), "backoff: under the new configuration, recorded again");
+	db_free(&req);
+	db_free(&resp);
+	rig_close(&r);
+}
+
 int main(void)
 {
 	char state[] = "/tmp/ipad-test-emu-XXXXXX";
@@ -916,6 +973,7 @@ int main(void)
 	test_fallback();
 	test_fallback_card_state();
 	test_list_profile_info();
+	test_notif_backoff();
 	db_free(&req);
 	db_free(&resp);
 	db_free(&ops);

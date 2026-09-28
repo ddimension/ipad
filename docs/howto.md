@@ -246,7 +246,10 @@ step, for example:
 - "profile package loaded"
 - "direct download done"
 - "card bound at the eIM (204)"
-- "notification … not delivered, kept"
+- "notification … not delivered, kept" (the eIM was not reached)
+- "notification … not taken by the eIM, kept; offered again in 3600s" (an
+  emulated card's backoff, see
+  [sgp22-emulation.md](sgp22-emulation.md#notifications-and-profile-installation-results))
 - "InitiateAuthentication refused by the eIM: 52 (invalidEimTransactionId)",
   likewise AuthenticateClient and GetBoundProfilePackage with their ESipa
   error code and its name (SGP.32 5.14.1–5.14.3); "…: the eIM answered HTTP

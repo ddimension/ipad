@@ -49,6 +49,22 @@ int emu_es10(emu *e, const uint8_t *req, size_t len, dbuf *resp);
  * no such eIM is configured. */
 int emu_eim_state(const emu *e, const char *eim_id, int64_t *counter, bool *has_token, int64_t *token);
 
+/* Backoff for Notifications the eIM answers without taking them (a PIR it
+ * cannot attribute, an old consumer-card notification). SGP.32 3.7 has the
+ * IPA remove only what the eIM acknowledged, so they stay on the card; what
+ * changes is how often they are offered: an hour after the first refusal,
+ * doubling up to a day. Kept in the state, so a poll every few minutes does
+ * not send them each time; forgotten when the eIM configuration changes,
+ * since another eIM, or the same one updated, may take them. now: seconds
+ * (time()). emu_notif_keep: the seqNumbers still on the card, after a
+ * complete run; the record of any other is dropped. */
+bool emu_notif_due(emu *e, int64_t seq, int64_t now);
+int64_t emu_notif_refused(emu *e, int64_t seq, int64_t now);   /* the next delay */
+void emu_notif_keep(emu *e, const int64_t *seqs, int n);
+
+#define EMU_NB_FIRST 3600
+#define EMU_NB_CAP 86400
+
 /* The sequence numbers the emulation gives its eUICC Package Results start
  * here: far above the card's own notification numbers, so that
  * RemoveNotificationFromList can tell whose a number is, and still

@@ -13,8 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 
 #include "ipa.h"
+#include "emu.h"
 #include "crypto.h"
 #include "hex.h"
 
@@ -30,6 +32,12 @@ struct ipa {
 	int cause;               /* state change cause for the next poll, -1 none */
 	int64_t es9[ES9_MAX];    /* PIRs owed to their SM-DP+ over ES9+ (es9_path) */
 	int nes9;
+	/* the card's RetrieveNotificationsList without criteria, read once per
+	 * poll (the package phase and the notification phase share it): on a
+	 * consumer card with old notifications it is tens of kilobytes of GET
+	 * RESPONSE. Dropped whenever the list may change. */
+	dbuf nl;
+	bool nl_ok;
 };
 
 #define DAP_URL_PATH "/gsma/rsp2/asn1"
@@ -258,6 +266,7 @@ static int remove_seq(ipa *a, int64_t seq)
 	int64_t v = -1;
 	size_t m;
 
+	a->nl_ok = false;
 	db_init(&q);
 	db_init(&r);
 	m = der_begin(&q, 0xBF30);
@@ -280,6 +289,11 @@ static int retrieve(ipa *a, const uint8_t *crit, size_t clen, dbuf *resp, der_tl
 	size_t m;
 	int rc;
 
+	if (!crit && a->nl_ok) {
+		resp->len = 0;
+		db_put(resp, a->nl.d, a->nl.len);
+		return resp->err || der_parse(resp->d, resp->len, t) < 0 ? -1 : 0;
+	}
 	db_init(&q);
 	m = der_begin(&q, 0xBF2B);
 	if (crit)
@@ -287,6 +301,11 @@ static int retrieve(ipa *a, const uint8_t *crit, size_t clen, dbuf *resp, der_tl
 	der_end(&q, m);
 	rc = es10(a->c.eu, q.d, q.len, resp, t);
 	db_free(&q);
+	if (rc == 0 && !crit) {
+		a->nl.len = 0;
+		db_put(&a->nl, resp->d, resp->len);
+		a->nl_ok = !a->nl.err;
+	}
 	return rc;
 }
 
@@ -382,6 +401,7 @@ static int es9_deliver(ipa *a, int64_t seq)
 	 * back; card_es10 reopens it afterwards */
 	card_close(a->c.eu->card);
 	rc = a->c.host.notify(a->c.host.ud, seq);
+	a->nl_ok = false;
 	if (rc == 0) {
 		es9_set(a, seq, false);
 		say(a, LOG_NOTICE, "PIR %lld delivered to the SM-DP+ over ES9+", (long long)seq);
@@ -392,15 +412,23 @@ static int es9_deliver(ipa *a, int64_t seq)
 	return rc;
 }
 
+#define SEEN_MAX 64
+
 int ipa_deliver_notifications(ipa *a)
 {
 	dbuf r, msg;
 	der_tlv t, list, n;
 	const uint8_t *p, *end;
-	int sent = 0;
-	int64_t seen[ES9_MAX];
+	int sent = 0, held = 0;
+	/* the seqNumbers still on the card after this run, for dropping stale
+	 * records (ES9+ and backoff); only once the whole list was seen */
+	int64_t seen[SEEN_MAX];
 	int nseen = 0, i, rc;
 	bool listed = false;
+	emu *em = a->c.eu->kind == EUICC_EMU ? a->c.eu->emu : NULL;
+	int64_t now = a->c.clock ? a->c.clock() : (int64_t)time(NULL);
+
+#define SEEN(s) (nseen < SEEN_MAX ? (void)(seen[nseen++] = (s)) : (void)(listed = false))
 
 	db_init(&r);
 	db_init(&msg);
@@ -419,8 +447,13 @@ int ipa_deliver_notifications(ipa *a)
 			if (a->c.host.notify && es9_owed(a, seq)) {
 				if (es9_deliver(a, seq) == 0)
 					sent++;
-				else if (nseen < ES9_MAX)
-					seen[nseen++] = seq;
+				else
+					SEEN(seq);
+				continue;
+			}
+			if (em && !emu_notif_due(em, seq, now)) {
+				held++;
+				SEEN(seq);
 				continue;
 			}
 			/* HandleNotificationEsipa { pendingNotification [0] } (5.14.7);
@@ -432,13 +465,20 @@ int ipa_deliver_notifications(ipa *a)
 			der_end(&msg, k);
 			der_end(&msg, m);
 			rc = esipa_notify(a, &msg);
-			/* One the eIM answers but does not take stays on the card and
-			 * the next one goes out: stopping here let a single
-			 * notification the eIM keeps refusing (a PIR it cannot
-			 * attribute) hold back every later one of the card. */
+			/* One the eIM answers but does not take stays on the card
+			 * (3.7: only an acknowledged one is removed) and the next one
+			 * goes out: stopping here let a single notification the eIM
+			 * keeps refusing (a PIR it cannot attribute) hold back every
+			 * later one of the card. On an emulated card it then waits
+			 * out a backoff (emu.h emu_notif_due). */
 			if (rc == -2) {
-				say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept for a later run",
-				    (long long)seq);
+				if (em)
+					say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept; offered again in %llds",
+					    (long long)seq, (long long)emu_notif_refused(em, seq, now));
+				else
+					say(a, LOG_WARNING, "notification %lld not taken by the eIM, kept for a later run",
+					    (long long)seq);
+				SEEN(seq);
 				continue;
 			}
 			if (rc < 0) {
@@ -446,12 +486,17 @@ int ipa_deliver_notifications(ipa *a)
 				listed = false;   /* not all seen: no record is dropped */
 				break;   /* the eIM is unreachable; the rest waits too */
 			}
-			remove_seq(a, seq);
+			if (remove_seq(a, seq) < 0)
+				SEEN(seq);
 			sent++;
 		}
 	}
-	/* a record whose PIR is no longer on the card (removed by other means)
-	 * is dropped; a list the card did not give leaves the record alone */
+#undef SEEN
+	if (held)
+		say(a, LOG_DEBUG, "%d notification(s) the eIM did not take held back until their retry time", held);
+	/* a record whose notification is no longer on the card (removed by
+	 * other means) is dropped; a list the card did not give, or not all
+	 * of, leaves the records alone */
 	if (listed && a->c.host.notify) {
 		for (i = a->nes9 - 1; i >= 0; i--) {
 			int j;
@@ -462,6 +507,9 @@ int ipa_deliver_notifications(ipa *a)
 				es9_set(a, a->es9[i], false);
 		}
 	}
+	if (listed && em)
+		emu_notif_keep(em, seen, nseen);
+	a->nl_ok = false;   /* the run's last reader; others change the card */
 	db_free(&r);
 	db_free(&msg);
 	return sent;
@@ -1091,6 +1139,7 @@ static int handle_download(ipa *a, const der_tlv *req, ipa_summary *sum)
 		 * card_es10 reopens it afterwards */
 		card_close(a->c.eu->card);
 		rc = a->c.host.download(a->c.host.ud, ac, NULL);
+		a->nl_ok = false;
 		m = der_begin(&res, 0xBF54);
 		if (has_txid)
 			der_put(&res, 0x82, txid.val, txid.len);
@@ -1153,6 +1202,7 @@ int ipa_poll(ipa *a, ipa_summary *sum)
 	if (!sum)
 		sum = &dummy;
 	memset(sum, 0, sizeof(*sum));
+	a->nl_ok = false;   /* read afresh once per poll */
 	db_init(&msg);
 	db_init(&resp);
 
@@ -1188,12 +1238,14 @@ int ipa_poll(ipa *a, ipa_summary *sum)
 		switch (alt.tag) {
 		case 0xBF51:
 			handle_package(a, &alt, sum);
+			a->nl_ok = false;   /* an enable, disable or delete notifies */
 			break;
 		case 0xBF52:
 			handle_data(a, &alt, sum);
 			break;
 		case 0xBF54:
 			handle_download(a, &alt, sum);
+			a->nl_ok = false;   /* a new PIR */
 			break;
 		default: {
 			/* eimPackageResultResponseError [0] { code unknownPackage } */
@@ -1374,6 +1426,7 @@ ipa *ipa_open(const ipa_config *cfg)
 	a->cause = cfg->state_change_cause;
 	es9_load(a);
 	db_init(&a->ca);
+	db_init(&a->nl);
 	db_init(&r);
 	if (es10(a->c.eu, geteid, sizeof(geteid), &r, &t) < 0 || der_find(t.val, t.len, 0x5A, &x) < 0 ||
 	    x.len != 16) {
@@ -1398,6 +1451,7 @@ void ipa_close(ipa *a)
 	if (!a)
 		return;
 	db_free(&a->ca);
+	db_free(&a->nl);
 	free(a);
 }
 

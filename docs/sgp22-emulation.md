@@ -190,7 +190,10 @@ State ::= SEQUENCE {
   immediate  [7]  SEQUENCE { flag [0] BOOLEAN, oid [1] OPTIONAL,
                              addr [2] OPTIONAL } OPTIONAL,
   tokenCtr   [8]  INTEGER,
-  quirks     [9]  INTEGER OPTIONAL                 -- what the card refused once
+  quirks     [9]  INTEGER OPTIONAL,                -- what the card refused once
+  backoff    [10] SEQUENCE { fp [0] OCTET STRING (8),
+                             SEQUENCE OF SEQUENCE { seq [0] INTEGER,
+                                                    due [1] INTEGER, delay [2] INTEGER } } OPTIONAL
 }
 ```
 
@@ -200,7 +203,11 @@ every run: bit 1, the `9F67` tag list of the profile check (see
 bit 2, `9F7B`/`9F67` in a `listProfileInfo` tag list. Only a refusal the card
 answered counts (an error status word or a `profileInfoListError`, followed
 by an answer to the list without them); a call that got no answer proves
-nothing. `ipad reset <EID>` forgets it with the rest of the card's state.
+nothing. `backoff` is the notification backoff (see
+[Notifications](#notifications-and-profile-installation-results)); `fp` is a
+fingerprint of the eIM configurations it was recorded under. A damaged
+`backoff` is dropped, not a reason to refuse the state. `ipad reset <EID>`
+forgets both with the rest of the card's state.
 
 The state is bound to the card. `emu_open()` reads the EID from the card
 (`GetEUICCData`, tag list `5A`) and refuses a state file whose `eid` does not
@@ -656,8 +663,27 @@ What the code does:
   notifications (PIRs and `OtherSignedNotification`s, signed by the card) and
   sends each one to the eIM with `ESipa.HandleNotification` (5.14.7, 3.7 option
   [2b]). A notification is removed from the card (`RemoveNotificationFromList`)
-  only after the eIM answers 204 or 200. At the first failure the rest are kept
-  for the next run.
+  only after the eIM answers 204 or 200. When the eIM cannot be reached, the
+  rest are kept for the next run.
+- The card's notification list (`RetrieveNotificationsList` without
+  criteria) is read once per poll: the IpaEuiccData of an
+  `IpaEuiccDataRequest` and the delivery at the end share it, and it is read
+  again only after something that changes it (a package, a download, a
+  removal, the host's ES9+ client). On a consumer card that keeps old
+  notifications one read is tens of kilobytes of GET RESPONSE.
+- A notification the eIM answers but does not take (an error status, see
+  below) waits out a **backoff** per seqNumber on an emulated card, kept in
+  the state (`backoff`): it is offered again an hour after the first
+  refusal, then after 2, 4, 8 and 16 hours, and then once a day. It stays on
+  the card throughout (3.7: the IPA deletes only what the eIM acknowledged);
+  only the frequency changes. On router 245, eleven old consumer-card
+  notifications cost 11 ESipa calls on every poll without it. The records
+  are forgotten when the eIM configurations change (another eIM, an
+  `updateEim`, a new provisioning), because the eIM may take them then, and
+  a record is dropped once its notification is no longer on the card. A due
+  date more than a day ahead means the clock went back (a router sets it
+  late), and the notification is offered. An IoT eUICC has no such state,
+  and its refused notifications go out on every poll as before.
 - ipad sends no notification to an SM-DP+ itself: it has no ES9+ client. The
   one exception to the eIM route is the PIR of a direct download, which the
   host's ES9+ client (lpac) delivers (next section). Everything else reaches
@@ -702,7 +728,7 @@ So, with direct download offered (`-D`):
   PIR is no longer on the card is dropped.
 - Without `-D` there is no ES9+ route, and the record is not consulted: every
   pending notification goes to the eIM as before. Nothing in ipad holds a
-  notification back.
+  notification back, apart from the backoff above.
 - A notification the eIM answers but does not take (an error status — e.g. a
   PIR the eIM cannot attribute yet, which it refuses so that it is not lost,
   eIM decision D-85) stays on the card and the next one goes out; only an eIM
