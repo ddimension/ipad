@@ -727,6 +727,35 @@ int main(void)
 	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0 && count_got(&eim, mark, 0xBF3D) == 2,
 	   "notify: taken after two hours, and removed");
 
+	/* a list that does not parse to its end drops no backoff record: the
+	 * cut entry is the refused one, and it stays held */
+	fake22_add_other(&fc);
+	eim.refuse_notify = 1;
+	mark = eim.ngot;
+	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1, "notify: refused, backoff recorded");
+	fc.broken_tail = 1;
+	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1 &&
+	   strstr(h.last_log, "does not parse") != NULL, "notify: a broken list tail is logged, nothing sent");
+	fc.broken_tail = 0;
+	OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1,
+	   "notify: after a broken list the backoff still holds it");
+	/* the refused one read without a seqNumber (its metadata damaged in
+	 * transfer): likewise */
+	{
+		dbuf keep = fc.notes[0];
+
+		db_init(&fc.notes[0]);
+		db_put(&fc.notes[0], "\x30\x03\x80\x01\x00", 5);
+		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1,
+		   "notify: an entry without a seqNumber skipped");
+		db_free(&fc.notes[0]);
+		fc.notes[0] = keep;
+		OK(ipa_deliver_notifications(a) == 0 && count_got(&eim, mark, 0xBF3D) == 1,
+		   "notify: after an entry without a seqNumber the backoff still holds it");
+	}
+	now += EMU_NB_FIRST;
+	OK(ipa_deliver_notifications(a) == 1 && fc.nnotes == 0, "notify: taken after its hour");
+
 	/* --- direct download through the host (3.2.3.1) --- */
 	{
 		dbuf q;
@@ -942,6 +971,24 @@ int main(void)
 		   "es9: the next run delivers it over ES9+");
 		OK(count_got(&eim, mark, 0xBF3D) == 0 && !file_exists(es9), "es9: not to the eIM, record cleared");
 
+		/* a list that does not parse to its end drops no record: the cut
+		 * entry is the owed PIR, which must not go to the eIM later */
+		owed = fake22_add_pir(&fc, "98001032547698103284");
+		f = fopen(es9, "w");
+		fprintf(f, "%lld\n", (long long)owed);
+		fclose(f);
+		ipa_close(b2);
+		b2 = ipa_open(&c2);
+		fc.broken_tail = 1;
+		mark = eim.ngot;
+		ipa_deliver_notifications(b2);
+		OK(file_exists(es9) && h.notifies == 4 && count_got(&eim, mark, 0xBF3D) == 0,
+		   "es9: a broken list tail keeps the record");
+		fc.broken_tail = 0;
+		OK(ipa_deliver_notifications(b2) == 1 && h.notifies == 5 && h.notify_seq == owed && fc.nnotes == 0 &&
+		   count_got(&eim, mark, 0xBF3D) == 0 && !file_exists(es9),
+		   "es9: the PIR then goes over ES9+, not to the eIM");
+
 		/* a record whose PIR is gone from the card is dropped */
 		f = fopen(es9, "w");
 		fprintf(f, "999\n");
@@ -949,7 +996,7 @@ int main(void)
 		ipa_close(b2);
 		b2 = ipa_open(&c2);
 		ipa_deliver_notifications(b2);
-		OK(!file_exists(es9) && h.notifies == 4, "es9: a stale record dropped, nothing sent for it");
+		OK(!file_exists(es9) && h.notifies == 5, "es9: a stale record dropped, nothing sent for it");
 
 		/* no ES9+ route (host without -D): nothing is held back, the PIR
 		 * goes to the eIM as before */

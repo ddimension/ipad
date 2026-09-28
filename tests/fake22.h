@@ -46,6 +46,7 @@ typedef struct {
 	int nnotes;
 	int64_t next_seq;
 	int retrieves;                    /* RetrieveNotificationsList calls */
+	int broken_tail;                  /* the full list's last entry cut short */
 
 	/* download: the BPP segments seen ("BF36 A0 A1 88 A3 86 ..."), the
 	 * sessions cancelled, and what the last segment installs */

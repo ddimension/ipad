@@ -364,7 +364,9 @@ uint16_t fake22_handler(simcard *s, const uint8_t *req, size_t len, dbuf *r)
 		m = der_begin(r, 0xBF2B);
 		l = der_begin(r, 0xA0);
 		for (i = 0; i < f->nnotes; i++)
-			if (want < 0 || f->note_seq[i] == want)
+			if (want < 0 && f->broken_tail && i == f->nnotes - 1)
+				db_put(r, f->notes[i].d, 8);   /* its header, a little content */
+			else if (want < 0 || f->note_seq[i] == want)
 				db_put(r, f->notes[i].d, f->notes[i].len);
 		der_end(r, l);
 		der_end(r, m);

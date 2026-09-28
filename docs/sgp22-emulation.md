@@ -685,7 +685,8 @@ What the code does:
   notifications cost 11 ESipa calls on every poll without it. The records
   are forgotten when the eIM configurations change (another eIM, an
   `updateEim`, a new provisioning), because the eIM may take them then, and
-  a record is dropped once its notification is no longer on the card. A due
+  a record is dropped once its notification is no longer on the card (as
+  with the ES9+ record below, only after a list read to its end). A due
   date more than a day ahead means the clock went back (a router sets it
   late), and the notification is offered. An IoT eUICC has no such state,
   and its refused notifications go out on every poll as before.
@@ -730,7 +731,9 @@ So, with direct download offered (`-D`):
   the record. `ipa_deliver_notifications()` (every poll, and `ipad notify`)
   sends a recorded PIR over the host again, never to the eIM, which would
   acknowledge it and drop it, and the card would have lost it. A record whose
-  PIR is no longer on the card is dropped.
+  PIR is no longer on the card is dropped, but only after a list read to its
+  end: a list that does not parse to its end, or an entry without a
+  seqNumber, drops no record, since the unread part may hold that PIR.
 - Without `-D` there is no ES9+ route, and the record is not consulted: every
   pending notification goes to the eIM as before. Nothing in ipad holds a
   notification back, apart from the backoff above.

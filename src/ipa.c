@@ -438,10 +438,17 @@ int ipa_deliver_notifications(ipa *a)
 			int64_t seq;
 			size_t m, k;
 
-			if (der_next(&p, end, &n) < 0)
+			/* a list that does not parse to its end, or a notification
+			 * without a seqNumber, leaves notifications unseen: every
+			 * record stays, as one of them may be theirs */
+			if (der_next(&p, end, &n) < 0) {
+				say(a, LOG_WARNING, "notification list does not parse to its end, the rest skipped");
+				listed = false;
 				break;
+			}
 			if (notif_seq(&n, &seq) < 0) {
 				say(a, LOG_WARNING, "notification without a sequence number, skipped");
+				listed = false;
 				continue;
 			}
 			if (a->c.host.notify && es9_owed(a, seq)) {
