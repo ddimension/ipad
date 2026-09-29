@@ -1054,6 +1054,7 @@ static int indirect_download(ipa *a, const char *ac, const der_tlv *eim_txid)
 	char mid[256] = "";
 	dbuf msg, resp, r, info1, chal, ctx, pir;
 	der_tlv t, ok, x, ss1, sig1, ckid, cert, txid, y;
+	uint8_t txbuf[16];
 	const uint8_t *p, *end;
 	int rc = -1, reason = 127;
 	bool have_txid = false;
@@ -1112,10 +1113,20 @@ static int indirect_download(ipa *a, const char *ac, const der_tlv *eim_txid)
 			cert = y;
 	}
 	if (!ss1.raw || !cert.raw || der_find(ok.val, ok.len, 0x5F37, &sig1) < 0 ||
-	    der_find(ok.val, ok.len, 0x04, &ckid) < 0 || der_find(ss1.val, ss1.len, 0x80, &txid) < 0) {
+	    der_find(ok.val, ok.len, 0x04, &ckid) < 0 || der_find(ss1.val, ss1.len, 0x80, &txid) < 0 ||
+	    txid.len < 1 || txid.len > sizeof(txbuf)) {
 		say(a, LOG_ERR, "InitiateAuthentication response incomplete");
 		goto out;
 	}
+	/* The TransactionID outlives this response: `resp` takes the
+	 * AuthenticateClient and GetBoundProfilePackage answers next, and a
+	 * view into it would then read whatever those carry at that offset –
+	 * the eIM need not repeat transactionId there (SGP.32 5.14.2 "If
+	 * smdpSign2 is provided, transactionId is optional"). TransactionId
+	 * is OCTET STRING (SIZE(1..16)), SGP.22 5.6.1. */
+	memcpy(txbuf, txid.val, txid.len);
+	txid.val = txbuf;
+	txid.raw = NULL;
 	have_txid = true;
 	if (der_find(ok.val, ok.len, 0x0C, &y) == 0 && y.len < sizeof(mid)) {
 		memcpy(mid, y.val, y.len);

@@ -44,7 +44,7 @@ static void load_fixture(const char *name, dbuf *out)
 /* ---- the scripted eIM ---- */
 
 typedef struct {
-	dbuf queue[16];             /* GetEimPackageResponses to hand out */
+	dbuf queue[24];             /* GetEimPackageResponses to hand out */
 	int nq, qi;
 	dbuf got[160];              /* every request, in order */
 	int ngot;
@@ -54,6 +54,7 @@ typedef struct {
 	int64_t init_auth_error;    /* > 0: InitiateAuthentication answers this error */
 	bool invalid;               /* a deliberately malformed exchange: not dumped */
 	bool no_matching;           /* InitiateAuthentication without matchingId */
+	bool ac_without_txid;       /* AuthenticateClient: profileMetaData, no transactionId (5.14.2) */
 } fake_eim;
 
 static void dump_hex(const char *dir, const uint8_t *p, size_t n)
@@ -169,7 +170,17 @@ static int eim_transport(void *ud, const uint8_t *req, size_t len, int *status, 
 			der_put_int(resp, 0x82, f->auth_client_error);
 		} else {
 			k = der_begin(resp, 0xA0);   /* AuthenticateClientOkDPEsipa */
-			der_put(resp, 0x80, txid, 16);
+			if (f->ac_without_txid) {
+				/* as the eIM answers: transactionId left out (optional
+				 * beside smdpSigned2, SGP.32 5.14.2), profileMetaData
+				 * first – other bytes where the txid used to be */
+				l = der_begin(resp, 0xBF25);
+				der_put(resp, 0x5A, "\x98\x94\x44\x99\x99\x99\x99\x09\x60\xF4", 10);
+				der_put_str(resp, 0x91, "OsmocomSPN");
+				der_end(resp, l);
+			} else {
+				der_put(resp, 0x80, txid, 16);
+			}
 			l = der_begin(resp, 0x30);   /* smdpSigned2 */
 			der_put(resp, 0x80, txid, 16);
 			der_put_bool(resp, 0x01, false);
@@ -932,6 +943,24 @@ int main(void)
 		OK(m && inner(m, 0xA0, &x) == 0 && der_parse(x.val, x.len, &y) == 0 && y.tag == 0xBF37,
 		   "indirect: PIR delivered as pendingNotification (step 23)");
 		OK(fc.nnotes == 0 && fc.cancels == 0, "indirect: PIR removed, nothing cancelled");
+
+		/* the same with an AuthenticateClient answer without transactionId
+		 * (SGP.32 5.14.2) and profileMetaData in its place, as our eIM
+		 * sends it: GetBoundProfilePackage still carries the session's
+		 * TransactionID from InitiateAuthentication, not the bytes now at
+		 * its offset in the reused response buffer (found against the
+		 * virtual IoT eUICC, eIM tools/interop/ipas) */
+		eim.ac_without_txid = true;
+		queue(&eim, &q);
+		snprintf(fc.install_iccid, sizeof(fc.install_iccid), "98001032547698103284");
+		mark = eim.ngot;
+		ipa_poll(a, &sum);
+		eim.ac_without_txid = false;
+		m = last_got(&eim, 0xBF3A);
+		OK(count_got(&eim, mark, 0xBF3A) == 1 && m && inner(m, 0x80, &x) == 0 && x.len == 16 &&
+		   x.val[0] == 0x33 && x.val[15] == 0x33, "indirect, no txid in AuthenticateClient: GetBPP keeps the session's");
+		OK(!strcmp(fc.segs, "BF36 A0 A1 88 88 A3 86 86") && fc.cancels == 0,
+		   "indirect, no txid in AuthenticateClient: BPP loaded, nothing cancelled");
 
 		/* an activation code in the trigger, and a host without direct
 		 * download: indirect, still no smdpAddress (eimDownloadDataHandling,
