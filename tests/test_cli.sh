@@ -42,6 +42,77 @@ ok '[ $same = 5 ]' 'two first runs at once: one device key'
 out=$("$b/hostsim" -- "$b/ipad" -s "$w/s" provision "$w/cfg.der" 2>&1)
 ok 'echo "$out" | grep -q "\"code\":1"' 'provision again: refused'
 
+# --- the card's eIM configurations: the info event and eim-save -------------
+# the event carries them too (the host reads events only), and so does the
+# event at the start of a poll
+out=$("$b/hostsim" -- "$b/ipad" -s "$w/s" info 2>&1)
+ok 'echo "$out" | grep -q "host: .*\"event\":\"info\".*\"eims\":\[{\"id\":\"eim.cli.example\",\"fqdn\":\"127.0.0.1:9\",\"tls\":\"system\"}\]"' \
+	'event info: the eIM list'
+out=$("$b/hostsim" -- "$b/ipad" -s "$w/s" poll 2>&1)
+ok 'echo "$out" | grep -q "host: .*\"event\":\"info\".*\"eims\":\[{\"id\":\"eim.cli.example\""' \
+	'event info at the start of a poll: the eIM list'
+out=$("$b/hostsim" -- "$b/ipad" -s "$w/n" info 2>&1)
+ok 'echo "$out" | grep -q "host: .*\"event\":\"info\".*\"eims\":\[\]"' 'event info, no eIM: an empty list'
+
+# no eIM: exit 3 and no file
+out=$("$b/hostsim" -- "$b/ipad" -s "$w/n" eim-save "$w/none.ber" 2>&1)
+ok 'echo "$out" | grep -q "\"code\":3,\"message\":\"no eIM configured\"" && [ ! -e "$w/none.ber" ]' \
+	'eim-save, no eIM: exit 3, no file'
+
+# an EimConfigurationData as an eIM writes it for AddInitialEim (5.9.4): id,
+# fqdn, counterValue 0, associationToken -1 (asks the card for one), the eIM's
+# key (eimPublicKeyData [5] { eimPublicKey [0] SPKI }) and a euiccCiPKId [8];
+# without [5] (key 0), the same as a card may render it in its BF55
+python3 -I - "$(dirname "$0")/fixtures/prime256v1.spki.der" "$w" <<'PY'
+import sys
+def tlv(tag, val):
+    n = len(val)
+    l = bytes([n]) if n < 128 else (bytes([0x81, n]) if n < 256 else bytes([0x82, n >> 8, n & 255]))
+    return bytes(tag) + l + val
+spki = open(sys.argv[1], 'rb').read()
+spki_content = spki[2:] if spki[1] < 128 else spki[2 + (spki[1] & 0x7f):]
+head = tlv([0x80], b'eim.cli.example') + tlv([0x81], b'127.0.0.1:9')
+key = tlv([0xA5], tlv([0xA0], spki_content))
+ci = tlv([0x88], bytes(range(20)))
+open(sys.argv[2] + '/tcfg.der', 'wb').write(tlv([0x30], head + tlv([0x83], b'\0') + tlv([0x84], b'\xff') + key + ci))
+# a BF55 whose card left the key out ("MAY", 5.9.18)
+open(sys.argv[2] + '/nokey.ber', 'wb').write(tlv([0xBF, 0x55], tlv([0xA0], tlv([0x30], head + tlv([0x84], b'\x01')))))
+PY
+hx() { od -An -tx1 "$1" | tr -d ' \n'; }
+
+# a card whose eIM asked for an associationToken: its BF55 holds the token it
+# generated and no counterValue, both of which another card's AddInitialEim
+# refuses; provision asks that card for a token of its own and starts its
+# counter at 0 (the emulation, like a card, refuses an entry without one)
+out=$("$b/hostsim" -- "$b/ipad" -s "$w/t1" provision "$w/tcfg.der" -- "$b/ipad" -s "$w/t1" eim-save "$w/t1.ber" 2>&1)
+ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"eim-save\""' 'eim-save: done'
+ok 'echo "$out" | grep -q "host: .*\"event\":\"info\".*\"eims\":\[{\"id\":\"eim.cli.example\""' \
+	'eim-save: the info event lists what the file holds'
+ok '[ "$(od -An -tx1 -N2 "$w/t1.ber" | tr -d " ")" = bf55 ]' 'eim-save: a GetEimConfigurationDataResponse'
+ok '[ "$(stat -c %a "$w/t1.ber")" = 600 ] && [ ! -e "$w/t1.ber.tmp" ]' 'eim-save: 0600, no temporary left'
+ok 'hx "$w/t1.ber" | grep -q "840101" && ! hx "$w/t1.ber" | grep -q "830100"' \
+	'eim-save: the generated token, no counterValue (5.9.18)'
+out=$("$b/hostsim" -- "$b/ipad" -s "$w/t2" provision "$w/t1.ber" -- "$b/ipad" -s "$w/t2" info \
+	-- "$b/ipad" -s "$w/t2" eim-save "$w/t2.ber" 2>&1)
+ok 'echo "$out" | grep -q "\"code\":0,\"message\":\"provision\""' 'provision of a saved BF55: stored (counter 0, token -1)'
+ok 'echo "$out" | grep -q "\"eims\":\[{\"id\":\"eim.cli.example\""' 'provision of a saved BF55: the eIM is there'
+ok 'hx "$w/t1.ber" | grep -q "8814000102" && ! hx "$w/t2.ber" | grep -q "8814000102"' \
+	'provision of a saved BF55: the first card'"'"'s euiccCiPKId is left to the new card'
+ok 'hx "$w/t2.ber" | grep -q "840101"' 'provision of a saved BF55: the new card generated its own token'
+out=$("$b/hostsim" -- "$b/ipad" -s "$w/t4" provision "$w/nokey.ber" 2>&1)
+ok 'echo "$out" | grep -q "\"code\":1,\"message\":\"provision\"" && echo "$out" | grep -q "did not return its key"' \
+	'provision of a saved BF55 without the eIM key: refused, and why'
+ok '! ls "$w/t4"/*.state >/dev/null 2>&1 || ! "$b/hostsim" -- "$b/ipad" -s "$w/t4" info 2>&1 | grep -q "\"eims\":\[{"' \
+	'provision of a saved BF55 without the eIM key: nothing stored'
+# an entry without counterValue is refused, as a card refuses it (5.9.4)
+printf '\060\041\200\017eim.cli.example\201\013127.0.0.1:9\204\001\377' >"$w/noctr.der"
+out=$("$b/hostsim" -- "$b/ipad" -s "$w/t5" provision "$w/noctr.der" 2>&1)
+ok 'echo "$out" | grep -q "AddInitialEim refused: 7"' 'AddInitialEim without counterValue: commandError'
+# the link at the temporary name is not followed
+ln -s "$w/victim" "$w/t3.ber.tmp"
+"$b/hostsim" -- "$b/ipad" -s "$w/t1" eim-save "$w/t3.ber" >/dev/null 2>&1
+ok '[ ! -e "$w/victim" ]' 'eim-save: a link at the temporary name is not followed'
+
 # --- the eIM's bundle (eIM decision D-69) and the self-binding -------------
 # A stand-in eIM (bind_eim.py) answers the bind with scripted statuses; the
 # card is fake22 under the emulation. The bundle carries a real P-256 key.
@@ -218,7 +289,7 @@ ok '! echo "$out" | grep -qF "$key64"' 'malformed bundle: the key is not printed
 out=$("$b/ipad" -h)
 ok 'echo "$out" | grep -q "^  reset <EID>|all "' 'help: reset and its argument'
 ok 'echo "$out" | grep -q "provisioning bundle (eim-ipad-provision/1"' 'help: provision takes a bundle too'
-for c in poll provision export connectivity notify info reset; do
+for c in poll provision export eim-save connectivity notify info reset; do
 	grep -q "strcmp(cmd, \"$c\")" "$(dirname "$0")/../src/main.c" || continue
 	ok 'echo "$out" | grep -q "^  $c "' "help: $c listed"
 done

@@ -1184,6 +1184,12 @@ static int add_initial_eim(emu *e, const uint8_t *req, size_t len, dbuf *out)
 				code = 7;
 				break;
 			}
+			/* counterValue SHALL be present (5.9.4); a real card refuses
+			 * an entry without it, and so does the emulation */
+			if (der_find(c.val, c.len, 0x83, &x) < 0) {
+				code = 7;   /* commandError */
+				break;
+			}
 			want_tok = der_find(c.val, c.len, 0x84, &x) == 0 && der_get_int(&x, &tok) == 0;
 			if (want_tok && tok != -1) {
 				code = 5;   /* invalidAssociationToken */

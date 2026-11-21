@@ -59,7 +59,7 @@ device key, and for an emulated card the binding and the counter), and
 acknowledged results, binding, and the last error when the run failed).
 
 ```
-ipad [options] poll | provision <file> | export <file> | connectivity | notify | info | reset <EID>|all
+ipad [options] poll | provision <file> | export <file> | eim-save <file> | connectivity | notify | info | reset <EID>|all
 ```
 
 - `provision` stores the eIM configuration. It takes the file `eimctl

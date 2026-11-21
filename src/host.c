@@ -313,7 +313,7 @@ static void ev_connectivity(void *ud, const char *iccid, const conn_params *p, b
 }
 
 void host_event_info(host_link *h, const char *eid, const char *backend, const char *fp,
-                     const char *bind, long long counter)
+                     const char *bind, long long counter, const char *eims)
 {
 	fprintf(h->out, "{\"type\":\"event\",\"payload\":{\"event\":\"info\",\"eid\":\"%s\",\"backend\":\"%s\"",
 	        eid, backend);
@@ -323,6 +323,8 @@ void host_event_info(host_link *h, const char *eid, const char *backend, const c
 		fprintf(h->out, ",\"bind\":\"%s\"", bind);
 	if (counter >= 0)
 		fprintf(h->out, ",\"counter\":%lld", counter);
+	if (eims)
+		fprintf(h->out, ",\"eims\":%s", eims);
 	event_answer(h);
 }
 

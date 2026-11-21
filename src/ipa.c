@@ -1462,14 +1462,72 @@ int ipa_add_initial_eim(euicc *eu, const uint8_t *cfg, size_t len, char *err, si
 	if (c.tag == 0xBF57) {
 		db_put(&q, cfg, len);   /* already the request, as eimctl eim-config writes it */
 	} else if (c.tag == 0xBF55) {
-		/* GetEimConfigurationDataResponse: the same [0] SEQUENCE OF
-		 * EimConfigurationData as the request carries, under another tag */
+		/* GetEimConfigurationDataResponse (another card's, `eim-save`):
+		 * the same [0] SEQUENCE OF EimConfigurationData as the request
+		 * carries, under another tag, but as THAT card renders what it
+		 * stored (5.9.18), which AddInitialEim (5.9.4) does not take as is:
+		 *  - counterValue [3], which AddInitialEim requires, is never in it
+		 *    ("SHALL NOT provide"): 0 goes in, the start of a new
+		 *    association;
+		 *  - associationToken [4] is the token that card generated, and
+		 *    AddInitialEim takes only -1, the request for one of this
+		 *    card's own (else invalidAssociationToken);
+		 *  - euiccCiPKId [8] is the CI that card chose; this card may not
+		 *    have it (ciPKUnknown) and picks its own default without it;
+		 *  - eimPublicKeyData [5], which AddInitialEim requires, is
+		 *    optional in it ("MAY"): without it the file sets up no card,
+		 *    which is said here rather than left to the card's error. */
+		const uint8_t *p, *end;
+		der_tlv e, f;
+		size_t l, s;
+
 		if (der_find(c.val, c.len, 0xA0, &x) < 0) {
 			snprintf(err, errlen, "GetEimConfigurationDataResponse without a list");
 			goto out;
 		}
 		m = der_begin(&q, 0xBF57);
-		db_put(&q, x.raw, x.raw_len);
+		l = der_begin(&q, 0xA0);
+		for (p = x.val, end = x.val + x.len; p < end; ) {
+			const uint8_t *ep, *eend;
+			bool ctr = false;
+
+			if (der_next(&p, end, &e) < 0 || e.tag != 0x30) {
+				snprintf(err, errlen, "GetEimConfigurationDataResponse: not a list of EimConfigurationData");
+				goto out;
+			}
+			if (der_find(e.val, e.len, 0x80, &f) < 0) {
+				snprintf(err, errlen, "GetEimConfigurationDataResponse: an entry without eimId");
+				goto out;
+			}
+			if (der_find(e.val, e.len, 0xA5, &f) < 0) {
+				der_find(e.val, e.len, 0x80, &f);
+				snprintf(err, errlen, "eIM %.*s: the card did not return its key (eimPublicKeyData); "
+				         "this file cannot set up another card, ask the eIM for its configuration",
+				         (int)(f.len > 64 ? 64 : f.len), (const char *)f.val);
+				goto out;
+			}
+			s = der_begin(&q, 0x30);
+			for (ep = e.val, eend = e.val + e.len; ep < eend; ) {
+				if (der_next(&ep, eend, &f) < 0) {
+					snprintf(err, errlen, "GetEimConfigurationDataResponse: a broken EimConfigurationData");
+					goto out;
+				}
+				/* DER keeps declaration order: [3] after [0] [1] [2] */
+				if (!ctr && f.tag != 0x80 && f.tag != 0x81 && f.tag != 0x82) {
+					if (f.tag != 0x83)
+						der_put_int(&q, 0x83, 0);
+					ctr = true;
+				}
+				if (f.tag == 0x84)
+					der_put_int(&q, 0x84, -1);
+				else if (f.tag != 0x88)
+					db_put(&q, f.raw, f.raw_len);
+			}
+			if (!ctr)
+				der_put_int(&q, 0x83, 0);
+			der_end(&q, s);
+		}
+		der_end(&q, l);
 		der_end(&q, m);
 	} else {
 		m = der_begin(&q, 0xBF57);

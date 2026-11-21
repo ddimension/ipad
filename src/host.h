@@ -30,10 +30,15 @@
  *       "password":"...","pdp_type":"ipv4"|...}}   -> {}
  *   {"type":"event","payload":{"event":"info","eid":"...","backend":
  *       "iot"|"emulated","key_fingerprint":"<sha256 of the SPKI>",
- *       "bind":"none"|"pending"|"done"|"refused","counter":n}}  -> {}
+ *       "bind":"none"|"pending"|"done"|"refused","counter":n,
+ *       "eims":[{"id":"...","fqdn":"...","tls":"key"|"certificate"|
+ *       "configuration"|"system"}]}}  -> {}
  *       at the start of every run that reached the card, and for `info`,
  *       so the host can show what it manages without a session of its own;
- *       bind and counter only for an emulated card (eIM decision D-69)
+ *       bind and counter only for an emulated card (eIM decision D-69);
+ *       eims: the eIM configurations the card (or the emulation) holds, as
+ *       GetEimConfigurationData returns them, [] for none, absent when the
+ *       card did not answer
  *   {"type":"event","payload":{"event":"summary","command":"poll"|"provision",
  *       "code":n,"packages":n,"acknowledged":n,"downloads":n,
  *       "notifications":n,"changed":n,"rolled_back":n,"bind":"...",
@@ -68,9 +73,11 @@ void host_free(host_link *h);
 void host_ipa_hooks(host_link *h, ipa_host *hooks, int verbose);
 
 /* the info event; fp NULL for an IoT eUICC (it has no device key); bind
- * NULL and counter < 0 leave those fields out */
+ * NULL and counter < 0 leave those fields out; eims, a JSON array already
+ * built from the card's GetEimConfigurationData (read before: stdout is
+ * the APDU channel too), NULL leaves it out */
 void host_event_info(host_link *h, const char *eid, const char *backend, const char *fp,
-                     const char *bind, long long counter);
+                     const char *bind, long long counter, const char *eims);
 /* the summary event; s and bind may be NULL */
 void host_event_summary(host_link *h, const char *cmd, int code, const ipa_summary *s, const char *bind);
 

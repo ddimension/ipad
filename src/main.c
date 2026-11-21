@@ -57,6 +57,8 @@ static void usage(FILE *f)
 	        "                     eIM configuration and device key, bound at the next poll;\n"
 	        "                     the file is deleted once stored\n"
 	        "  export <file>      the eIM import file for an emulated card (" IMPORT_FORMAT ")\n"
+	        "  eim-save <file>    the card's eIM configurations as it holds them\n"
+	        "                     (GetEimConfigurationDataResponse, DER; provision takes it)\n"
 	        "  connectivity       report the enabled profile's connectivity parameters\n"
 	        "  notify             deliver pending notifications only\n"
 	        "  info               EID, backend, eIMs, device key (JSON on stdout)\n"
@@ -664,23 +666,100 @@ static long long emu_counter(euicc *eu, const char *eim_id)
 	return (long long)ctr;
 }
 
-static void cmd_info(euicc *eu, const crypto_key *key, const uint8_t eid[16], const char *dir, FILE *out)
+/* The eIM configurations the card holds (ES10b.GetEimConfigurationData,
+ * SGP.32 5.9.18), as the JSON array the info event and line carry:
+ * [{"id","fqdn","tls"}], [] for none; NULL when the card did not answer.
+ * Read here, printed later: stdout is also the APDU channel. Malloc'd. */
+/* the card's GetEimConfigurationDataResponse into r: 0 when it is one */
+static int read_eim_config(euicc *eu, dbuf *r)
 {
-	long long counter = emu_counter(eu, NULL);
 	static const uint8_t q[] = { 0xBF, 0x55, 0x00 };
-	char eidhex[33], iccid[21], fp[65];
-	dbuf r;
+	der_tlv t;
+
+	return (euicc_es10(eu, q, sizeof(q), r) < 0 || der_parse(r->d, r->len, &t) < 0 ||
+	        t.tag != 0xBF55 || t.raw_len != r->len) ? -1 : 0;
+}
+
+/* the list of a GetEimConfigurationDataResponse already read */
+static char *eims_json_of(const dbuf *r)
+{
 	der_tlv t, list, c, x;
 	const uint8_t *p, *end;
-	bool first = true, have_iccid;
+	bool first = true;
+	char *body = NULL;
+	size_t blen = 0;
+	FILE *m;
+
+	if (der_parse(r->d, r->len, &t) < 0 || !(m = open_memstream(&body, &blen)))
+		return NULL;
+	fputc('[', m);
+	if (der_find(t.val, t.len, 0xA0, &list) == 0)
+		for (p = list.val, end = list.val + list.len; p < end && der_next(&p, end, &c) == 0; ) {
+			char s[260];
+			const char *sep = "";
+
+			fprintf(m, "%s{", first ? "" : ",");
+			first = false;
+			if (der_find(c.val, c.len, 0x80, &x) == 0 && x.len < sizeof(s)) {
+				memcpy(s, x.val, x.len);
+				s[x.len] = 0;
+				fprintf(m, "\"id\":");
+				host_json_str(m, s);
+				sep = ",";
+			}
+			if (der_find(c.val, c.len, 0x81, &x) == 0 && x.len < sizeof(s)) {
+				memcpy(s, x.val, x.len);
+				s[x.len] = 0;
+				fprintf(m, "%s\"fqdn\":", sep);
+				host_json_str(m, s);
+				sep = ",";
+			}
+			/* trustedPublicKeyDataTls [6] (SGP.32 2.11.1.1.1): the eIM's
+			 * key [0] or a certificate [1] (the eIM's or its CA, D-70);
+			 * without it the system CAs decide */
+			{
+				der_tlv y;
+				const char *tls = "system";
+
+				if (der_find(c.val, c.len, 0xA6, &x) == 0)
+					tls = der_parse(x.val, x.len, &y) < 0 ? "configuration"
+					    : y.tag == 0xA1 ? "certificate" : y.tag == 0xA0 ? "key" : "configuration";
+				fprintf(m, "%s\"tls\":\"%s\"}", sep, tls);
+			}
+		}
+	fputc(']', m);
+	if (fclose(m) != 0) {
+		free(body);
+		return NULL;
+	}
+	return body;
+}
+
+static char *eims_json(euicc *eu)
+{
+	dbuf r;
+	char *j;
+
+	db_init(&r);
+	j = read_eim_config(eu, &r) == 0 ? eims_json_of(&r) : NULL;
+	db_free(&r);
+	return j;
+}
+
+/* Everything the card says is collected first (eims, by the caller): stdout
+ * is also the APDU channel, and a line printed in pieces around card calls
+ * would come out interleaved with them. */
+static void cmd_info(euicc *eu, const crypto_key *key, const uint8_t eid[16], const char *dir,
+                     const char *eims, FILE *out)
+{
+	long long counter = emu_counter(eu, NULL);
+	char eidhex[33], iccid[21], fp[65];
+	bool have_iccid;
 	char *body = NULL;
 	size_t blen = 0;
 	FILE *m;
 
 	have_iccid = ipa_enabled_iccid(eu, iccid) == 0;
-	db_init(&r);
-	if (euicc_es10(eu, q, sizeof(q), &r) < 0)
-		r.len = 0;
 
 	if (!(m = open_memstream(&body, &blen)))
 		return;
@@ -698,44 +777,61 @@ static void cmd_info(euicc *eu, const crypto_key *key, const uint8_t eid[16], co
 		if (counter >= 0)
 			fprintf(m, ",\"counter\":%lld", counter);
 	}
-	fprintf(m, ",\"eims\":[");
-	if (r.len && der_parse(r.d, r.len, &t) == 0 && der_find(t.val, t.len, 0xA0, &list) == 0)
-		for (p = list.val, end = list.val + list.len; p < end && der_next(&p, end, &c) == 0; ) {
-			char s[260];
-
-			fprintf(m, "%s{", first ? "" : ",");
-			first = false;
-			if (der_find(c.val, c.len, 0x80, &x) == 0 && x.len < sizeof(s)) {
-				memcpy(s, x.val, x.len);
-				s[x.len] = 0;
-				fprintf(m, "\"id\":");
-				host_json_str(m, s);
-			}
-			if (der_find(c.val, c.len, 0x81, &x) == 0 && x.len < sizeof(s)) {
-				memcpy(s, x.val, x.len);
-				s[x.len] = 0;
-				fprintf(m, ",\"fqdn\":");
-				host_json_str(m, s);
-			}
-			/* trustedPublicKeyDataTls [6] (SGP.32 2.11.1.1.1): the eIM's
-			 * key [0] or a certificate [1] (the eIM's or its CA, D-70);
-			 * without it the system CAs decide */
-			{
-				der_tlv y;
-				const char *tls = "system";
-
-				if (der_find(c.val, c.len, 0xA6, &x) == 0)
-					tls = der_parse(x.val, x.len, &y) < 0 ? "configuration"
-					    : y.tag == 0xA1 ? "certificate" : y.tag == 0xA0 ? "key" : "configuration";
-				fprintf(m, ",\"tls\":\"%s\"}", tls);
-			}
-		}
-	fprintf(m, "]}}\n");
+	fprintf(m, ",\"eims\":%s}}\n", eims ? eims : "[]");
 	fclose(m);
 	fputs(body, out);
 	fflush(out);
 	free(body);
-	db_free(&r);
+}
+
+/* `eim-save <file>`: the card's eIM configurations, its
+ * GetEimConfigurationDataResponse (BF55) exactly as it answered, for a look
+ * or for `provision` on another card (which replaces this card's
+ * associationToken by a request for one of its own; the response carries
+ * no counterValue, so the other card starts at 0). EXIT_NO_EIM when the
+ * card holds none: no file then. Nothing secret, but 0600 like the rest of
+ * the directory's files; written aside, no link followed, renamed. */
+static int cmd_eim_save(const dbuf *r, const char *path)
+{
+	char tmp[520];
+	der_tlv t, list;
+	FILE *f;
+	int fd, rc = 1;
+	bool ok;
+
+	if (der_parse(r->d, r->len, &t) < 0 || der_find(t.val, t.len, 0xA0, &list) < 0) {
+		fprintf(stderr, "ipad: eim-save: the card gave no GetEimConfigurationDataResponse\n");
+		goto out;
+	}
+	if (list.len == 0) {
+		rc = EXIT_NO_EIM;
+		goto out;
+	}
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) {
+		fprintf(stderr, "ipad: eim-save: path too long\n");
+		goto out;
+	}
+	fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		fprintf(stderr, "ipad: %s: %s\n", tmp, strerror(errno));
+		goto out;
+	}
+	if (fchmod(fd, 0600) != 0 || !(f = fdopen(fd, "w"))) {
+		fprintf(stderr, "ipad: %s: %s\n", tmp, strerror(errno));
+		close(fd);
+		unlink(tmp);
+		goto out;
+	}
+	ok = fwrite(r->d, 1, r->len, f) == r->len && fflush(f) == 0 && fsync(fileno(f)) == 0;
+	if (fclose(f) != 0 || !ok || rename(tmp, path) != 0) {
+		fprintf(stderr, "ipad: %s: %s\n", path, strerror(errno));
+		unlink(tmp);
+		goto out;
+	}
+	syslog(LOG_NOTICE, "eIM configuration of the card written to %s", path);
+	rc = 0;
+out:
+	return rc;
 }
 
 /* any eIM configuration at all on the card (or in the emulation) */
@@ -904,12 +1000,15 @@ int main(int argc, char **argv)
 
 		/* the event for a host that reads events only (wwand's bridge logs
 		 * the JSON line below), the line for everyone else */
+		char *eims = eims_json(&eu);
+
 		hex_encode(eid, 16, eidhex);
 		if (key)
 			fingerprint(key, fp);
 		host_event_info(&hl, eidhex, eu.kind == EUICC_EMU ? "emulated" : "iot", key ? fp : NULL,
-		                eu.kind == EUICC_EMU ? bind_state(dir) : NULL, emu_counter(&eu, NULL));
-		cmd_info(&eu, key, eid, dir, stdout);
+		                eu.kind == EUICC_EMU ? bind_state(dir) : NULL, emu_counter(&eu, NULL), eims);
+		cmd_info(&eu, key, eid, dir, eims, stdout);
+		free(eims);
 		rc = 0;
 	} else if (!strcmp(cmd, "provision")) {
 		dbuf f;
@@ -939,6 +1038,7 @@ int main(int argc, char **argv)
 		if (rc == 0) {
 			char eidhex[33], fp[65], kp[512];
 			crypto_key *nk = NULL;
+			char *eims = eims_json(&eu);
 
 			hex_encode(eid, 16, eidhex);
 			if (eu.kind == EUICC_EMU) {
@@ -947,8 +1047,9 @@ int main(int argc, char **argv)
 					fingerprint(nk, fp);
 			}
 			host_event_info(&hl, eidhex, eu.kind == EUICC_EMU ? "emulated" : "iot", nk ? fp : NULL,
-			                eu.kind == EUICC_EMU ? bind_state(dir) : NULL, emu_counter(&eu, NULL));
+			                eu.kind == EUICC_EMU ? bind_state(dir) : NULL, emu_counter(&eu, NULL), eims);
 			crypto_key_free(nk);
+			free(eims);
 		}
 		host_event_summary(&hl, "provision", rc, NULL, eu.kind == EUICC_EMU ? bind_state(dir) : NULL);
 		result_line(stdout, rc, "provision", NULL);
@@ -960,17 +1061,47 @@ int main(int argc, char **argv)
 			rc = cmd_export(&eu, key, cfg.eim_id, imei, direct, eid, argv[optind + 1]);
 		}
 		result_line(stdout, rc, "export", NULL);
+	} else if (!strcmp(cmd, "eim-save")) {
+		if (optind + 1 >= argc) {
+			usage(stderr);
+			rc = 2;
+		} else {
+			/* one read: the info event (the host's answer) lists what
+			 * the file holds, not what an earlier run saw */
+			char eidhex[33], fp[65], *eims = NULL;
+			dbuf r;
+			bool got;
+
+			db_init(&r);
+			if ((got = read_eim_config(&eu, &r) == 0))
+				eims = eims_json_of(&r);
+			hex_encode(eid, 16, eidhex);
+			if (key)
+				fingerprint(key, fp);
+			host_event_info(&hl, eidhex, eu.kind == EUICC_EMU ? "emulated" : "iot", key ? fp : NULL,
+			                eu.kind == EUICC_EMU ? bind_state(dir) : NULL, emu_counter(&eu, NULL), eims);
+			free(eims);
+			if (!got)
+				fprintf(stderr, "ipad: eim-save: the card gave no GetEimConfigurationDataResponse\n");
+			rc = got ? cmd_eim_save(&r, argv[optind + 1]) : 1;
+			db_free(&r);
+		}
+		result_line(stdout, rc, rc == EXIT_NO_EIM ? "no eIM configured" : "eim-save", NULL);
 	} else if (!strcmp(cmd, "poll") || !strcmp(cmd, "notify") || !strcmp(cmd, "connectivity")) {
 		ipa *a = ipa_open(&cfg);
 		ipa_summary s;
 		char eidhex[33], fp[65];
+		/* what the eIM may have changed since (updateEim, addEim, deleteEim)
+		 * shows at the host after the next run, not only after an `info` */
+		char *eims = eims_json(&eu);
 
 		memset(&s, 0, sizeof(s));
 		hex_encode(eid, 16, eidhex);
 		if (key)
 			fingerprint(key, fp);
 		host_event_info(&hl, eidhex, eu.kind == EUICC_EMU ? "emulated" : "iot", key ? fp : NULL,
-		                eu.kind == EUICC_EMU ? bind_state(dir) : NULL, emu_counter(&eu, cfg.eim_id));
+		                eu.kind == EUICC_EMU ? bind_state(dir) : NULL, emu_counter(&eu, cfg.eim_id), eims);
+		free(eims);
 		if (!a) {
 			rc = has_eim(&eu) ? 1 : EXIT_NO_EIM;
 			if (!strcmp(cmd, "poll"))

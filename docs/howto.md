@@ -105,14 +105,15 @@ What comes out, in order:
 ## Commands and options
 
 ```
-ipad [options] poll | provision <file> | export <file> | connectivity | notify | info | reset
+ipad [options] poll | provision <file> | export <file> | eim-save <file> | connectivity | notify | info | reset
 ```
 
 | Command | What it does |
 |---|---|
 | `poll` | Binds a provisioned bundle's card first (emulated cards). Then runs the eIM's packages until it has none (at most 16 per run), delivers pending notifications, and reports the enabled profile's connectivity parameters. |
-| `provision <file>` | Stores an eIM configuration through `AddInitialEim`: DER or hex `EimConfigurationData` (`30…`), `AddInitialEimRequest` (`BF57…`, what `eimctl eim-config` writes) or `GetEimConfigurationDataResponse` (`BF55…`). An `eim-ipad-provision/1` bundle (first byte `{`) also sets the device key and is deleted once stored. |
+| `provision <file>` | Stores an eIM configuration through `AddInitialEim`: DER or hex `EimConfigurationData` (`30…`), `AddInitialEimRequest` (`BF57…`, what `eimctl eim-config` writes) or `GetEimConfigurationDataResponse` (`BF55…`, another card's, as `eim-save` writes it: it is made a valid `AddInitialEim` first — counterValue 0 goes in (a card never returns its counter), an associationToken that card generated becomes -1 (a request for one of this card's own), and that card's `euiccCiPKId` is left out (this card picks its own); an entry without the eIM's key, which a card may leave out of `BF55`, is refused, since no card would take it). An `eim-ipad-provision/1` bundle (first byte `{`) also sets the device key and is deleted once stored. |
 | `export <file>` | Writes the `eim-euicc-import/1` file for the eIM. Emulated cards only. |
+| `eim-save <file>` | Writes the card's eIM configurations as it holds them: its `GetEimConfigurationDataResponse` (`BF55…`, DER, 0600, written aside and renamed). No counterValue (a card never reveals it), so `provision` of it on another card starts that card at 0. The `info` event lists what the file holds. A card without an eIM: exit 3, no file. |
 | `connectivity` | Reports the enabled profile's connectivity parameters only. |
 | `notify` | Delivers pending notifications only. |
 | `info` | EID, backend, device-key fingerprint, enabled ICCID, binding, counter and the configured eIMs, as one JSON line. |
@@ -226,6 +227,9 @@ Each command ends with one result line on stdout:
 {"type":"info","payload":{"eid":"89049032…","backend":"emulated","key_fingerprint":"3F2A…","iccid":"8949…","bind":"done","counter":7,"eims":[{"id":"eim.example.com","fqdn":"eim.example.com","tls":"certificate"}]}}
 ```
 
+- The same `eims` list rides on the `info` event (the host protocol, `src/host.h`)
+  at the start of every run that reached the card, so a host sees what the
+  eIM changed (`updateEim`, `addEim`, `deleteEim`) after the next run.
 - `tls` says what the stored configuration carries as the eIM's TLS trust
   (`trustedPublicKeyDataTls`): `key` (a pinned key), `certificate` (the
   eIM's certificate or its CA), `system` (none: the CA bundle decides), or
